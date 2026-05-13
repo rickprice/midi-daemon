@@ -45,10 +45,10 @@ function on_tick(tick, bpm, ppqn)
 end
 
 -- Optionally react to incoming MIDI CC to change BPM
--- CC 21 on channel 1 maps 0–127 → 60–187 BPM
+-- CC 21 on channel 1 maps 0–127 → 20–200 BPM
 function on_midi(msg)
     if msg.type == "cc" and msg.channel == 1 and msg.controller == 21 then
-        local new_bpm = 60 + (msg.value / 127.0) * 127
+        local new_bpm = 20 + (msg.value / 127.0) * 180
         set_bpm(new_bpm)
         log(string.format("BPM changed to %.1f", new_bpm))
     end

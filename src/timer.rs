@@ -19,7 +19,7 @@ pub struct Timer {
 impl Timer {
     pub fn new(default_bpm: f64, default_ppqn: u32) -> Self {
         Timer {
-            bpm: Arc::new(AtomicU32::new((default_bpm * 100.0) as u32)),
+            bpm: Arc::new(AtomicU32::new((default_bpm.clamp(20.0, 200.0) * 100.0) as u32)),
             ppqn: Arc::new(AtomicU32::new(default_ppqn)),
             running: Arc::new(AtomicBool::new(true)),
         }
@@ -30,7 +30,8 @@ impl Timer {
     }
 
     pub fn set_bpm(&self, bpm: f64) {
-        self.bpm.store((bpm * 100.0) as u32, Ordering::Relaxed);
+        let clamped = bpm.clamp(20.0, 200.0);
+        self.bpm.store((clamped * 100.0) as u32, Ordering::Relaxed);
     }
 
     pub fn get_ppqn(&self) -> u32 {
