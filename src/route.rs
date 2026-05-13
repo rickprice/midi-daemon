@@ -194,9 +194,8 @@ fn run_lua_event_loop(
     })?;
 
     // --- Event loop ---
-    let rt = tokio::runtime::Handle::current();
     loop {
-        let event = match rt.block_on(rx.recv()) {
+        let event = match rx.blocking_recv() {
             Some(e) => e,
             None => break, // channel closed
         };
