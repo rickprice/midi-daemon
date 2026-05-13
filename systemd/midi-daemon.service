@@ -1,0 +1,18 @@
+[Unit]
+Description=MIDI Lua Routing Daemon
+Documentation=https://github.com/yourname/midi-daemon
+After=sound.target pipewire.service pipewire-pulse.service
+
+[Service]
+Type=simple
+ExecStart=%h/.cargo/bin/midi-daemon
+Restart=on-failure
+RestartSec=2
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+Environment=RUST_LOG=midi_daemon=info
+
+[Install]
+WantedBy=default.target

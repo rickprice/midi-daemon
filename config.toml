@@ -1,0 +1,15 @@
+# midi-daemon configuration
+# Default values shown — all fields are optional.
+
+# Directory containing .lua route files.
+# Each .lua file gets its own virtual ALSA MIDI port pair.
+# routes_dir = "~/.config/midi-daemon/routes.d"
+
+# Default BPM for the timer passed to on_tick().
+# Can be overridden at runtime from Lua with set_bpm().
+default_bpm = 120.0
+
+# Pulses per quarter note — controls tick resolution.
+# 24 = standard MIDI clock, 96 = high resolution.
+# Can be overridden at runtime from Lua with set_ppqn().
+default_ppqn = 24
