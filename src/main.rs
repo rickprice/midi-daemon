@@ -68,14 +68,13 @@ async fn main() -> Result<()> {
 
         info!("Detected change in {}.lua — reloading", name);
 
-        let mut map = routes.lock().unwrap();
-        // Drop old route (closes its MIDI ports and stops its thread)
-        map.remove(&name);
+        // Extract ports before dropping the old route so ALSA port IDs are preserved.
+        let old_ports = routes.lock().unwrap().remove(&name).map(|r| r.take_ports());
 
         if path.exists() {
-            match Route::start(&path, Arc::clone(&config)) {
+            match Route::start(&path, Arc::clone(&config), old_ports) {
                 Ok(route) => {
-                    map.insert(name.clone(), route);
+                    routes.lock().unwrap().insert(name.clone(), route);
                     info!("Reloaded route: {}", name);
                 }
                 Err(e) => error!("Failed to load route {}: {}", name, e),
@@ -110,7 +109,7 @@ async fn load_all_routes(
                 .unwrap_or("unknown")
                 .to_string();
 
-            match Route::start(&path, Arc::clone(&config)) {
+            match Route::start(&path, Arc::clone(&config), None) {
                 Ok(route) => {
                     info!("Loaded route: {}", name);
                     map.insert(name, route);

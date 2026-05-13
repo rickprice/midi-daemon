@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use midir::os::unix::{VirtualInput, VirtualOutput};
-use midir::{MidiInput, MidiOutput, MidiOutputConnection};
+use midir::{MidiInput, MidiInputConnection, MidiOutput, MidiOutputConnection};
 use mlua::prelude::*;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -11,25 +11,75 @@ use crate::config::Config;
 use crate::lua_api::{lua_to_midi_bytes, midi_bytes_to_lua};
 use crate::timer::{Timer, TimerEvent};
 
-/// Events dispatched to a route's Lua event loop
 enum RouteEvent {
     Midi(Vec<u8>),
     Timer(TimerEvent),
 }
 
+/// Owns the virtual MIDI ports for a route. Kept alive across Lua reloads so
+/// the ALSA client and port IDs stay the same.
+pub struct RoutePorts {
+    out_conn: Arc<Mutex<MidiOutputConnection>>,
+    /// The MIDI input callback sends here; swapped on each reload to forward
+    /// to the new route's event channel.
+    midi_fwd: Arc<Mutex<Option<mpsc::Sender<RouteEvent>>>>,
+    _in_conn: MidiInputConnection<()>,
+}
+
+impl RoutePorts {
+    fn create(port_name: &str, initial_tx: mpsc::Sender<RouteEvent>) -> Result<Arc<Self>> {
+        let midi_fwd: Arc<Mutex<Option<mpsc::Sender<RouteEvent>>>> =
+            Arc::new(Mutex::new(Some(initial_tx)));
+
+        let midi_in = MidiInput::new(&format!("{}-in", port_name))
+            .context("Failed to create MIDI input")?;
+        let fwd_ref = Arc::clone(&midi_fwd);
+        let in_conn = midi_in
+            .create_virtual(
+                &format!("{}-in", port_name),
+                move |_stamp, message, _| {
+                    let guard = fwd_ref.lock().unwrap();
+                    if let Some(tx) = guard.as_ref() {
+                        let _ = tx.blocking_send(RouteEvent::Midi(message.to_vec()));
+                    }
+                },
+                (),
+            )
+            .map_err(|e| anyhow::anyhow!("Failed to create virtual MIDI input port: {}", e))?;
+
+        let midi_out = MidiOutput::new(&format!("{}-out", port_name))
+            .context("Failed to create MIDI output")?;
+        let out_conn = midi_out
+            .create_virtual(port_name)
+            .map_err(|e| anyhow::anyhow!("Failed to create virtual MIDI output port: {}", e))?;
+
+        Ok(Arc::new(RoutePorts {
+            out_conn: Arc::new(Mutex::new(out_conn)),
+            midi_fwd,
+            _in_conn: in_conn,
+        }))
+    }
+}
+
 /// A running route: owns its MIDI ports, Lua VM, and timer.
 /// Dropping this stops everything cleanly.
 pub struct Route {
-    // Kept alive to hold the MIDI output connection open
-    _output: Arc<Mutex<MidiOutputConnection>>,
-    // Kept alive to stop the timer on drop
+    ports: Arc<RoutePorts>,
     _timer: Arc<Timer>,
-    // Thread handle for the event loop
     _thread: std::thread::JoinHandle<()>,
 }
 
 impl Route {
-    pub fn start(lua_path: &PathBuf, config: Arc<Config>) -> Result<Self> {
+    /// Consume the route and return its ports so they can be reused on reload.
+    pub fn take_ports(self) -> Arc<RoutePorts> {
+        self.ports
+    }
+
+    pub fn start(
+        lua_path: &PathBuf,
+        config: Arc<Config>,
+        existing_ports: Option<Arc<RoutePorts>>,
+    ) -> Result<Self> {
         let name = lua_path
             .file_stem()
             .and_then(|s| s.to_str())
@@ -38,60 +88,38 @@ impl Route {
 
         let port_name = format!("midi-daemon:{}", name);
 
-        // --- MIDI Input ---
-        let midi_in = MidiInput::new(&format!("{}-in", port_name))
-            .context("Failed to create MIDI input")?;
-
-        // --- MIDI Output ---
-        let midi_out = MidiOutput::new(&format!("{}-out", port_name))
-            .context("Failed to create MIDI output")?;
-
-        let out_port_name = port_name.clone();
-        let out_conn = midi_out
-            .create_virtual(&out_port_name)
-            .map_err(|e| anyhow::anyhow!("Failed to create virtual MIDI output port: {}", e))?;
-
-        let out_conn = Arc::new(Mutex::new(out_conn));
-
-        // --- Event channel ---
         let (tx, rx) = mpsc::channel::<RouteEvent>(256);
 
-        // --- MIDI input callback ---
-        let midi_tx = tx.clone();
-        let _in_conn = midi_in
-            .create_virtual(
-                &format!("{}-in", port_name),
-                move |_stamp, message, _| {
-                    let _ = midi_tx.blocking_send(RouteEvent::Midi(message.to_vec()));
-                },
-                (),
-            )
-            .map_err(|e| anyhow::anyhow!("Failed to create virtual MIDI input port: {}", e))?;
+        let ports = match existing_ports {
+            Some(p) => {
+                // Redirect the input callback to the new event channel.
+                *p.midi_fwd.lock().unwrap() = Some(tx.clone());
+                p
+            }
+            None => RoutePorts::create(&port_name, tx.clone())?,
+        };
 
         // --- Timer ---
         let timer = Arc::new(Timer::new(config.default_bpm, config.default_ppqn));
         let timer_tx = tx.clone();
-        let _timer_thread = timer.spawn(
-            // wrap TimerEvent in RouteEvent
-            {
-                let (ttx, mut trx) = mpsc::channel::<TimerEvent>(256);
-                tokio::spawn(async move {
-                    while let Some(ev) = trx.recv().await {
-                        if timer_tx.send(RouteEvent::Timer(ev)).await.is_err() {
-                            break;
-                        }
+        let _timer_thread = timer.spawn({
+            let (ttx, mut trx) = mpsc::channel::<TimerEvent>(256);
+            tokio::spawn(async move {
+                while let Some(ev) = trx.recv().await {
+                    if timer_tx.send(RouteEvent::Timer(ev)).await.is_err() {
+                        break;
                     }
-                });
-                ttx
-            },
-        );
+                }
+            });
+            ttx
+        });
 
         // --- Lua script ---
         let script = std::fs::read_to_string(lua_path)
             .with_context(|| format!("Failed to read {}", lua_path.display()))?;
 
         // --- Spawn event loop thread ---
-        let out_for_thread = Arc::clone(&out_conn);
+        let out_for_thread = Arc::clone(&ports.out_conn);
         let timer_for_thread = Arc::clone(&timer);
         let name_for_thread = name.clone();
 
@@ -110,7 +138,7 @@ impl Route {
         info!("Started route '{}' on port '{}'", name, port_name);
 
         Ok(Route {
-            _output: out_conn,
+            ports,
             _timer: timer,
             _thread: thread,
         })
