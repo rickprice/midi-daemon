@@ -108,15 +108,56 @@ with the updated configuration automatically (no restart needed).
 Each script can define these callback functions:
 
 ```lua
+-- Optional: declare named ports and auto-connect patterns (see below).
+-- Called once at startup before on_midi/on_tick.
+function init() end
+
 -- Called on every timer tick
 -- tick:  monotonically increasing tick counter
 -- bpm:   current BPM (float)
 -- ppqn:  current pulses per quarter note
 function on_tick(tick, bpm, ppqn) end
 
--- Called on every incoming MIDI message on this route's input port
--- msg fields vary by type (see below)
+-- Called on every incoming MIDI message on this route's input port.
+-- msg.port holds the input port name when the route has multiple inputs.
+-- Other msg fields vary by type (see below).
 function on_midi(msg) end
+```
+
+### Named ports via `init()`
+
+By default each route gets one input and one output port. Return a table from
+`init()` to declare multiple named ports:
+
+```lua
+function init()
+    return {
+        inputs  = {"keyboard", "pad"},
+        outputs = {"synth", "drums"},
+    }
+end
+```
+
+ALSA ports created (visible in `aconnect -l`):
+
+```
+midi-daemon:my-route/keyboard-in
+midi-daemon:my-route/pad-in
+midi-daemon:my-route/synth-out
+midi-daemon:my-route/drums-out
+```
+
+In `on_midi`, `msg.port` tells you which input fired. In `send`, the first
+argument selects the output:
+
+```lua
+function on_midi(msg)
+    if msg.port == "keyboard" then
+        send("synth", msg)
+    elseif msg.port == "pad" then
+        send("drums", msg)
+    end
+end
 ```
 
 ### `msg` table fields by type
@@ -137,12 +178,13 @@ function on_midi(msg) end
 ### Global functions available in Lua
 
 ```lua
-send(msg)         -- Send a MIDI message table to this route's output port
-set_bpm(bpm)      -- Set timer BPM (float)
-get_bpm()         -- Get current BPM (float)
-set_ppqn(ppqn)    -- Set pulses per quarter note (integer)
-get_ppqn()        -- Get current PPQN (integer)
-log(message)      -- Log a string to the systemd journal / stdout
+send(msg)              -- Send msg to the first/only output port
+send(port_name, msg)   -- Send msg to a named output port (multi-port routes)
+set_bpm(bpm)           -- Set timer BPM (float)
+get_bpm()              -- Get current BPM (float)
+set_ppqn(ppqn)         -- Set pulses per quarter note (integer)
+get_ppqn()             -- Get current PPQN (integer)
+log(message)           -- Log a string to the systemd journal / stdout
 ```
 
 ## config.toml
@@ -161,6 +203,11 @@ The daemon searches for a config file in this order:
 
 default_bpm  = 120.0
 default_ppqn = 24
+
+# Auto-connect: regex matched against "ClientName:PortName" of ALSA ports.
+# Applied to every route input/output that has no per-route pattern.
+# default_connect_input  = ".*My Keyboard.*"
+# default_connect_output = ".*My Synth.*"
 ```
 
 Changes to `config.toml` are picked up automatically and all routes are
@@ -187,6 +234,70 @@ local num   = config.some_number or 0
 
 Any TOML type is supported: strings, integers, floats, booleans, arrays, and
 nested tables.
+
+## Auto-connect
+
+The daemon can automatically wire its virtual ALSA ports to physical or
+software devices when it starts, and also when a device is plugged in later.
+Patterns are regular expressions matched against the full ALSA address string
+`"ClientName:PortName"` (the same strings shown by `aconnect -l`).
+
+There are three levels of configuration, applied from highest to lowest
+priority:
+
+### 1. Per-port — `init()` in Lua
+
+The most specific level. Use the `connect` field in the table returned by
+`init()`:
+
+```lua
+function init()
+    return {
+        inputs  = {"keyboard", "pad"},
+        outputs = {"synth", "drums"},
+        connect = {
+            -- per named port (highest priority)
+            inputs  = { keyboard = ".*KeyLab.*", pad = ".*LinnStrument.*" },
+            outputs = { synth = ".*Surge.*", drums = ".*DrumMachine.*" },
+
+            -- OR: one pattern for all inputs / all outputs (singular form)
+            -- input  = ".*My Keyboard.*",
+            -- output = ".*My Synth.*",
+        },
+    }
+end
+```
+
+`connect.inputs` / `connect.outputs` are tables of `port_name = "pattern"`.
+`connect.input` / `connect.output` (singular) apply to every input or output
+of that route.
+
+### 2. Per-route — `config.toml`
+
+One pattern applied to all input ports of the route, and one for all output
+ports. Overrides the global default; overridden by Lua `init()`.
+
+```toml
+[transpose]
+connect_input  = ".*KeyLab.*"
+connect_output = ".*Surge.*"
+```
+
+### 3. Global default — `config.toml`
+
+Applies to every port of every route that has no higher-priority pattern.
+The simplest option when a single controller drives all routes.
+
+```toml
+default_connect_input  = ".*KeyLab Essential.*"
+default_connect_output = ".*Surge XT.*"
+```
+
+### Hot-plug
+
+A background thread subscribes to ALSA sequencer announcements. When a
+device appears after the daemon has started, any matching route ports are
+connected to it automatically — no restart needed.
 
 ## Example: Simple Metronome
 
