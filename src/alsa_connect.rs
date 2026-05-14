@@ -160,9 +160,7 @@ fn try_subscribe(seq: &Seq, sender: Addr, dest: Addr, label: &str) {
     match seq.subscribe_port(&sub) {
         Ok(_) => info!("auto-connected: {}", label),
         Err(e) => {
-            // EBUSY (-16) means already connected — not an error.
-            let msg = e.to_string();
-            if !msg.contains("16") && !msg.contains("busy") {
+            if !e.to_string().contains("busy") {
                 warn!("auto-connect failed ({}): {}", label, e);
             }
         }

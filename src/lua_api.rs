@@ -142,7 +142,7 @@ pub fn lua_to_midi_bytes(msg: &LuaTable) -> LuaResult<Vec<u8>> {
         "continue" => Ok(vec![0xFB]),
         "raw" => {
             let data: LuaTable = msg.get("data")?;
-            let mut bytes = Vec::new();
+            let mut bytes = Vec::with_capacity(data.len()? as usize);
             for i in 1..=data.len()? {
                 bytes.push(data.get::<u8>(i)?);
             }

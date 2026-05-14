@@ -58,6 +58,18 @@ fn default_ppqn() -> u32 {
     24
 }
 
+fn default_config(routes_dir: PathBuf) -> Config {
+    Config {
+        routes_dir,
+        default_bpm: default_bpm(),
+        default_ppqn: default_ppqn(),
+        route_configs: HashMap::new(),
+        config_path: None,
+        default_connect_input: None,
+        default_connect_output: None,
+    }
+}
+
 fn user_config_dir() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("midi-daemon"))
 }
@@ -122,15 +134,7 @@ impl Config {
             .map(|d| (d.join("routes.d"), "user"))
             .unwrap_or_else(|| (system_config_dir().join("routes.d"), "system"));
         tracing::info!("No config file found, using {} defaults", scope);
-        Ok(Config {
-            routes_dir,
-            default_bpm: default_bpm(),
-            default_ppqn: default_ppqn(),
-            route_configs: HashMap::new(),
-            config_path: None,
-            default_connect_input: None,
-            default_connect_output: None,
-        })
+        Ok(default_config(routes_dir))
     }
 
     /// Load from an explicit path. Useful for testing or when the caller
@@ -144,17 +148,10 @@ impl Config {
             Self::load_file(path, default_routes)
         } else {
             tracing::info!("No config found at {}, using defaults", path.display());
-            Ok(Config {
-                routes_dir: user_config_dir()
-                    .unwrap_or_else(|| PathBuf::from("~/.config/midi-daemon"))
-                    .join("routes.d"),
-                default_bpm: default_bpm(),
-                default_ppqn: default_ppqn(),
-                route_configs: HashMap::new(),
-                config_path: None,
-                default_connect_input: None,
-                default_connect_output: None,
-            })
+            let routes_dir = user_config_dir()
+                .unwrap_or_else(|| PathBuf::from("~/.config/midi-daemon"))
+                .join("routes.d");
+            Ok(default_config(routes_dir))
         }
     }
 
