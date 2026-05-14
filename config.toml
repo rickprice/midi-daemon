@@ -35,7 +35,15 @@ velocity    = 100
 beats_per_bar = 4
 note_len_ms   = 20   # fixed note duration in milliseconds (independent of BPM)
 
-# Incoming message that controls BPM (maps 0–127 → 20–200 BPM)
+# Incoming CC that controls BPM (maps 0–127 → 20–200 BPM)
 cc_type       = "cc"
 cc_channel    = 1
 cc_controller = 21
+
+# Incoming CC that starts/stops the metronome (value >= 64 = start, value < 64 = stop)
+# MIDI Transport Start (0xFA), Stop (0xFC), and Continue (0xFB) are also honoured.
+start_stop_channel    = 1
+start_stop_controller = 22
+
+# Whether the metronome starts playing immediately on launch (default: true)
+start_running = true

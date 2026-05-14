@@ -180,8 +180,9 @@ nested tables.
 
 ## Example: Simple Metronome
 
-See `routes.d/metronome.lua`. Plays GM percussion clicks and accepts a
-configurable MIDI message to change BPM in real time.
+See `routes.d/metronome.lua`. Plays GM percussion clicks and accepts
+configurable MIDI control signals to start/stop playback and change BPM in
+real time.
 
 Configurable via `[metronome]` in `config.toml`:
 
@@ -195,11 +196,18 @@ Configurable via `[metronome]` in `config.toml`:
 | `velocity`      | 100     | Note velocity                                    |
 | `beats_per_bar` | 4       | Beats per bar                                    |
 | `note_len_ms`   | 20      | Note duration in ms (fixed, independent of BPM)  |
-| `cc_type`       | `"cc"`  | Incoming message type that controls BPM          |
-| `cc_channel`    | 1       | Incoming MIDI channel that controls BPM          |
-| `cc_controller` | 21      | CC controller number that controls BPM           |
+| `cc_type`            | `"cc"`  | Incoming message type that controls BPM                    |
+| `cc_channel`         | 1       | Incoming MIDI channel that controls BPM                    |
+| `cc_controller`      | 21      | CC controller number that controls BPM                     |
+| `start_stop_channel`    | 1    | MIDI channel for the start/stop CC                         |
+| `start_stop_controller` | 22   | CC controller that starts/stops the metronome              |
+| `start_running`      | `true`  | Whether the metronome starts playing immediately on launch  |
 
 BPM is clamped to the range 20–200 regardless of source.
+
+The start/stop CC uses the value to determine state: value ≥ 64 starts the
+metronome, value < 64 stops it. MIDI Transport messages (`start`, `stop`,
+`continue`) are also honoured and override the CC.
 
 ## Example: Invert Controllers
 
