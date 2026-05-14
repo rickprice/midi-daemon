@@ -20,6 +20,12 @@ default_bpm = 120.0
 # Can be overridden at runtime from Lua with set_ppqn().
 default_ppqn = 24
 
+# [keyboard-split]
+# split_note    = 60              # split at middle C (C4); notes below → bass, >= → lead
+# connect_input = ".*KeyLab.*"   # regex matched against "ClientName:PortName"
+# connect_bass  = ".*ZynAddSubFX.*"
+# connect_lead  = ".*Surge.*"
+
 [invert_controllers]
 # Message type to match
 type = "cc"
