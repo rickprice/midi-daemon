@@ -350,6 +350,25 @@ channel     = 1
 controllers = [7, 11]   # volume, expression
 ```
 
+## Example: Keyboard Split
+
+See `routes.d/keyboard-split.lua`. Splits a single keyboard at a configurable
+note: notes below go to a "bass" output, notes at or above go to a "lead"
+output. Non-note messages (CC, pitch bend, …) are broadcast to both. Demonstrates
+per-port auto-connect driven from config.toml.
+
+```toml
+[keyboard-split]
+split_note    = 60              # split at middle C (C4)
+connect_input = ".*KeyLab.*"   # auto-connect keyboard input on startup
+connect_bass  = ".*ZynAddSubFX.*"
+connect_lead  = ".*Surge.*"
+```
+
+The `connect_*` keys are all optional — omit any you don't need and connect
+that port manually with `aconnect`, or rely on `default_connect_input` /
+`default_connect_output` in the top-level config.
+
 ## Example: Transpose
 
 See `routes.d/transpose.lua`. Shifts all notes up by a configurable interval,
