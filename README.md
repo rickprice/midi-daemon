@@ -85,6 +85,9 @@ cp my-route.lua ~/.config/midi-daemon/routes.d/
 rm ~/.config/midi-daemon/routes.d/my-route.lua
 ```
 
+Edit `config.toml` — the daemon detects the change and reloads all routes
+with the updated configuration automatically (no restart needed).
+
 ### System-wide
 
 ```bash
@@ -96,6 +99,9 @@ journalctl -u midi-daemon -f
 sudo cp my-route.lua /etc/midi-daemon/routes.d/
 sudo rm /etc/midi-daemon/routes.d/my-route.lua
 ```
+
+Edit `config.toml` — the daemon detects the change and reloads all routes
+with the updated configuration automatically (no restart needed).
 
 ## Lua API
 
@@ -156,6 +162,10 @@ The daemon searches for a config file in this order:
 default_bpm  = 120.0
 default_ppqn = 24
 ```
+
+Changes to `config.toml` are picked up automatically and all routes are
+reloaded with the new values. The one exception is `routes_dir` — changing
+it requires a daemon restart.
 
 ### Per-route configuration
 

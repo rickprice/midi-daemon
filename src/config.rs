@@ -11,6 +11,8 @@ pub struct Config {
     pub default_ppqn: u32,
     /// Per-route config sections, e.g. `[metronome]` in config.toml
     pub route_configs: HashMap<String, toml::Value>,
+    /// Path to the config file that was loaded, or None if using built-in defaults.
+    pub config_path: Option<PathBuf>,
 }
 
 /// Internal deserialization target. `routes_dir` is optional so the caller
@@ -27,12 +29,13 @@ struct RawConfig {
 }
 
 impl RawConfig {
-    fn into_config(self, default_routes_dir: PathBuf) -> Config {
+    fn into_config(self, default_routes_dir: PathBuf, config_path: Option<PathBuf>) -> Config {
         Config {
             routes_dir: self.routes_dir.unwrap_or(default_routes_dir),
             default_bpm: self.default_bpm,
             default_ppqn: self.default_ppqn,
             route_configs: self.route_configs,
+            config_path,
         }
     }
 }
@@ -116,6 +119,7 @@ impl Config {
             default_bpm: default_bpm(),
             default_ppqn: default_ppqn(),
             route_configs: HashMap::new(),
+            config_path: None,
         })
     }
 
@@ -137,14 +141,24 @@ impl Config {
                 default_bpm: default_bpm(),
                 default_ppqn: default_ppqn(),
                 route_configs: HashMap::new(),
+                config_path: None,
             })
+        }
+    }
+
+    /// Re-read config from the same file it was originally loaded from.
+    /// Falls back to returning a clone of self if no file path is known.
+    pub fn reload(&self) -> Result<Self> {
+        match &self.config_path {
+            Some(path) => Self::load_file(path, self.routes_dir.clone()),
+            None => Ok(self.clone()),
         }
     }
 
     fn load_file(path: &Path, default_routes_dir: PathBuf) -> Result<Self> {
         let text = std::fs::read_to_string(path)?;
         let raw: RawConfig = toml::from_str(&text)?;
-        Ok(raw.into_config(default_routes_dir))
+        Ok(raw.into_config(default_routes_dir, Some(path.to_path_buf())))
     }
 }
 
