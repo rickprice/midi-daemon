@@ -3,6 +3,10 @@ name = "midi-daemon"
 version = "0.1.0"
 edition = "2021"
 description = "A Lua-scriptable MIDI routing daemon"
+license = "BSD-3-Clause"
+repository = "https://github.com/rickprice/midi-daemon"
+readme = "README.md"
+authors = ["Frederick Price <fprice@pricemail.ca>"]
 
 [[bin]]
 name = "midi-daemon"
