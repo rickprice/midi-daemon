@@ -3,18 +3,19 @@
 -- Plays a high click on beat 1, low click on other beats.
 -- Virtual ports created: midi-daemon:metronome (in + out)
 
--- MIDI note numbers for the clicks
-local BEAT_1_NOTE = 37  -- Side Stick (GM)
-local BEAT_N_NOTE = 56  -- Cowbell (GM)
-local CHANNEL     = 10  -- GM percussion channel
-local VELOCITY    = 100
-local NOTE_LEN_MS = 20  -- milliseconds (approximate, via tick count)
+local BEAT_1_NOTE  = config.beat_1_note  or 37   -- Side Stick (GM)
+local BEAT_N_NOTE  = config.beat_n_note  or 56   -- Cowbell (GM)
+local CHANNEL      = config.channel      or 10   -- GM percussion channel
+local VELOCITY     = config.velocity     or 100
+local BEATS_PER_BAR = config.beats_per_bar or 4
 
--- Time signature
-local BEATS_PER_BAR = 4
+-- Incoming message that controls BPM: cc_type / cc_channel / cc_controller
+local CC_TYPE       = config.cc_type       or "cc"
+local CC_CHANNEL    = config.cc_channel    or 1
+local CC_CONTROLLER = config.cc_controller or 21
 
-set_bpm(120)
-set_ppqn(24)  -- 24 ticks per quarter note
+set_bpm(config.bpm   or 120)
+set_ppqn(config.ppqn or 24)
 
 local beat = 0
 local note_off_at = {}  -- tick -> {note, channel}
@@ -44,10 +45,9 @@ function on_tick(tick, bpm, ppqn)
     end
 end
 
--- Optionally react to incoming MIDI CC to change BPM
--- CC 21 on channel 1 maps 0–127 → 20–200 BPM
+-- React to incoming MIDI CC to change BPM (CC maps 0–127 → 20–200 BPM)
 function on_midi(msg)
-    if msg.type == "cc" and msg.channel == 1 and msg.controller == 21 then
+    if msg.type == CC_TYPE and msg.channel == CC_CHANNEL and msg.controller == CC_CONTROLLER then
         local new_bpm = 20 + (msg.value / 127.0) * 180
         set_bpm(new_bpm)
         log(string.format("BPM changed to %.1f", new_bpm))

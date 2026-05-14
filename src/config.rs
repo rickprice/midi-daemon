@@ -1,5 +1,6 @@
 use anyhow::Result;
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 #[derive(Debug, Deserialize, Clone)]
@@ -15,6 +16,10 @@ pub struct Config {
     /// Default pulses per quarter note
     #[serde(default = "default_ppqn")]
     pub default_ppqn: u32,
+
+    /// Per-route config sections, e.g. `[metronome]` in config.toml
+    #[serde(flatten)]
+    pub route_configs: HashMap<String, toml::Value>,
 }
 
 fn default_routes_dir() -> PathBuf {
@@ -40,6 +45,11 @@ pub fn default_config_path() -> PathBuf {
 }
 
 impl Config {
+    /// Returns the `[route_name]` section from config.toml, if present.
+    pub fn route_config(&self, name: &str) -> Option<&toml::Table> {
+        self.route_configs.get(name)?.as_table()
+    }
+
     pub fn load(path: &PathBuf) -> Result<Self> {
         if path.exists() {
             let text = std::fs::read_to_string(path)?;
@@ -53,6 +63,7 @@ impl Config {
                 routes_dir: default_routes_dir(),
                 default_bpm: default_bpm(),
                 default_ppqn: default_ppqn(),
+                route_configs: HashMap::new(),
             })
         }
     }

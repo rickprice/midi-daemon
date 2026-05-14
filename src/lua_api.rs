@@ -1,5 +1,32 @@
 use mlua::prelude::*;
 
+/// Convert a TOML table into a Lua table, recursively.
+pub fn toml_table_to_lua(lua: &Lua, table: &toml::Table) -> LuaResult<LuaTable> {
+    let t = lua.create_table()?;
+    for (k, v) in table {
+        t.set(k.as_str(), toml_value_to_lua(lua, v)?)?;
+    }
+    Ok(t)
+}
+
+fn toml_value_to_lua(lua: &Lua, value: &toml::Value) -> LuaResult<LuaValue> {
+    match value {
+        toml::Value::String(s) => Ok(LuaValue::String(lua.create_string(s)?)),
+        toml::Value::Integer(i) => Ok(LuaValue::Integer(*i)),
+        toml::Value::Float(f) => Ok(LuaValue::Number(*f)),
+        toml::Value::Boolean(b) => Ok(LuaValue::Boolean(*b)),
+        toml::Value::Array(arr) => {
+            let t = lua.create_table()?;
+            for (i, v) in arr.iter().enumerate() {
+                t.set(i + 1, toml_value_to_lua(lua, v)?)?;
+            }
+            Ok(LuaValue::Table(t))
+        }
+        toml::Value::Table(tbl) => Ok(LuaValue::Table(toml_table_to_lua(lua, tbl)?)),
+        toml::Value::Datetime(dt) => Ok(LuaValue::String(lua.create_string(&dt.to_string())?)),
+    }
+}
+
 /// A MIDI message passed between Rust and Lua as a table.
 /// Fields: type, channel, note, velocity, controller, value, data (raw bytes)
 pub fn midi_bytes_to_lua(lua: &Lua, bytes: &[u8]) -> LuaResult<LuaTable> {

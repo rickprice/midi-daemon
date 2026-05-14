@@ -8,7 +8,7 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use crate::config::Config;
-use crate::lua_api::{lua_to_midi_bytes, midi_bytes_to_lua};
+use crate::lua_api::{lua_to_midi_bytes, midi_bytes_to_lua, toml_table_to_lua};
 use crate::timer::{Timer, TimerEvent};
 
 enum RouteEvent {
@@ -90,6 +90,8 @@ impl Route {
 
         let (tx, rx) = mpsc::channel::<RouteEvent>(256);
 
+        let route_cfg = config.route_config(&name).cloned();
+
         let ports = match existing_ports {
             Some(p) => {
                 // Redirect the input callback to the new event channel.
@@ -130,6 +132,7 @@ impl Route {
                 rx,
                 out_for_thread,
                 timer_for_thread,
+                route_cfg,
             ) {
                 error!("Route '{}' event loop error: {}", name_for_thread, e);
             }
@@ -151,6 +154,7 @@ fn run_lua_event_loop(
     mut rx: mpsc::Receiver<RouteEvent>,
     out_conn: Arc<Mutex<MidiOutputConnection>>,
     timer: Arc<Timer>,
+    route_cfg: Option<toml::Table>,
 ) -> Result<()> {
     let lua = Lua::new();
 
@@ -214,6 +218,16 @@ fn run_lua_event_loop(
             Ok(())
         })?;
         lua.globals().set("log", f)?;
+    }
+
+    // --- Expose `config` table ---
+    {
+        let cfg_table = match route_cfg {
+            Some(ref tbl) => toml_table_to_lua(&lua, tbl)
+                .map_err(|e| anyhow::anyhow!("Failed to convert route config to Lua table: {}", e))?,
+            None => lua.create_table()?,
+        };
+        lua.globals().set("config", cfg_table)?;
     }
 
     // --- Load the user script ---

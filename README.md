@@ -107,10 +107,48 @@ default_bpm  = 120.0
 default_ppqn = 24
 ```
 
+### Per-route configuration
+
+Add a TOML section named after the route file (without `.lua`) to pass
+configuration into that route's `config` global table:
+
+```toml
+[my-route]
+some_key = "value"
+some_number = 42
+```
+
+In `my-route.lua`:
+
+```lua
+local value = config.some_key    or "default"
+local num   = config.some_number or 0
+```
+
+Any TOML type is supported: strings, integers, floats, booleans, arrays, and
+nested tables.
+
 ## Example: Simple Metronome
 
-See `routes.d/metronome.lua`. Plays GM percussion clicks and accepts CC 21
-on channel 1 to change BPM in real time.
+See `routes.d/metronome.lua`. Plays GM percussion clicks and accepts a
+configurable MIDI message to change BPM in real time.
+
+Configurable via `[metronome]` in `config.toml`:
+
+| Key             | Default | Description                                      |
+|-----------------|---------|--------------------------------------------------|
+| `bpm`           | 120.0   | Initial BPM                                      |
+| `ppqn`          | 24      | Pulses per quarter note                          |
+| `beat_1_note`   | 37      | MIDI note for beat 1 (GM: Side Stick)            |
+| `beat_n_note`   | 56      | MIDI note for other beats (GM: Cowbell)          |
+| `channel`       | 10      | MIDI output channel (GM: percussion)             |
+| `velocity`      | 100     | Note velocity                                    |
+| `beats_per_bar` | 4       | Beats per bar                                    |
+| `cc_type`       | `"cc"`  | Incoming message type that controls BPM          |
+| `cc_channel`    | 1       | Incoming MIDI channel that controls BPM          |
+| `cc_controller` | 21      | CC controller number that controls BPM           |
+
+BPM is clamped to the range 20–200 regardless of source.
 
 ## Example: Transpose
 
