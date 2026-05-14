@@ -200,6 +200,26 @@ Configurable via `[metronome]` in `config.toml`:
 
 BPM is clamped to the range 20–200 regardless of source.
 
+## Example: Invert Controllers
+
+See `routes.d/invert_controllers.lua`. Forwards all MIDI, inverting the
+value (`0–127 → 127–0`) for a configured set of controllers.
+
+Configurable via `[invert_controllers]` in `config.toml`:
+
+| Key           | Default | Description                              |
+|---------------|---------|------------------------------------------|
+| `type`        | `"cc"`  | Message type to match                    |
+| `channel`     | 1       | MIDI channel to match                    |
+| `controllers` | `[]`    | List of controller numbers to invert     |
+
+```toml
+[invert_controllers]
+type        = "cc"
+channel     = 1
+controllers = [7, 11]   # volume, expression
+```
+
 ## Example: Transpose
 
 See `routes.d/transpose.lua`. Shifts all notes up by a configurable interval,

@@ -14,6 +14,14 @@ default_bpm = 120.0
 # Can be overridden at runtime from Lua with set_ppqn().
 default_ppqn = 24
 
+[invert_controllers]
+# Message type to match
+type = "cc"
+# MIDI channel to match
+channel = 1
+# CC controller numbers whose values should be inverted (0–127 → 127–0)
+controllers = [7, 11]   # volume, expression
+
 [metronome]
 # Timer
 bpm  = 120.0
