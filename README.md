@@ -194,6 +194,7 @@ Configurable via `[metronome]` in `config.toml`:
 | `channel`       | 10      | MIDI output channel (GM: percussion)             |
 | `velocity`      | 100     | Note velocity                                    |
 | `beats_per_bar` | 4       | Beats per bar                                    |
+| `note_len_ms`   | 20      | Note duration in ms (fixed, independent of BPM)  |
 | `cc_type`       | `"cc"`  | Incoming message type that controls BPM          |
 | `cc_channel`    | 1       | Incoming MIDI channel that controls BPM          |
 | `cc_controller` | 21      | CC controller number that controls BPM           |

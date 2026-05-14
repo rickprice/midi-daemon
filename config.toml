@@ -33,6 +33,7 @@ beat_n_note = 56   # Cowbell
 channel     = 10   # GM percussion channel
 velocity    = 100
 beats_per_bar = 4
+note_len_ms   = 20   # fixed note duration in milliseconds (independent of BPM)
 
 # Incoming message that controls BPM (maps 0–127 → 20–200 BPM)
 cc_type       = "cc"

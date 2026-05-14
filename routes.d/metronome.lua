@@ -8,6 +8,7 @@ local BEAT_N_NOTE  = config.beat_n_note  or 56   -- Cowbell (GM)
 local CHANNEL      = config.channel      or 10   -- GM percussion channel
 local VELOCITY     = config.velocity     or 100
 local BEATS_PER_BAR = config.beats_per_bar or 4
+local NOTE_LEN_MS   = config.note_len_ms   or 20   -- fixed note duration in ms
 
 -- Incoming message that controls BPM: cc_type / cc_channel / cc_controller
 local CC_TYPE       = config.cc_type       or "cc"
@@ -36,8 +37,10 @@ function on_tick(tick, bpm, ppqn)
 
         send({ type = "note_on", channel = CHANNEL, note = note, velocity = VELOCITY })
 
-        -- Schedule note-off ~20ms later (approximate: 1 tick at 120bpm/24ppqn ≈ 20.8ms)
-        local off_tick = tick + 1
+        -- Schedule note-off after a fixed wall-clock duration regardless of BPM.
+        -- Tick duration = 60000 / (bpm * ppqn) ms, so ticks needed for NOTE_LEN_MS:
+        local off_ticks = math.max(1, math.floor(NOTE_LEN_MS * bpm * ppqn / 60000.0 + 0.5))
+        local off_tick = tick + off_ticks
         note_off_at[off_tick] = note_off_at[off_tick] or {}
         table.insert(note_off_at[off_tick], { note = note, channel = CHANNEL })
 
