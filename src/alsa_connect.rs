@@ -299,7 +299,7 @@ impl ConnectionManager {
 mod tests {
     use super::*;
     use crate::route::{ConnectDecl, PortDecl};
-    use std::collections::HashMap;
+
 
     fn make_connect(inputs: &[(&str, &str)], outputs: &[(&str, &str)]) -> ConnectDecl {
         ConnectDecl {
