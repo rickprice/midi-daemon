@@ -7,13 +7,21 @@
 -- ALSA ports created:
 --   inputs:  midi-daemon:two-input-two-output/keyboard-in
 --            midi-daemon:two-input-two-output/pad-in
---   outputs: midi-daemon:two-input-two-output/synth
---            midi-daemon:two-input-two-output/drums
+--   outputs: midi-daemon:two-input-two-output/synth-out
+--            midi-daemon:two-input-two-output/drums-out
+--
+-- Optional: auto-connect to physical devices on startup (regex on "Client:Port").
+-- connect.inputs uses per-port patterns; connect.output applies to all outputs.
+-- Remove or leave connect nil to skip auto-connection.
 
 function init()
     return {
         inputs  = {"keyboard", "pad"},
         outputs = {"synth", "drums"},
+        -- connect = {
+        --     inputs  = { keyboard = ".*KeyLab.*", pad = ".*LinnStrument.*" },
+        --     output  = ".*Surge.*",   -- same synth for both outputs
+        -- },
     }
 end
 

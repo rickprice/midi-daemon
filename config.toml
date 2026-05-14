@@ -9,6 +9,12 @@
 # Can be overridden at runtime from Lua with set_bpm().
 default_bpm = 120.0
 
+# Auto-connect: regex matched against "ClientName:PortName" of ALSA ports.
+# Applied to every route input/output that has no per-route pattern.
+# Uncomment and set to your controller/synth name to wire everything at once.
+# default_connect_input  = ".*My Keyboard.*"
+# default_connect_output = ".*My Synth.*"
+
 # Pulses per quarter note — controls tick resolution.
 # 24 = standard MIDI clock, 96 = high resolution.
 # Can be overridden at runtime from Lua with set_ppqn().

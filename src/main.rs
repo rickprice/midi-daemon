@@ -1,3 +1,4 @@
+mod alsa_connect;
 mod config;
 mod route;
 mod timer;
@@ -11,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
+use alsa_connect::ConnectionManager;
 use config::Config;
 use route::Route;
 
@@ -35,8 +37,11 @@ async fn main() -> Result<()> {
     let routes: Arc<Mutex<HashMap<String, Route>>> =
         Arc::new(Mutex::new(HashMap::new()));
 
+    let conn_mgr = Arc::new(ConnectionManager::new());
+    Arc::clone(&conn_mgr).spawn_watcher();
+
     // Initial load of all .lua files
-    load_all_routes(&routes_dir, Arc::clone(&config), Arc::clone(&routes)).await?;
+    load_all_routes(&routes_dir, Arc::clone(&config), Arc::clone(&routes), Arc::clone(&conn_mgr)).await?;
 
     // inotify watcher for hot-reload
     enum WatchEvent {
@@ -92,12 +97,15 @@ async fn main() -> Result<()> {
                 if path.exists() {
                     match Route::start(&path, Arc::clone(&config), old_ports) {
                         Ok(route) => {
+                            conn_mgr.register_route(&name, route.port_decl(), &route.connect_decl);
+                            conn_mgr.apply_all();
                             routes.lock().unwrap().insert(name.clone(), route);
                             info!("Reloaded route: {}", name);
                         }
                         Err(e) => error!("Failed to load route {}: {}", name, e),
                     }
                 } else {
+                    conn_mgr.unregister_route(&name);
                     info!("Removed route: {}", name);
                 }
             }
@@ -111,7 +119,7 @@ async fn main() -> Result<()> {
                             );
                         }
                         config = Arc::new(new_cfg);
-                        reload_all_routes(&routes_dir, Arc::clone(&config), Arc::clone(&routes));
+                        reload_all_routes(&routes_dir, Arc::clone(&config), Arc::clone(&routes), Arc::clone(&conn_mgr));
                         info!("Config reloaded");
                     }
                     Err(e) => error!("Failed to reload config.toml: {}", e),
@@ -127,6 +135,7 @@ fn reload_all_routes(
     dir: &PathBuf,
     config: Arc<Config>,
     routes: Arc<Mutex<HashMap<String, Route>>>,
+    conn_mgr: Arc<ConnectionManager>,
 ) {
     let names: Vec<String> = routes.lock().unwrap().keys().cloned().collect();
     for name in names {
@@ -134,18 +143,21 @@ fn reload_all_routes(
         let old_ports = routes.lock().unwrap().remove(&name).map(|r| r.take_ports());
         match Route::start(&path, Arc::clone(&config), old_ports) {
             Ok(route) => {
+                conn_mgr.register_route(&name, route.port_decl(), &route.connect_decl);
                 routes.lock().unwrap().insert(name.clone(), route);
                 info!("Reloaded route '{}' with new config", name);
             }
             Err(e) => error!("Failed to reload route '{}': {}", name, e),
         }
     }
+    conn_mgr.apply_all();
 }
 
 async fn load_all_routes(
     dir: &PathBuf,
     config: Arc<Config>,
     routes: Arc<Mutex<HashMap<String, Route>>>,
+    conn_mgr: Arc<ConnectionManager>,
 ) -> Result<()> {
     if !dir.exists() {
         std::fs::create_dir_all(dir)?;
@@ -153,25 +165,29 @@ async fn load_all_routes(
         return Ok(());
     }
 
-    let mut map = routes.lock().unwrap();
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().map(|e| e == "lua").unwrap_or(false) {
-            let name = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("unknown")
-                .to_string();
+    {
+        let mut map = routes.lock().unwrap();
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().map(|e| e == "lua").unwrap_or(false) {
+                let name = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("unknown")
+                    .to_string();
 
-            match Route::start(&path, Arc::clone(&config), None) {
-                Ok(route) => {
-                    info!("Loaded route: {}", name);
-                    map.insert(name, route);
+                match Route::start(&path, Arc::clone(&config), None) {
+                    Ok(route) => {
+                        conn_mgr.register_route(&name, route.port_decl(), &route.connect_decl);
+                        info!("Loaded route: {}", name);
+                        map.insert(name, route);
+                    }
+                    Err(e) => error!("Failed to load route {}: {}", name, e),
                 }
-                Err(e) => error!("Failed to load route {}: {}", name, e),
             }
         }
     }
+    conn_mgr.apply_all();
     Ok(())
 }

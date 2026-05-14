@@ -8,6 +8,13 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
+/// Connect patterns for a route's ports: port_name → regex string.
+#[derive(Debug, Clone, Default)]
+pub struct ConnectDecl {
+    pub inputs: HashMap<String, String>,
+    pub outputs: HashMap<String, String>,
+}
+
 use crate::config::Config;
 use crate::lua_api::{lua_to_midi_bytes, midi_bytes_to_lua, toml_table_to_lua};
 use crate::timer::{Timer, TimerEvent};
@@ -38,7 +45,7 @@ impl Default for PortDecl {
 
 impl PortDecl {
     /// True when this is the single unnamed default port (uses backward-compat ALSA names).
-    fn is_default(&self) -> bool {
+    pub fn is_default(&self) -> bool {
         self.inputs.len() == 1
             && self.inputs[0] == "default"
             && self.outputs.len() == 1
@@ -142,12 +149,17 @@ pub struct Route {
     ports: Arc<RoutePorts>,
     _timer: Arc<Timer>,
     _thread: std::thread::JoinHandle<()>,
+    pub connect_decl: ConnectDecl,
 }
 
 impl Route {
     /// Consume the route and return its ports so they can be reused on reload.
     pub fn take_ports(self) -> Arc<RoutePorts> {
         self.ports
+    }
+
+    pub fn port_decl(&self) -> &PortDecl {
+        &self.ports.decl
     }
 
     pub fn start(
@@ -168,6 +180,26 @@ impl Route {
 
         // Determine port layout before creating/reusing ports.
         let decl = extract_port_decl(&script, &name, route_cfg.as_ref())?;
+
+        // Build connect patterns: Lua/toml per-route, then fill missing with global defaults.
+        // `extract_connect_decl` stores per-route (all-ports) patterns under the "" key.
+        let mut connect_decl = extract_connect_decl(&script, &name, route_cfg.as_ref());
+        let all_input  = connect_decl.inputs.remove("").or_else(|| config.default_connect_input.clone());
+        let all_output = connect_decl.outputs.remove("").or_else(|| config.default_connect_output.clone());
+        for port_name in &decl.inputs {
+            if !connect_decl.inputs.contains_key(port_name) {
+                if let Some(ref pat) = all_input {
+                    connect_decl.inputs.insert(port_name.clone(), pat.clone());
+                }
+            }
+        }
+        for port_name in &decl.outputs {
+            if !connect_decl.outputs.contains_key(port_name) {
+                if let Some(ref pat) = all_output {
+                    connect_decl.outputs.insert(port_name.clone(), pat.clone());
+                }
+            }
+        }
 
         let (tx, rx) = mpsc::channel::<RouteEvent>(256);
 
@@ -226,6 +258,7 @@ impl Route {
             ports,
             _timer: timer,
             _thread: thread,
+            connect_decl,
         })
     }
 }
@@ -299,6 +332,80 @@ fn extract_port_decl(
     }
 
     Ok(PortDecl::default())
+}
+
+// ── Connect pattern extraction ────────────────────────────────────────────────
+
+/// Extract per-port connect regex patterns from Lua init() and config.toml.
+/// Priority: Lua per-port > Lua per-route > toml per-route.
+/// Global defaults are applied by the caller (Route::start).
+fn extract_connect_decl(
+    script: &str,
+    name: &str,
+    route_cfg: Option<&toml::Table>,
+) -> ConnectDecl {
+    let mut decl = ConnectDecl::default();
+
+    // Try Lua init()
+    let lua = Lua::new();
+    let _ = lua.globals().set("send", lua.create_function(|_, _: LuaMultiValue| Ok(())).unwrap());
+    let _ = lua.globals().set("set_bpm", lua.create_function(|_, _: f64| Ok(())).unwrap());
+    let _ = lua.globals().set("get_bpm", lua.create_function(|_, ()| -> LuaResult<f64> { Ok(120.0) }).unwrap());
+    let _ = lua.globals().set("set_ppqn", lua.create_function(|_, _: u32| Ok(())).unwrap());
+    let _ = lua.globals().set("get_ppqn", lua.create_function(|_, ()| -> LuaResult<u32> { Ok(24) }).unwrap());
+    let _ = lua.globals().set("log", lua.create_function(|_, _: String| Ok(())).unwrap());
+    if let Some(tbl) = route_cfg {
+        if let Ok(cfg) = crate::lua_api::toml_table_to_lua(&lua, tbl) {
+            let _ = lua.globals().set("config", cfg);
+        }
+    } else {
+        let _ = lua.globals().set("config", lua.create_table().unwrap());
+    }
+
+    if lua.load(script).set_name(name).exec().is_ok() {
+        if let Ok(Some(init_fn)) = lua.globals().get::<Option<LuaFunction>>("init") {
+            if let Ok(LuaValue::Table(result)) = init_fn.call::<LuaValue>(()) {
+                if let Ok(LuaValue::Table(connect_tbl)) = result.get::<LuaValue>("connect") {
+                    // Singular `input`/`output` — applies to all ports of that direction.
+                    let all_input: Option<String> = connect_tbl
+                        .get::<LuaValue>("input").ok()
+                        .and_then(|v| if let LuaValue::String(s) = v { s.to_str().ok().as_deref().map(str::to_string) } else { None });
+                    let all_output: Option<String> = connect_tbl
+                        .get::<LuaValue>("output").ok()
+                        .and_then(|v| if let LuaValue::String(s) = v { s.to_str().ok().as_deref().map(str::to_string) } else { None });
+
+                    // Plural `inputs`/`outputs` tables — per port name.
+                    if let Ok(LuaValue::Table(inputs_tbl)) = connect_tbl.get::<LuaValue>("inputs") {
+                        for pair in inputs_tbl.pairs::<String, String>() {
+                            if let Ok((k, v)) = pair { decl.inputs.insert(k, v); }
+                        }
+                    }
+                    if let Ok(LuaValue::Table(outputs_tbl)) = connect_tbl.get::<LuaValue>("outputs") {
+                        for pair in outputs_tbl.pairs::<String, String>() {
+                            if let Ok((k, v)) = pair { decl.outputs.insert(k, v); }
+                        }
+                    }
+
+                    // Store singular patterns as a sentinel under "" so Route::start can
+                    // propagate them to named ports that have no per-port pattern.
+                    if let Some(pat) = all_input { decl.inputs.insert("".into(), pat); }
+                    if let Some(pat) = all_output { decl.outputs.insert("".into(), pat); }
+                }
+            }
+        }
+    }
+
+    // Toml per-route: `connect_input`/`connect_output` keys.
+    if let Some(cfg) = route_cfg {
+        if let Some(toml::Value::String(pat)) = cfg.get("connect_input") {
+            decl.inputs.entry("".into()).or_insert_with(|| pat.clone());
+        }
+        if let Some(toml::Value::String(pat)) = cfg.get("connect_output") {
+            decl.outputs.entry("".into()).or_insert_with(|| pat.clone());
+        }
+    }
+
+    decl
 }
 
 fn parse_port_decl_from_lua(tbl: &LuaTable) -> Result<PortDecl> {

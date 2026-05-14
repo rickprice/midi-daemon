@@ -20,3 +20,5 @@ tracing   = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow    = "1"
 dirs      = "5"
+alsa = "0.9"
+regex = "1.12.3"

@@ -13,6 +13,10 @@ pub struct Config {
     pub route_configs: HashMap<String, toml::Value>,
     /// Path to the config file that was loaded, or None if using built-in defaults.
     pub config_path: Option<PathBuf>,
+    /// Regex applied to all route inputs when no per-route pattern is set.
+    pub default_connect_input: Option<String>,
+    /// Regex applied to all route outputs when no per-route pattern is set.
+    pub default_connect_output: Option<String>,
 }
 
 /// Internal deserialization target. `routes_dir` is optional so the caller
@@ -24,6 +28,8 @@ struct RawConfig {
     default_bpm: f64,
     #[serde(default = "default_ppqn")]
     default_ppqn: u32,
+    default_connect_input: Option<String>,
+    default_connect_output: Option<String>,
     #[serde(flatten)]
     route_configs: HashMap<String, toml::Value>,
 }
@@ -36,6 +42,8 @@ impl RawConfig {
             default_ppqn: self.default_ppqn,
             route_configs: self.route_configs,
             config_path,
+            default_connect_input: self.default_connect_input,
+            default_connect_output: self.default_connect_output,
         }
     }
 }
@@ -120,6 +128,8 @@ impl Config {
             default_ppqn: default_ppqn(),
             route_configs: HashMap::new(),
             config_path: None,
+            default_connect_input: None,
+            default_connect_output: None,
         })
     }
 
@@ -142,6 +152,8 @@ impl Config {
                 default_ppqn: default_ppqn(),
                 route_configs: HashMap::new(),
                 config_path: None,
+                default_connect_input: None,
+                default_connect_output: None,
             })
         }
     }
