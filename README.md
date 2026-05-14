@@ -17,17 +17,20 @@ cargo build --release
 
 ## Install
 
+### Per-user install
+
+Config and routes live in `~/.config/midi-daemon/`. The daemon runs under
+your own account as a systemd user service.
+
 ```bash
 # Install binary
 cargo install --path .
 
-# Create config directory
+# Create config and routes directories
 mkdir -p ~/.config/midi-daemon/routes.d
 
-# Copy example config
+# Copy example config and routes
 cp config.toml ~/.config/midi-daemon/config.toml
-
-# Copy example routes (optional)
 cp routes.d/*.lua ~/.config/midi-daemon/routes.d/
 
 # Install and enable systemd user service
@@ -37,22 +40,61 @@ systemctl --user daemon-reload
 systemctl --user enable --now midi-daemon
 ```
 
+### System-wide install
+
+Config and routes live in `/etc/midi-daemon/`. The daemon runs as a
+dedicated `midi-daemon` system user.
+
+```bash
+# Install binary
+sudo cargo install --path . --root /usr/local
+
+# Create a dedicated system user
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin midi-daemon
+# Add it to the audio group so it can access ALSA/PipeWire
+sudo usermod -aG audio midi-daemon
+
+# Create config and routes directories
+sudo mkdir -p /etc/midi-daemon/routes.d
+sudo chown -R midi-daemon:midi-daemon /etc/midi-daemon
+
+# Copy example config and routes
+sudo cp config.toml /etc/midi-daemon/config.toml
+sudo cp routes.d/*.lua /etc/midi-daemon/routes.d/
+sudo chown midi-daemon:midi-daemon /etc/midi-daemon/config.toml \
+    /etc/midi-daemon/routes.d/*.lua
+
+# Install and enable systemd system service
+sudo cp systemd/midi-daemon-system.service /etc/systemd/system/midi-daemon.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now midi-daemon
+```
+
 ## Usage
 
-Check status:
+### Per-user
+
 ```bash
 systemctl --user status midi-daemon
 journalctl --user -u midi-daemon -f
 ```
 
-Add a route — just drop a `.lua` file in `routes.d/` and it hot-reloads:
+Add or remove a route — the daemon hot-reloads automatically:
 ```bash
 cp my-route.lua ~/.config/midi-daemon/routes.d/
+rm ~/.config/midi-daemon/routes.d/my-route.lua
 ```
 
-Remove a route:
+### System-wide
+
 ```bash
-rm ~/.config/midi-daemon/routes.d/my-route.lua
+systemctl status midi-daemon
+journalctl -u midi-daemon -f
+```
+
+```bash
+sudo cp my-route.lua /etc/midi-daemon/routes.d/
+sudo rm /etc/midi-daemon/routes.d/my-route.lua
 ```
 
 ## Lua API
@@ -99,8 +141,16 @@ log(message)      -- Log a string to the systemd journal / stdout
 
 ## config.toml
 
+The daemon searches for a config file in this order:
+
+1. `$MIDI_DAEMON_CONFIG` — explicit path via environment variable
+2. `~/.config/midi-daemon/config.toml` — per-user
+3. `/etc/midi-daemon/config.toml` — system-wide
+4. Built-in defaults (routes dir inferred from whichever scope applies)
+
 ```toml
-# Path to routes directory (default: ~/.config/midi-daemon/routes.d)
+# Path to routes directory.
+# Default: <config-dir>/routes.d  (user or system, whichever was loaded)
 # routes_dir = "/custom/path"
 
 default_bpm  = 120.0

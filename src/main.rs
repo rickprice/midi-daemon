@@ -23,8 +23,7 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let config_path = config::default_config_path();
-    let config = Config::load(&config_path)?;
+    let config = Config::find_and_load()?;
 
     info!("Starting midi-daemon");
     info!("Routes directory: {}", config.routes_dir.display());

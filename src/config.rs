@@ -3,28 +3,41 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-#[derive(Debug, Deserialize, Clone)]
+/// Public config — fully resolved (no Option fields).
+#[derive(Debug, Clone)]
 pub struct Config {
-    /// Directory containing .lua route files
-    #[serde(default = "default_routes_dir")]
     pub routes_dir: PathBuf,
-
-    /// Default BPM for timers
-    #[serde(default = "default_bpm")]
     pub default_bpm: f64,
-
-    /// Default pulses per quarter note
-    #[serde(default = "default_ppqn")]
     pub default_ppqn: u32,
-
     /// Per-route config sections, e.g. `[metronome]` in config.toml
-    #[serde(flatten)]
     pub route_configs: HashMap<String, toml::Value>,
 }
 
-fn default_routes_dir() -> PathBuf {
-    default_config_dir().join("routes.d")
+/// Internal deserialization target. `routes_dir` is optional so the caller
+/// can supply the right default after knowing which config file was loaded.
+#[derive(Deserialize)]
+struct RawConfig {
+    routes_dir: Option<PathBuf>,
+    #[serde(default = "default_bpm")]
+    default_bpm: f64,
+    #[serde(default = "default_ppqn")]
+    default_ppqn: u32,
+    #[serde(flatten)]
+    route_configs: HashMap<String, toml::Value>,
 }
+
+impl RawConfig {
+    fn into_config(self, default_routes_dir: PathBuf) -> Config {
+        Config {
+            routes_dir: self.routes_dir.unwrap_or(default_routes_dir),
+            default_bpm: self.default_bpm,
+            default_ppqn: self.default_ppqn,
+            route_configs: self.route_configs,
+        }
+    }
+}
+
+// ── Path helpers ─────────────────────────────────────────────────────────────
 
 fn default_bpm() -> f64 {
     120.0
@@ -34,15 +47,22 @@ fn default_ppqn() -> u32 {
     24
 }
 
-fn default_config_dir() -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("~/.config"))
-        .join("midi-daemon")
+fn user_config_dir() -> Option<PathBuf> {
+    dirs::config_dir().map(|d| d.join("midi-daemon"))
 }
 
-pub fn default_config_path() -> PathBuf {
-    default_config_dir().join("config.toml")
+fn system_config_dir() -> PathBuf {
+    PathBuf::from("/etc/midi-daemon")
 }
+
+#[allow(dead_code)]
+pub fn default_config_path() -> PathBuf {
+    user_config_dir()
+        .unwrap_or_else(|| PathBuf::from("~/.config/midi-daemon"))
+        .join("config.toml")
+}
+
+// ── Config impl ───────────────────────────────────────────────────────────────
 
 impl Config {
     /// Returns the `[route_name]` section from config.toml, if present.
@@ -50,22 +70,84 @@ impl Config {
         self.route_configs.get(name)?.as_table()
     }
 
+    /// Search for a config file and load it. Lookup order:
+    ///   1. `$MIDI_DAEMON_CONFIG` environment variable
+    ///   2. `~/.config/midi-daemon/config.toml`  (user)
+    ///   3. `/etc/midi-daemon/config.toml`        (system)
+    ///   4. Built-in defaults
+    pub fn find_and_load() -> Result<Self> {
+        // 1. Explicit override
+        if let Ok(val) = std::env::var("MIDI_DAEMON_CONFIG") {
+            let path = PathBuf::from(&val);
+            let default_routes = path
+                .parent()
+                .unwrap_or(path.as_path())
+                .join("routes.d");
+            tracing::info!("Loading config from $MIDI_DAEMON_CONFIG: {}", path.display());
+            return Self::load_file(&path, default_routes);
+        }
+
+        // 2. User config
+        if let Some(dir) = user_config_dir() {
+            let path = dir.join("config.toml");
+            if path.exists() {
+                tracing::info!("Loading user config: {}", path.display());
+                return Self::load_file(&path, dir.join("routes.d"));
+            }
+        }
+
+        // 3. System config
+        {
+            let dir = system_config_dir();
+            let path = dir.join("config.toml");
+            if path.exists() {
+                tracing::info!("Loading system config: {}", path.display());
+                return Self::load_file(&path, dir.join("routes.d"));
+            }
+        }
+
+        // 4. No config found — fall back to built-in defaults
+        let (routes_dir, scope) = user_config_dir()
+            .map(|d| (d.join("routes.d"), "user"))
+            .unwrap_or_else(|| (system_config_dir().join("routes.d"), "system"));
+        tracing::info!("No config file found, using {} defaults", scope);
+        Ok(Config {
+            routes_dir,
+            default_bpm: default_bpm(),
+            default_ppqn: default_ppqn(),
+            route_configs: HashMap::new(),
+        })
+    }
+
+    /// Load from an explicit path. Useful for testing or when the caller
+    /// already knows which file to use.
+    #[allow(dead_code)]
+    /// Falls back to built-in defaults with `default_routes_dir` if the file
+    /// is absent.
     pub fn load(path: &PathBuf) -> Result<Self> {
+        let default_routes = path
+            .parent()
+            .unwrap_or(path.as_path())
+            .join("routes.d");
         if path.exists() {
-            let text = std::fs::read_to_string(path)?;
-            Ok(toml::from_str(&text)?)
+            Self::load_file(path, default_routes)
         } else {
-            tracing::info!(
-                "No config found at {}, using defaults",
-                path.display()
-            );
+            tracing::info!("No config found at {}, using defaults", path.display());
             Ok(Config {
-                routes_dir: default_routes_dir(),
+                routes_dir: user_config_dir()
+                    .unwrap_or_else(|| PathBuf::from("~/.config/midi-daemon"))
+                    .join("routes.d"),
                 default_bpm: default_bpm(),
                 default_ppqn: default_ppqn(),
                 route_configs: HashMap::new(),
             })
         }
+    }
+
+    fn load_file(path: &PathBuf, default_routes_dir: PathBuf) -> Result<Self> {
+        let text = std::fs::read_to_string(path)?;
+        let raw: RawConfig = toml::from_str(&text)?;
+        Ok(raw.into_config(default_routes_dir))
     }
 }
 
@@ -94,7 +176,7 @@ mod tests {
     #[test]
     fn missing_file_returns_defaults() {
         let path = PathBuf::from("/tmp/midi_daemon_nonexistent_config_abc123.toml");
-        let _ = std::fs::remove_file(&path); // ensure absent
+        let _ = std::fs::remove_file(&path);
         let cfg = Config::load(&path).unwrap();
         assert_eq!(cfg.default_bpm, 120.0);
         assert_eq!(cfg.default_ppqn, 24);
@@ -117,7 +199,7 @@ mod tests {
         let path = write_tmp("midi_daemon_test_partial.toml", "default_bpm = 90.0\n");
         let cfg = Config::load(&path).unwrap();
         assert!((cfg.default_bpm - 90.0).abs() < 1e-9);
-        assert_eq!(cfg.default_ppqn, 24); // default applied
+        assert_eq!(cfg.default_ppqn, 24);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -125,7 +207,7 @@ mod tests {
     fn load_ppqn_only() {
         let path = write_tmp("midi_daemon_test_ppqn.toml", "default_ppqn = 96\n");
         let cfg = Config::load(&path).unwrap();
-        assert_eq!(cfg.default_bpm, 120.0); // default applied
+        assert_eq!(cfg.default_bpm, 120.0);
         assert_eq!(cfg.default_ppqn, 96);
         let _ = std::fs::remove_file(&path);
     }
@@ -138,6 +220,15 @@ mod tests {
         );
         let cfg = Config::load(&path).unwrap();
         assert_eq!(cfg.routes_dir, PathBuf::from("/custom/routes"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn routes_dir_defaults_to_parent_of_config() {
+        let path = write_tmp("midi_daemon_test_routes_default.toml", "");
+        let cfg = Config::load(&path).unwrap();
+        let expected = path.parent().unwrap().join("routes.d");
+        assert_eq!(cfg.routes_dir, expected);
         let _ = std::fs::remove_file(&path);
     }
 
