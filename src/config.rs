@@ -268,4 +268,60 @@ mod tests {
         let p = default_config_path();
         assert_eq!(p.file_name().unwrap(), "config.toml");
     }
+
+    // ── default_connect_input / default_connect_output ────────────────────────
+
+    #[test]
+    fn connect_fields_absent_returns_none() {
+        let path = write_tmp("midi_daemon_test_no_connect.toml", "default_bpm = 120.0\n");
+        let cfg = Config::load(&path).unwrap();
+        assert!(cfg.default_connect_input.is_none());
+        assert!(cfg.default_connect_output.is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn connect_input_only_parses() {
+        let path = write_tmp(
+            "midi_daemon_test_connect_in.toml",
+            "default_connect_input = \".*KeyLab.*\"\n",
+        );
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.default_connect_input.as_deref(), Some(".*KeyLab.*"));
+        assert!(cfg.default_connect_output.is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn connect_output_only_parses() {
+        let path = write_tmp(
+            "midi_daemon_test_connect_out.toml",
+            "default_connect_output = \".*Surge.*\"\n",
+        );
+        let cfg = Config::load(&path).unwrap();
+        assert!(cfg.default_connect_input.is_none());
+        assert_eq!(cfg.default_connect_output.as_deref(), Some(".*Surge.*"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn connect_both_fields_parse() {
+        let path = write_tmp(
+            "midi_daemon_test_connect_both.toml",
+            "default_connect_input = \".*KeyLab.*\"\ndefault_connect_output = \".*Surge.*\"\n",
+        );
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.default_connect_input.as_deref(), Some(".*KeyLab.*"));
+        assert_eq!(cfg.default_connect_output.as_deref(), Some(".*Surge.*"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn connect_fields_survive_missing_file_fallback() {
+        let path = PathBuf::from("/tmp/midi_daemon_nonexistent_connect_xyz.toml");
+        let _ = std::fs::remove_file(&path);
+        let cfg = Config::load(&path).unwrap();
+        assert!(cfg.default_connect_input.is_none());
+        assert!(cfg.default_connect_output.is_none());
+    }
 }

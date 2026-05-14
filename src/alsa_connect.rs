@@ -266,3 +266,207 @@ fn watch_loop(mgr: &Arc<ConnectionManager>) -> Result<()> {
     }
 }
 
+// ── Test helpers ──────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+impl ConnectionManager {
+    fn spec_count(&self) -> usize {
+        self.specs.lock().unwrap().len()
+    }
+
+    fn spec_client_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.specs.lock().unwrap()
+            .iter().map(|s| s.our_client_name.clone()).collect();
+        names.sort();
+        names
+    }
+
+    /// Returns `Some(true)` if the spec is an Input direction, `Some(false)` for Output.
+    fn spec_dir_is_input(&self, client_name: &str) -> Option<bool> {
+        self.specs.lock().unwrap().iter()
+            .find(|s| s.our_client_name == client_name)
+            .map(|s| s.dir == ConnDir::Input)
+    }
+
+    fn spec_pattern(&self, client_name: &str) -> Option<String> {
+        self.specs.lock().unwrap().iter()
+            .find(|s| s.our_client_name == client_name)
+            .map(|s| s.pattern.as_str().to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::route::{ConnectDecl, PortDecl};
+    use std::collections::HashMap;
+
+    fn make_connect(inputs: &[(&str, &str)], outputs: &[(&str, &str)]) -> ConnectDecl {
+        ConnectDecl {
+            inputs:  inputs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            outputs: outputs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+        }
+    }
+
+    // ── register_route: default single-port layout ────────────────────────────
+
+    #[test]
+    fn default_port_input_uses_minus_in_suffix() {
+        let mgr = ConnectionManager::new();
+        let decl = PortDecl::default(); // inputs: ["default"], outputs: ["default"]
+        let connect = make_connect(&[("default", ".*KeyLab.*")], &[]);
+        mgr.register_route("transpose", &decl, &connect);
+        assert!(mgr.spec_client_names().contains(&"midi-daemon:transpose-in".to_string()));
+    }
+
+    #[test]
+    fn default_port_output_uses_minus_out_suffix() {
+        let mgr = ConnectionManager::new();
+        let decl = PortDecl::default();
+        let connect = make_connect(&[], &[("default", ".*Surge.*")]);
+        mgr.register_route("transpose", &decl, &connect);
+        assert!(mgr.spec_client_names().contains(&"midi-daemon:transpose-out".to_string()));
+    }
+
+    #[test]
+    fn default_port_input_direction_is_input() {
+        let mgr = ConnectionManager::new();
+        let decl = PortDecl::default();
+        let connect = make_connect(&[("default", ".*")], &[]);
+        mgr.register_route("r", &decl, &connect);
+        assert_eq!(mgr.spec_dir_is_input("midi-daemon:r-in"), Some(true));
+    }
+
+    #[test]
+    fn default_port_output_direction_is_output() {
+        let mgr = ConnectionManager::new();
+        let decl = PortDecl::default();
+        let connect = make_connect(&[], &[("default", ".*")]);
+        mgr.register_route("r", &decl, &connect);
+        assert_eq!(mgr.spec_dir_is_input("midi-daemon:r-out"), Some(false));
+    }
+
+    // ── register_route: multi-port layout ────────────────────────────────────
+
+    #[test]
+    fn multi_port_input_uses_slash_and_minus_in_suffix() {
+        let mgr = ConnectionManager::new();
+        let decl = PortDecl { inputs: vec!["keyboard".into()], outputs: vec!["synth".into()] };
+        let connect = make_connect(&[("keyboard", ".*KORG.*")], &[]);
+        mgr.register_route("router", &decl, &connect);
+        assert!(mgr.spec_client_names().contains(
+            &"midi-daemon:router/keyboard-in".to_string()
+        ));
+    }
+
+    #[test]
+    fn multi_port_output_uses_slash_and_minus_out_suffix() {
+        let mgr = ConnectionManager::new();
+        let decl = PortDecl { inputs: vec!["kbd".into()], outputs: vec!["synth".into()] };
+        let connect = make_connect(&[], &[("synth", ".*Surge.*")]);
+        mgr.register_route("router", &decl, &connect);
+        assert!(mgr.spec_client_names().contains(
+            &"midi-daemon:router/synth-out".to_string()
+        ));
+    }
+
+    #[test]
+    fn multi_port_two_inputs_two_outputs_produces_four_specs() {
+        let mgr = ConnectionManager::new();
+        let decl = PortDecl {
+            inputs:  vec!["kbd".into(), "pad".into()],
+            outputs: vec!["synth".into(), "drums".into()],
+        };
+        let connect = make_connect(
+            &[("kbd", ".*KeyLab.*"), ("pad", ".*Alesis.*")],
+            &[("synth", ".*Surge.*"), ("drums", ".*DrumKit.*")],
+        );
+        mgr.register_route("split", &decl, &connect);
+        assert_eq!(mgr.spec_count(), 4);
+    }
+
+    // ── register_route: pattern stored and direction correct ──────────────────
+
+    #[test]
+    fn registered_pattern_matches_provided_regex() {
+        let mgr = ConnectionManager::new();
+        let decl = PortDecl::default();
+        let connect = make_connect(&[("default", ".*My Keyboard.*")], &[]);
+        mgr.register_route("t", &decl, &connect);
+        assert_eq!(
+            mgr.spec_pattern("midi-daemon:t-in").as_deref(),
+            Some(".*My Keyboard.*")
+        );
+    }
+
+    // ── register_route: replace on re-register ────────────────────────────────
+
+    #[test]
+    fn re_register_replaces_old_specs() {
+        let mgr = ConnectionManager::new();
+        let decl = PortDecl::default();
+        mgr.register_route("t", &decl, &make_connect(&[("default", ".*Old.*")], &[]));
+        mgr.register_route("t", &decl, &make_connect(&[("default", ".*New.*")], &[]));
+        assert_eq!(mgr.spec_count(), 1);
+        assert_eq!(mgr.spec_pattern("midi-daemon:t-in").as_deref(), Some(".*New.*"));
+    }
+
+    #[test]
+    fn re_register_does_not_affect_other_routes() {
+        let mgr = ConnectionManager::new();
+        let decl = PortDecl::default();
+        mgr.register_route("a", &decl, &make_connect(&[("default", ".*A.*")], &[]));
+        mgr.register_route("b", &decl, &make_connect(&[("default", ".*B.*")], &[]));
+        mgr.register_route("a", &decl, &make_connect(&[("default", ".*A2.*")], &[]));
+        assert_eq!(mgr.spec_count(), 2);
+        assert_eq!(mgr.spec_pattern("midi-daemon:b-in").as_deref(), Some(".*B.*"));
+    }
+
+    // ── unregister_route ──────────────────────────────────────────────────────
+
+    #[test]
+    fn unregister_removes_all_specs_for_route() {
+        let mgr = ConnectionManager::new();
+        let decl = PortDecl::default();
+        mgr.register_route("x", &decl, &make_connect(&[("default", ".*")], &[("default", ".*")]));
+        assert_eq!(mgr.spec_count(), 2);
+        mgr.unregister_route("x");
+        assert_eq!(mgr.spec_count(), 0);
+    }
+
+    #[test]
+    fn unregister_only_removes_named_route() {
+        let mgr = ConnectionManager::new();
+        let decl = PortDecl::default();
+        mgr.register_route("keep", &decl, &make_connect(&[("default", ".*")], &[]));
+        mgr.register_route("drop", &decl, &make_connect(&[("default", ".*")], &[]));
+        mgr.unregister_route("drop");
+        assert_eq!(mgr.spec_count(), 1);
+        assert!(mgr.spec_client_names().contains(&"midi-daemon:keep-in".to_string()));
+    }
+
+    // ── invalid regex is silently skipped ────────────────────────────────────
+
+    #[test]
+    fn invalid_regex_skipped_does_not_panic() {
+        let mgr = ConnectionManager::new();
+        let decl = PortDecl::default();
+        let connect = make_connect(&[("default", "[invalid")], &[]);
+        mgr.register_route("t", &decl, &connect);
+        assert_eq!(mgr.spec_count(), 0);
+    }
+
+    // ── ports without a connect pattern produce no spec ───────────────────────
+
+    #[test]
+    fn port_without_pattern_produces_no_spec() {
+        let mgr = ConnectionManager::new();
+        let decl = PortDecl::default();
+        // Only the output has a pattern; input has none.
+        let connect = make_connect(&[], &[("default", ".*Synth.*")]);
+        mgr.register_route("t", &decl, &connect);
+        assert_eq!(mgr.spec_count(), 1);
+        assert!(mgr.spec_dir_is_input("midi-daemon:t-out") == Some(false));
+    }
+}
+
