@@ -1,7 +1,7 @@
 use anyhow::Result;
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Public config — fully resolved (no Option fields).
 #[derive(Debug, Clone)]
@@ -124,11 +124,8 @@ impl Config {
     #[allow(dead_code)]
     /// Falls back to built-in defaults with `default_routes_dir` if the file
     /// is absent.
-    pub fn load(path: &PathBuf) -> Result<Self> {
-        let default_routes = path
-            .parent()
-            .unwrap_or(path.as_path())
-            .join("routes.d");
+    pub fn load(path: &Path) -> Result<Self> {
+        let default_routes = path.parent().unwrap_or(path).join("routes.d");
         if path.exists() {
             Self::load_file(path, default_routes)
         } else {
@@ -144,7 +141,7 @@ impl Config {
         }
     }
 
-    fn load_file(path: &PathBuf, default_routes_dir: PathBuf) -> Result<Self> {
+    fn load_file(path: &Path, default_routes_dir: PathBuf) -> Result<Self> {
         let text = std::fs::read_to_string(path)?;
         let raw: RawConfig = toml::from_str(&text)?;
         Ok(raw.into_config(default_routes_dir))

@@ -19,7 +19,7 @@ pub struct Timer {
 impl Timer {
     pub fn new(default_bpm: f64, default_ppqn: u32) -> Self {
         Timer {
-            bpm: Arc::new(AtomicU32::new((default_bpm.clamp(20.0, 200.0) * 100.0) as u32)),
+            bpm: Arc::new(AtomicU32::new((default_bpm * 100.0) as u32)),
             ppqn: Arc::new(AtomicU32::new(default_ppqn)),
             running: Arc::new(AtomicBool::new(true)),
         }
@@ -43,11 +43,15 @@ impl Timer {
     }
 
     /// Spawn the timer loop in a dedicated thread.
-    /// Returns the thread handle.
-    pub fn spawn(
-        &self,
-        tx: mpsc::Sender<TimerEvent>,
-    ) -> std::thread::JoinHandle<()> {
+    ///
+    /// `map` converts each `TimerEvent` into the channel's message type,
+    /// allowing the timer to write directly into any route's event channel
+    /// without an intermediate forwarding task.
+    pub fn spawn<T, F>(&self, tx: mpsc::Sender<T>, map: F) -> std::thread::JoinHandle<()>
+    where
+        T: Send + 'static,
+        F: Fn(TimerEvent) -> T + Send + 'static,
+    {
         let bpm_atomic = Arc::clone(&self.bpm);
         let ppqn_atomic = Arc::clone(&self.ppqn);
         let running = Arc::clone(&self.running);
@@ -63,13 +67,11 @@ impl Timer {
                 let bpm = bpm_atomic.load(Ordering::Relaxed) as f64 / 100.0;
                 let ppqn = ppqn_atomic.load(Ordering::Relaxed);
 
-                // Duration per tick = 60 / (bpm * ppqn) seconds
                 let tick_secs = 60.0 / (bpm * ppqn as f64);
                 let duration = Duration::from_secs_f64(tick_secs);
 
                 let event = TimerEvent::Tick { tick, bpm, ppqn };
-                if tx.blocking_send(event).is_err() {
-                    // Receiver dropped — route is being torn down
+                if tx.blocking_send(map(event)).is_err() {
                     break;
                 }
 
@@ -154,7 +156,7 @@ mod tests {
         // 600 BPM × 1 PPQN = 10 ticks/second → expect several ticks in 500 ms
         let t = Timer::new(600.0, 1);
         let (tx, mut rx) = mpsc::channel(16);
-        let _handle = t.spawn(tx);
+        let _handle = t.spawn(tx, std::convert::identity);
 
         let mut count = 0u32;
         let deadline = tokio::time::timeout(Duration::from_millis(500), async {
@@ -173,7 +175,7 @@ mod tests {
     async fn tick_event_carries_correct_bpm_and_ppqn() {
         let t = Timer::new(120.0, 24);
         let (tx, mut rx) = mpsc::channel(4);
-        let _handle = t.spawn(tx);
+        let _handle = t.spawn(tx, std::convert::identity);
 
         let ev = tokio::time::timeout(Duration::from_secs(2), rx.recv())
             .await
@@ -189,7 +191,7 @@ mod tests {
     async fn tick_counter_is_monotonically_increasing() {
         let t = Timer::new(600.0, 1);
         let (tx, mut rx) = mpsc::channel(16);
-        let _handle = t.spawn(tx);
+        let _handle = t.spawn(tx, std::convert::identity);
 
         let mut prev: Option<u64> = None;
         let _ = tokio::time::timeout(Duration::from_millis(300), async {
@@ -212,7 +214,7 @@ mod tests {
         let t = Timer::new(600.0, 1);
         let running = Arc::clone(&t.running);
         let (tx, rx) = mpsc::channel(4);
-        let handle = t.spawn(tx);
+        let handle = t.spawn(tx, std::convert::identity);
 
         // Receive one tick then drop the receiver — timer thread should exit
         drop(rx);
@@ -227,7 +229,7 @@ mod tests {
     async fn bpm_change_reflected_in_subsequent_ticks() {
         let t = Timer::new(600.0, 1);
         let (tx, mut rx) = mpsc::channel(16);
-        let _handle = t.spawn(tx);
+        let _handle = t.spawn(tx, std::convert::identity);
 
         // Receive first tick (original BPM)
         let first = tokio::time::timeout(Duration::from_secs(1), rx.recv())
@@ -235,13 +237,15 @@ mod tests {
         let TimerEvent::Tick { bpm: bpm0, .. } = first;
         assert!((bpm0 - 600.0).abs() < 0.01);
 
-        t.set_bpm(300.0);
+        // Change to a value within the Lua-facing 20–200 range so set_bpm
+        // does not clamp it, and we can verify the change propagates.
+        t.set_bpm(100.0);
 
         // Receive ticks until we see the updated BPM
         let mut saw_new = false;
         let _ = tokio::time::timeout(Duration::from_millis(500), async {
             while let Some(TimerEvent::Tick { bpm, .. }) = rx.recv().await {
-                if (bpm - 300.0).abs() < 0.01 {
+                if (bpm - 100.0).abs() < 0.01 {
                     saw_new = true;
                     break;
                 }

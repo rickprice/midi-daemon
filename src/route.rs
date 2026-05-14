@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use midir::os::unix::{VirtualInput, VirtualOutput};
 use midir::{MidiInput, MidiInputConnection, MidiOutput, MidiOutputConnection};
 use mlua::prelude::*;
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
@@ -76,7 +76,7 @@ impl Route {
     }
 
     pub fn start(
-        lua_path: &PathBuf,
+        lua_path: &Path,
         config: Arc<Config>,
         existing_ports: Option<Arc<RoutePorts>>,
     ) -> Result<Self> {
@@ -103,18 +103,7 @@ impl Route {
 
         // --- Timer ---
         let timer = Arc::new(Timer::new(config.default_bpm, config.default_ppqn));
-        let timer_tx = tx.clone();
-        let _timer_thread = timer.spawn({
-            let (ttx, mut trx) = mpsc::channel::<TimerEvent>(256);
-            tokio::spawn(async move {
-                while let Some(ev) = trx.recv().await {
-                    if timer_tx.send(RouteEvent::Timer(ev)).await.is_err() {
-                        break;
-                    }
-                }
-            });
-            ttx
-        });
+        let _timer_thread = timer.spawn(tx.clone(), RouteEvent::Timer);
 
         // --- Lua script ---
         let script = std::fs::read_to_string(lua_path)
@@ -235,6 +224,10 @@ fn run_lua_event_loop(
         format!("Lua load error in '{}'", name)
     })?;
 
+    // Cache callbacks once — avoids a global-table lookup on every event.
+    let on_midi_fn: Option<LuaFunction> = lua.globals().get("on_midi").ok();
+    let on_tick_fn: Option<LuaFunction> = lua.globals().get("on_tick").ok();
+
     // --- Event loop ---
     loop {
         let event = match rx.blocking_recv() {
@@ -244,7 +237,7 @@ fn run_lua_event_loop(
 
         match event {
             RouteEvent::Midi(bytes) => {
-                if let Ok(on_midi) = lua.globals().get::<LuaFunction>("on_midi") {
+                if let Some(ref on_midi) = on_midi_fn {
                     match midi_bytes_to_lua(&lua, &bytes) {
                         Ok(msg) => {
                             if let Err(e) = on_midi.call::<()>(msg) {
@@ -256,7 +249,7 @@ fn run_lua_event_loop(
                 }
             }
             RouteEvent::Timer(TimerEvent::Tick { tick, bpm, ppqn }) => {
-                if let Ok(on_tick) = lua.globals().get::<LuaFunction>("on_tick") {
+                if let Some(ref on_tick) = on_tick_fn {
                     if let Err(e) = on_tick.call::<()>((tick, bpm, ppqn)) {
                         warn!("[{}] on_tick error: {}", name, e);
                     }
