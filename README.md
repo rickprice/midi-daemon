@@ -327,8 +327,15 @@ Configurable via `[metronome]` in `config.toml`:
 BPM is clamped to the range 20–200 regardless of source.
 
 The start/stop CC uses the value to determine state: value ≥ 64 starts the
-metronome, value < 64 stops it. MIDI Transport messages (`start`, `stop`,
-`continue`) are also honoured and override the CC.
+metronome, value < 64 stops it.
+
+MIDI Transport messages are also honoured:
+
+| Message    | Behaviour                                                  |
+|------------|------------------------------------------------------------|
+| `start`    | Reset to beat 1 and begin playing (re-syncs if running)    |
+| `continue` | Resume from the current beat position without resetting    |
+| `stop`     | Stop and reset beat position to beat 1                     |
 
 ## Example: Invert Controllers
 
@@ -373,3 +380,47 @@ that port manually with `aconnect`, or rely on `default_connect_input` /
 
 See `routes.d/transpose.lua`. Shifts all notes up by a configurable interval,
 passes everything else through unchanged.
+
+## Example: Timing Trainer
+
+See `routes.d/timing-trainer.lua`. Gives real-time feedback on how well you
+are keeping time with a metronome by outputting a pan CC that shifts left when
+you play early and right when you play late.
+
+Connect the `metronome-in` port to any source that sends a `note_on` on each
+beat (e.g. the `metronome.lua` output), and connect `keyboard-in` to your
+keyboard. Route `pan-out` to a panning plugin in your audio chain. The
+output is CC #10 (standard MIDI pan) on channel 1:
+
+- **0 (hard left)** — playing ahead of the beat
+- **64 (center)** — on time
+- **127 (hard right)** — playing behind the beat
+
+The CC value reflects a rolling average of recent hits, so the pan homes in
+on your overall tendency to rush or drag rather than reacting to every
+individual note. After a configurable period of silence the average resets
+and pan returns to center.
+
+Configurable via `[timing-trainer]` in `config.toml`:
+
+| Key                      | Default | Description                                               |
+|--------------------------|---------|-----------------------------------------------------------|
+| `pan_channel`            | 1       | MIDI channel for the pan CC output                        |
+| `pan_controller`         | 10      | CC number (10 = standard MIDI pan)                        |
+| `max_error_ms`           | 200     | ±ms of timing error that maps to fully left or right      |
+| `history_size`           | 8       | Number of recent hits included in the running average     |
+| `idle_seconds`           | 3       | Seconds of silence before resetting the average to center |
+| `start_stop_channel`     | 1       | MIDI channel for the enable/disable CC                    |
+| `start_stop_controller`  | 22      | CC number that enables (≥ 64) or disables (< 64) training |
+| `start_running`          | `true`  | Whether training is active immediately on launch          |
+
+MIDI Transport messages (`start`, `continue`, `stop`) are also honoured and
+will enable or disable training regardless of which input they arrive on.
+
+```toml
+[timing-trainer]
+max_error_ms  = 150   # tighter window for more sensitive feedback
+history_size  = 4     # react faster to changes in timing
+idle_seconds  = 5
+start_running = false # start disabled; enable via CC or transport start
+```
