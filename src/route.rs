@@ -153,9 +153,10 @@ pub struct Route {
 }
 
 impl Route {
-    /// Consume the route and return its ports so they can be reused on reload.
-    pub fn take_ports(self) -> Arc<RoutePorts> {
-        self.ports
+    /// Return a clone of the ports Arc so the caller can pass them to a new Route::start
+    /// without consuming (and stopping) this route first.
+    pub fn ports_arc(&self) -> Arc<RoutePorts> {
+        Arc::clone(&self.ports)
     }
 
     pub fn port_decl(&self) -> &PortDecl {

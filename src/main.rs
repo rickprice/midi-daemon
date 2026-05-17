@@ -89,22 +89,28 @@ async fn main() -> Result<()> {
                     None => continue,
                 };
 
-                info!("Detected change in {}.lua — reloading", name);
-
-                // Extract ports before dropping the old route so ALSA port IDs are preserved.
-                let old_ports = routes.lock().unwrap().remove(&name).map(|r| r.take_ports());
-
                 if path.exists() {
+                    info!("Detected change in {}.lua — reloading", name);
+
+                    // Borrow the existing ports Arc without removing the old route so that
+                    // ALSA port IDs are preserved and the old route stays alive if the
+                    // reload fails (e.g. Lua syntax error or ALSA error).
+                    let old_ports = routes.lock().unwrap()
+                        .get(&name).map(|r| r.ports_arc());
+
                     match Route::start(&path, Arc::clone(&config), old_ports) {
                         Ok(route) => {
                             conn_mgr.register_route(&name, route.port_decl(), &route.connect_decl);
                             conn_mgr.apply_all();
+                            // Replacing the old entry drops it, which stops its timer and
+                            // detaches its event-loop thread (which will drain and exit).
                             routes.lock().unwrap().insert(name.clone(), route);
                             info!("Reloaded route: {}", name);
                         }
-                        Err(e) => error!("Failed to load route {}: {}", name, e),
+                        Err(e) => error!("Failed to reload route {}: {}", name, e),
                     }
                 } else {
+                    routes.lock().unwrap().remove(&name);
                     conn_mgr.unregister_route(&name);
                     info!("Removed route: {}", name);
                 }
@@ -140,7 +146,7 @@ fn reload_all_routes(
     let names: Vec<String> = routes.lock().unwrap().keys().cloned().collect();
     for name in names {
         let path = dir.join(format!("{}.lua", name));
-        let old_ports = routes.lock().unwrap().remove(&name).map(|r| r.take_ports());
+        let old_ports = routes.lock().unwrap().get(&name).map(|r| r.ports_arc());
         match Route::start(&path, Arc::clone(&config), old_ports) {
             Ok(route) => {
                 conn_mgr.register_route(&name, route.port_decl(), &route.connect_decl);
