@@ -26,6 +26,14 @@ default_ppqn = 24
 # connect_bass  = ".*ZynAddSubFX.*"
 # connect_lead  = ".*Surge.*"
 
+# Per-port connect strings for multi-input/output routes.
+# connect_{portname}-in  matches a specific named input port
+# connect_{portname}-out matches a specific named output port
+# Example (timing-trainer has inputs "keyboard" and "metronome"):
+# [timing-trainer]
+# connect_keyboard-in  = ".*My Keyboard.*"
+# connect_metronome-in = ".*metronome-out.*"
+
 [invert_controllers]
 # Message type to match
 type = "cc"

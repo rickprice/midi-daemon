@@ -305,14 +305,37 @@ fn connect_from_lua_table(tbl: &LuaTable) -> ConnectDecl {
     decl
 }
 
-/// Merge `connect_input`/`connect_output` from config.toml into `decl` at lower priority.
+/// Merge connect patterns from config.toml into `decl` at lower priority.
+///
+/// Recognised keys (all optional, all string values):
+///   `connect_input`            — pattern applied to every input port (sentinel)
+///   `connect_output`           — pattern applied to every output port (sentinel)
+///   `connect_{portname}-in`    — pattern for the named input port specifically
+///   `connect_{portname}-out`   — pattern for the named output port specifically
+///
+/// Lua-declared patterns (already in `decl`) take priority via `or_insert_with`.
 fn connect_from_toml(mut decl: ConnectDecl, route_cfg: Option<&toml::Table>) -> ConnectDecl {
     if let Some(cfg) = route_cfg {
-        if let Some(toml::Value::String(pat)) = cfg.get("connect_input") {
-            decl.inputs.entry("".into()).or_insert_with(|| pat.clone());
-        }
-        if let Some(toml::Value::String(pat)) = cfg.get("connect_output") {
-            decl.outputs.entry("".into()).or_insert_with(|| pat.clone());
+        for (key, val) in cfg {
+            if let toml::Value::String(pat) = val {
+                if key == "connect_input" {
+                    decl.inputs.entry("".into()).or_insert_with(|| pat.clone());
+                } else if key == "connect_output" {
+                    decl.outputs.entry("".into()).or_insert_with(|| pat.clone());
+                } else if let Some(port) = key
+                    .strip_prefix("connect_")
+                    .and_then(|s| s.strip_suffix("-in"))
+                    .filter(|s| !s.is_empty())
+                {
+                    decl.inputs.entry(port.to_string()).or_insert_with(|| pat.clone());
+                } else if let Some(port) = key
+                    .strip_prefix("connect_")
+                    .and_then(|s| s.strip_suffix("-out"))
+                    .filter(|s| !s.is_empty())
+                {
+                    decl.outputs.entry(port.to_string()).or_insert_with(|| pat.clone());
+                }
+            }
         }
     }
     decl
@@ -1335,6 +1358,56 @@ mod tests {
     fn connect_toml_connect_output_stored_under_sentinel() {
         let c = connect_with_cfg("-- no init", "connect_output = \".*Surge.*\"");
         assert_eq!(c.outputs.get(""), Some(&".*Surge.*".to_string()));
+    }
+
+    #[test]
+    fn connect_toml_per_port_input_stored_by_name() {
+        let c = connect_with_cfg("-- no init", "\"connect_keyboard-in\" = \".*A-PRO.*\"");
+        assert_eq!(c.inputs.get("keyboard"), Some(&".*A-PRO.*".to_string()));
+        assert!(!c.inputs.contains_key(""));
+    }
+
+    #[test]
+    fn connect_toml_per_port_output_stored_by_name() {
+        let c = connect_with_cfg("-- no init", "\"connect_synth-out\" = \".*Surge.*\"");
+        assert_eq!(c.outputs.get("synth"), Some(&".*Surge.*".to_string()));
+        assert!(!c.outputs.contains_key(""));
+    }
+
+    #[test]
+    fn connect_toml_per_port_multiple_inputs() {
+        let c = connect_with_cfg(
+            "-- no init",
+            "\"connect_keyboard-in\" = \".*A-PRO.*\"\n\"connect_metronome-in\" = \".*metronome-out.*\"",
+        );
+        assert_eq!(c.inputs.get("keyboard"), Some(&".*A-PRO.*".to_string()));
+        assert_eq!(c.inputs.get("metronome"), Some(&".*metronome-out.*".to_string()));
+    }
+
+    #[test]
+    fn connect_toml_per_port_input_not_overridden_by_sentinel() {
+        // per-port key takes priority over the all-inputs sentinel in the same section
+        let c = connect_with_cfg(
+            "-- no init",
+            "connect_input = \".*Fallback.*\"\n\"connect_keyboard-in\" = \".*A-PRO.*\"",
+        );
+        assert_eq!(c.inputs.get("keyboard"), Some(&".*A-PRO.*".to_string()));
+        assert_eq!(c.inputs.get(""), Some(&".*Fallback.*".to_string()));
+    }
+
+    #[test]
+    fn connect_lua_per_port_overrides_toml_per_port() {
+        // Lua connect pattern wins over TOML connect pattern for the same port.
+        let c = connect_with_cfg(
+            r#"
+            function init()
+                return { inputs = {"keyboard"}, outputs = {"pan"},
+                         connect = { inputs = { keyboard = ".*LuaDevice.*" } } }
+            end
+            "#,
+            "\"connect_keyboard-in\" = \".*TomlDevice.*\"",
+        );
+        assert_eq!(c.inputs.get("keyboard"), Some(&".*LuaDevice.*".to_string()));
     }
 
     #[test]

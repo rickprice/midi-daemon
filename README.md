@@ -274,14 +274,29 @@ of that route.
 
 ### 2. Per-route — `config.toml`
 
-One pattern applied to all input ports of the route, and one for all output
-ports. Overrides the global default; overridden by Lua `init()`.
+Patterns set here override the global default and are overridden by Lua `init()`.
+
+**All ports of a route** — one pattern for every input, one for every output:
 
 ```toml
 [transpose]
 connect_input  = ".*KeyLab.*"
 connect_output = ".*Surge.*"
 ```
+
+**Individual named ports** — use `connect_{portname}-in` / `connect_{portname}-out`
+(where `portname` matches the port name declared in `init()`):
+
+```toml
+[timing-trainer]
+connect_keyboard-in   = ".*A-PRO 2.*"
+connect_metronome-in  = ".*metronome-out.*"
+connect_pan-out       = ".*MyPlugin.*"
+```
+
+When any per-port or per-route connect pattern is present for a route, the
+global `default_connect_input` / `default_connect_output` is not applied to
+that route at all.
 
 ### 3. Global default — `config.toml`
 
