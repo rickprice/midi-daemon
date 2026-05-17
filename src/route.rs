@@ -371,8 +371,11 @@ fn apply_connect_defaults(
     global_input: Option<&str>,
     global_output: Option<&str>,
 ) -> ConnectDecl {
-    let all_in  = raw.inputs.remove("").or_else(|| global_input.map(str::to_string));
-    let all_out = raw.outputs.remove("").or_else(|| global_output.map(str::to_string));
+    // If the route has any input/output patterns (per-port or sentinel), don't use global defaults.
+    let has_in  = !raw.inputs.is_empty();
+    let has_out = !raw.outputs.is_empty();
+    let all_in  = raw.inputs.remove("").or_else(|| if has_in  { None } else { global_input.map(str::to_string) });
+    let all_out = raw.outputs.remove("").or_else(|| if has_out { None } else { global_output.map(str::to_string) });
     for port in port_inputs {
         if !raw.inputs.contains_key(port) {
             if let Some(ref pat) = all_in {
@@ -1448,6 +1451,30 @@ mod tests {
         assert_eq!(result.inputs.get("kbd").map(String::as_str), Some(".*PerPort.*"));
         // pad has no per-port entry, falls back to sentinel
         assert_eq!(result.inputs.get("pad").map(String::as_str), Some(".*Sentinel.*"));
+    }
+
+    #[test]
+    fn defaults_per_port_on_one_input_suppresses_global_for_other_inputs() {
+        // Route has a per-port entry for "kbd" but nothing for "pad".
+        // Because the route specified any connect pattern, global must not be applied to "pad".
+        let mut raw = ConnectDecl::default();
+        raw.inputs.insert("kbd".into(), ".*PerPort.*".into());
+        let result = apply_connect_defaults(
+            raw, &ports(&["kbd", "pad"]), &ports(&[]), Some(".*Global.*"), None,
+        );
+        assert_eq!(result.inputs.get("kbd").map(String::as_str), Some(".*PerPort.*"));
+        assert!(!result.inputs.contains_key("pad"), "global must not fill 'pad' when route has any connect pattern");
+    }
+
+    #[test]
+    fn defaults_per_port_on_one_output_suppresses_global_for_other_outputs() {
+        let mut raw = ConnectDecl::default();
+        raw.outputs.insert("synth".into(), ".*PerPort.*".into());
+        let result = apply_connect_defaults(
+            raw, &ports(&[]), &ports(&["synth", "drums"]), None, Some(".*Global.*"),
+        );
+        assert_eq!(result.outputs.get("synth").map(String::as_str), Some(".*PerPort.*"));
+        assert!(!result.outputs.contains_key("drums"), "global must not fill 'drums' when route has any connect pattern");
     }
 
     #[test]
