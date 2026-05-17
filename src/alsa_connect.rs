@@ -119,7 +119,7 @@ fn find_our_port(seq: &Seq, client_name: &str) -> Option<Addr> {
     None
 }
 
-/// Search all non-daemon ALSA ports for ones matching `pattern` with the right capability.
+/// Search ALSA ports for ones matching `pattern` with the right capability.
 fn find_matching_external(seq: &Seq, pattern: &Regex, dir: ConnDir) -> Vec<(Addr, String)> {
     let mut result = Vec::new();
     for ci in ClientIter::new(seq) {
@@ -127,7 +127,6 @@ fn find_matching_external(seq: &Seq, pattern: &Regex, dir: ConnDir) -> Vec<(Addr
             Ok(n) => n.to_string(),
             Err(_) => continue,
         };
-        if cname.starts_with("midi-daemon:") { continue; }
         let cid = ci.get_client();
         for pi in PortIter::new(seq, cid) {
             let pname = match pi.get_name() {
@@ -198,7 +197,6 @@ fn connect_new_port(seq: &Seq, specs: &[PortSpec], new_addr: Addr) {
     };
 
     let cname = ci.get_name().unwrap_or("").to_string();
-    if cname.starts_with("midi-daemon:") { return; }
     let pname = pi.get_name().unwrap_or("").to_string();
     let cap = pi.get_capability();
     let full = format!("{}:{}", cname, pname);
