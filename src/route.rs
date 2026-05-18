@@ -8,11 +8,11 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
-/// Connect patterns for a route's ports: port_name → regex string.
+/// Connect patterns for a route's ports: port_name → list of regex strings.
 #[derive(Debug, Clone, Default)]
 pub struct ConnectDecl {
-    pub inputs: HashMap<String, String>,
-    pub outputs: HashMap<String, String>,
+    pub inputs: HashMap<String, Vec<String>>,
+    pub outputs: HashMap<String, Vec<String>>,
 }
 
 use crate::config::Config;
@@ -271,10 +271,22 @@ fn setup_extract_lua(lua: &Lua, route_cfg: Option<&toml::Table>) -> Result<()> {
     Ok(())
 }
 
-fn lua_val_to_string(val: Option<LuaValue>) -> Option<String> {
+fn lua_val_to_patterns(val: LuaValue) -> Vec<String> {
     match val {
-        Some(LuaValue::String(s)) => s.to_str().ok().as_deref().map(str::to_string),
-        _ => None,
+        LuaValue::String(s) => s.to_str().ok().map(|p| vec![p.to_string()]).unwrap_or_default(),
+        LuaValue::Table(t) => {
+            let mut pats = Vec::new();
+            for i in 1u32.. {
+                match t.get::<LuaValue>(i) {
+                    Ok(LuaValue::String(s)) => {
+                        if let Ok(p) = s.to_str() { pats.push(p.to_string()); }
+                    }
+                    _ => break,
+                }
+            }
+            pats
+        }
+        _ => vec![],
     }
 }
 
@@ -286,55 +298,69 @@ fn connect_from_lua_table(tbl: &LuaTable) -> ConnectDecl {
         _ => return decl,
     };
     if let Ok(LuaValue::Table(t)) = connect_tbl.get::<LuaValue>("inputs") {
-        for pair in t.pairs::<String, String>() {
-            if let Ok((k, v)) = pair { decl.inputs.insert(k, v); }
+        for pair in t.pairs::<String, LuaValue>() {
+            if let Ok((k, v)) = pair {
+                let pats = lua_val_to_patterns(v);
+                if !pats.is_empty() { decl.inputs.insert(k, pats); }
+            }
         }
     }
     if let Ok(LuaValue::Table(t)) = connect_tbl.get::<LuaValue>("outputs") {
-        for pair in t.pairs::<String, String>() {
-            if let Ok((k, v)) = pair { decl.outputs.insert(k, v); }
+        for pair in t.pairs::<String, LuaValue>() {
+            if let Ok((k, v)) = pair {
+                let pats = lua_val_to_patterns(v);
+                if !pats.is_empty() { decl.outputs.insert(k, pats); }
+            }
         }
     }
     // Singular patterns stored under "" sentinel so apply_connect_defaults can expand them.
-    if let Some(pat) = lua_val_to_string(connect_tbl.get::<LuaValue>("input").ok()) {
-        decl.inputs.insert("".into(), pat);
+    if let Ok(v) = connect_tbl.get::<LuaValue>("input") {
+        let pats = lua_val_to_patterns(v);
+        if !pats.is_empty() { decl.inputs.insert("".into(), pats); }
     }
-    if let Some(pat) = lua_val_to_string(connect_tbl.get::<LuaValue>("output").ok()) {
-        decl.outputs.insert("".into(), pat);
+    if let Ok(v) = connect_tbl.get::<LuaValue>("output") {
+        let pats = lua_val_to_patterns(v);
+        if !pats.is_empty() { decl.outputs.insert("".into(), pats); }
     }
     decl
 }
 
 /// Merge connect patterns from config.toml into `decl` at lower priority.
 ///
-/// Recognised keys (all optional, all string values):
-///   `connect_input`            — pattern applied to every input port (sentinel)
-///   `connect_output`           — pattern applied to every output port (sentinel)
-///   `connect_{portname}-in`    — pattern for the named input port specifically
-///   `connect_{portname}-out`   — pattern for the named output port specifically
+/// Recognised keys (values may be a string or an array of strings):
+///   `connect_input`            — pattern(s) applied to every input port (sentinel)
+///   `connect_output`           — pattern(s) applied to every output port (sentinel)
+///   `connect_{portname}-in`    — pattern(s) for the named input port specifically
+///   `connect_{portname}-out`   — pattern(s) for the named output port specifically
 ///
 /// Lua-declared patterns (already in `decl`) take priority via `or_insert_with`.
 fn connect_from_toml(mut decl: ConnectDecl, route_cfg: Option<&toml::Table>) -> ConnectDecl {
     if let Some(cfg) = route_cfg {
         for (key, val) in cfg {
-            if let toml::Value::String(pat) = val {
-                if key == "connect_input" {
-                    decl.inputs.entry("".into()).or_insert_with(|| pat.clone());
-                } else if key == "connect_output" {
-                    decl.outputs.entry("".into()).or_insert_with(|| pat.clone());
-                } else if let Some(port) = key
-                    .strip_prefix("connect_")
-                    .and_then(|s| s.strip_suffix("-in"))
-                    .filter(|s| !s.is_empty())
-                {
-                    decl.inputs.entry(port.to_string()).or_insert_with(|| pat.clone());
-                } else if let Some(port) = key
-                    .strip_prefix("connect_")
-                    .and_then(|s| s.strip_suffix("-out"))
-                    .filter(|s| !s.is_empty())
-                {
-                    decl.outputs.entry(port.to_string()).or_insert_with(|| pat.clone());
-                }
+            let pats: Vec<String> = match val {
+                toml::Value::String(s) => vec![s.clone()],
+                toml::Value::Array(arr) => arr.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect(),
+                _ => continue,
+            };
+            if pats.is_empty() { continue; }
+            if key == "connect_input" {
+                decl.inputs.entry("".into()).or_insert_with(|| pats);
+            } else if key == "connect_output" {
+                decl.outputs.entry("".into()).or_insert_with(|| pats);
+            } else if let Some(port) = key
+                .strip_prefix("connect_")
+                .and_then(|s| s.strip_suffix("-in"))
+                .filter(|s| !s.is_empty())
+            {
+                decl.inputs.entry(port.to_string()).or_insert_with(|| pats);
+            } else if let Some(port) = key
+                .strip_prefix("connect_")
+                .and_then(|s| s.strip_suffix("-out"))
+                .filter(|s| !s.is_empty())
+            {
+                decl.outputs.entry(port.to_string()).or_insert_with(|| pats);
             }
         }
     }
@@ -398,19 +424,19 @@ fn apply_connect_defaults(
     // If the route has any input/output patterns (per-port or sentinel), don't use global defaults.
     let has_in  = !raw.inputs.is_empty();
     let has_out = !raw.outputs.is_empty();
-    let all_in  = raw.inputs.remove("").or_else(|| if has_in  { None } else { global_input.map(str::to_string) });
-    let all_out = raw.outputs.remove("").or_else(|| if has_out { None } else { global_output.map(str::to_string) });
+    let all_in  = raw.inputs.remove("").or_else(|| if has_in  { None } else { global_input.map(|s| vec![s.to_string()]) });
+    let all_out = raw.outputs.remove("").or_else(|| if has_out { None } else { global_output.map(|s| vec![s.to_string()]) });
     for port in port_inputs {
         if !raw.inputs.contains_key(port) {
-            if let Some(ref pat) = all_in {
-                raw.inputs.insert(port.clone(), pat.clone());
+            if let Some(ref pats) = all_in {
+                raw.inputs.insert(port.clone(), pats.clone());
             }
         }
     }
     for port in port_outputs {
         if !raw.outputs.contains_key(port) {
-            if let Some(ref pat) = all_out {
-                raw.outputs.insert(port.clone(), pat.clone());
+            if let Some(ref pats) = all_out {
+                raw.outputs.insert(port.clone(), pats.clone());
             }
         }
     }
@@ -1274,6 +1300,10 @@ mod tests {
         assert!(c.outputs.is_empty());
     }
 
+    fn pats(strs: &[&str]) -> Vec<String> {
+        strs.iter().map(|s| s.to_string()).collect()
+    }
+
     #[test]
     fn connect_lua_singular_input_stored_under_sentinel() {
         let c = connect(r#"
@@ -1282,7 +1312,7 @@ mod tests {
                          connect = { input = ".*KeyLab.*" } }
             end
         "#);
-        assert_eq!(c.inputs.get(""), Some(&".*KeyLab.*".to_string()));
+        assert_eq!(c.inputs.get(""), Some(&pats(&[".*KeyLab.*"])));
     }
 
     #[test]
@@ -1293,7 +1323,18 @@ mod tests {
                          connect = { output = ".*Surge.*" } }
             end
         "#);
-        assert_eq!(c.outputs.get(""), Some(&".*Surge.*".to_string()));
+        assert_eq!(c.outputs.get(""), Some(&pats(&[".*Surge.*"])));
+    }
+
+    #[test]
+    fn connect_lua_singular_input_array_stored_under_sentinel() {
+        let c = connect(r#"
+            function init()
+                return { inputs = {"kbd"}, outputs = {"synth"},
+                         connect = { input = {".*KeyLab.*", ".*A-PRO.*"} } }
+            end
+        "#);
+        assert_eq!(c.inputs.get(""), Some(&pats(&[".*KeyLab.*", ".*A-PRO.*"])));
     }
 
     #[test]
@@ -1304,9 +1345,20 @@ mod tests {
                          connect = { inputs = { kbd = ".*KORG.*", pad = ".*Alesis.*" } } }
             end
         "#);
-        assert_eq!(c.inputs.get("kbd"), Some(&".*KORG.*".to_string()));
-        assert_eq!(c.inputs.get("pad"), Some(&".*Alesis.*".to_string()));
+        assert_eq!(c.inputs.get("kbd"), Some(&pats(&[".*KORG.*"])));
+        assert_eq!(c.inputs.get("pad"), Some(&pats(&[".*Alesis.*"])));
         assert!(!c.inputs.contains_key(""));
+    }
+
+    #[test]
+    fn connect_lua_per_port_inputs_array_stored_by_name() {
+        let c = connect(r#"
+            function init()
+                return { inputs = {"kbd"}, outputs = {"synth"},
+                         connect = { inputs = { kbd = {".*KORG.*", ".*KeyLab.*"} } } }
+            end
+        "#);
+        assert_eq!(c.inputs.get("kbd"), Some(&pats(&[".*KORG.*", ".*KeyLab.*"])));
     }
 
     #[test]
@@ -1317,8 +1369,8 @@ mod tests {
                          connect = { outputs = { synth = ".*Surge.*", drums = ".*DrumKit.*" } } }
             end
         "#);
-        assert_eq!(c.outputs.get("synth"), Some(&".*Surge.*".to_string()));
-        assert_eq!(c.outputs.get("drums"), Some(&".*DrumKit.*".to_string()));
+        assert_eq!(c.outputs.get("synth"), Some(&pats(&[".*Surge.*"])));
+        assert_eq!(c.outputs.get("drums"), Some(&pats(&[".*DrumKit.*"])));
     }
 
     #[test]
@@ -1333,8 +1385,8 @@ mod tests {
                          } }
             end
         "#);
-        assert_eq!(c.inputs.get("kbd"), Some(&".*KORG.*".to_string()));
-        assert_eq!(c.inputs.get(""), Some(&".*Fallback.*".to_string()));
+        assert_eq!(c.inputs.get("kbd"), Some(&pats(&[".*KORG.*"])));
+        assert_eq!(c.inputs.get(""), Some(&pats(&[".*Fallback.*"])));
     }
 
     #[test]
@@ -1351,26 +1403,38 @@ mod tests {
     #[test]
     fn connect_toml_connect_input_stored_under_sentinel() {
         let c = connect_with_cfg("-- no init", "connect_input = \".*KeyLab.*\"");
-        assert_eq!(c.inputs.get(""), Some(&".*KeyLab.*".to_string()));
+        assert_eq!(c.inputs.get(""), Some(&pats(&[".*KeyLab.*"])));
+    }
+
+    #[test]
+    fn connect_toml_connect_input_array_stored_under_sentinel() {
+        let c = connect_with_cfg("-- no init", "connect_input = [\".*KeyLab.*\", \".*A-PRO.*\"]");
+        assert_eq!(c.inputs.get(""), Some(&pats(&[".*KeyLab.*", ".*A-PRO.*"])));
     }
 
     #[test]
     fn connect_toml_connect_output_stored_under_sentinel() {
         let c = connect_with_cfg("-- no init", "connect_output = \".*Surge.*\"");
-        assert_eq!(c.outputs.get(""), Some(&".*Surge.*".to_string()));
+        assert_eq!(c.outputs.get(""), Some(&pats(&[".*Surge.*"])));
     }
 
     #[test]
     fn connect_toml_per_port_input_stored_by_name() {
         let c = connect_with_cfg("-- no init", "\"connect_keyboard-in\" = \".*A-PRO.*\"");
-        assert_eq!(c.inputs.get("keyboard"), Some(&".*A-PRO.*".to_string()));
+        assert_eq!(c.inputs.get("keyboard"), Some(&pats(&[".*A-PRO.*"])));
         assert!(!c.inputs.contains_key(""));
+    }
+
+    #[test]
+    fn connect_toml_per_port_input_array_stored_by_name() {
+        let c = connect_with_cfg("-- no init", "\"connect_keyboard-in\" = [\".*A-PRO.*\", \".*KeyLab.*\"]");
+        assert_eq!(c.inputs.get("keyboard"), Some(&pats(&[".*A-PRO.*", ".*KeyLab.*"])));
     }
 
     #[test]
     fn connect_toml_per_port_output_stored_by_name() {
         let c = connect_with_cfg("-- no init", "\"connect_synth-out\" = \".*Surge.*\"");
-        assert_eq!(c.outputs.get("synth"), Some(&".*Surge.*".to_string()));
+        assert_eq!(c.outputs.get("synth"), Some(&pats(&[".*Surge.*"])));
         assert!(!c.outputs.contains_key(""));
     }
 
@@ -1380,8 +1444,8 @@ mod tests {
             "-- no init",
             "\"connect_keyboard-in\" = \".*A-PRO.*\"\n\"connect_metronome-in\" = \".*metronome-out.*\"",
         );
-        assert_eq!(c.inputs.get("keyboard"), Some(&".*A-PRO.*".to_string()));
-        assert_eq!(c.inputs.get("metronome"), Some(&".*metronome-out.*".to_string()));
+        assert_eq!(c.inputs.get("keyboard"), Some(&pats(&[".*A-PRO.*"])));
+        assert_eq!(c.inputs.get("metronome"), Some(&pats(&[".*metronome-out.*"])));
     }
 
     #[test]
@@ -1391,8 +1455,8 @@ mod tests {
             "-- no init",
             "connect_input = \".*Fallback.*\"\n\"connect_keyboard-in\" = \".*A-PRO.*\"",
         );
-        assert_eq!(c.inputs.get("keyboard"), Some(&".*A-PRO.*".to_string()));
-        assert_eq!(c.inputs.get(""), Some(&".*Fallback.*".to_string()));
+        assert_eq!(c.inputs.get("keyboard"), Some(&pats(&[".*A-PRO.*"])));
+        assert_eq!(c.inputs.get(""), Some(&pats(&[".*Fallback.*"])));
     }
 
     #[test]
@@ -1407,7 +1471,7 @@ mod tests {
             "#,
             "\"connect_keyboard-in\" = \".*TomlDevice.*\"",
         );
-        assert_eq!(c.inputs.get("keyboard"), Some(&".*LuaDevice.*".to_string()));
+        assert_eq!(c.inputs.get("keyboard"), Some(&pats(&[".*LuaDevice.*"])));
     }
 
     #[test]
@@ -1422,7 +1486,7 @@ mod tests {
             "#,
             "connect_input = \".*TomlPattern.*\"",
         );
-        assert_eq!(c.inputs.get(""), Some(&".*LuaPattern.*".to_string()));
+        assert_eq!(c.inputs.get(""), Some(&pats(&[".*LuaPattern.*"])));
     }
 
     #[test]
@@ -1435,8 +1499,8 @@ mod tests {
             "#,
             "connect_input = \".*TomlPattern.*\"\nconnect_output = \".*TomlOut.*\"",
         );
-        assert_eq!(c.inputs.get(""), Some(&".*TomlPattern.*".to_string()));
-        assert_eq!(c.outputs.get(""), Some(&".*TomlOut.*".to_string()));
+        assert_eq!(c.inputs.get(""), Some(&pats(&[".*TomlPattern.*"])));
+        assert_eq!(c.outputs.get(""), Some(&pats(&[".*TomlOut.*"])));
     }
 
     #[test]
@@ -1445,7 +1509,7 @@ mod tests {
             "this is ][ not valid lua",
             "connect_input = \".*Fallback.*\"",
         );
-        assert_eq!(c.inputs.get(""), Some(&".*Fallback.*".to_string()));
+        assert_eq!(c.inputs.get(""), Some(&pats(&[".*Fallback.*"])));
     }
 
     // ── apply_connect_defaults ────────────────────────────────────────────────
@@ -1456,7 +1520,7 @@ mod tests {
 
     fn decl_with_sentinel(sentinel: &str) -> ConnectDecl {
         let mut d = ConnectDecl::default();
-        d.inputs.insert("".into(), sentinel.to_string());
+        d.inputs.insert("".into(), vec![sentinel.to_string()]);
         d
     }
 
@@ -1478,20 +1542,20 @@ mod tests {
             Some(".*MyController.*"),
             Some(".*MySynth.*"),
         );
-        assert_eq!(result.inputs.get("kbd").map(String::as_str), Some(".*MyController.*"));
-        assert_eq!(result.inputs.get("pad").map(String::as_str), Some(".*MyController.*"));
-        assert_eq!(result.outputs.get("synth").map(String::as_str), Some(".*MySynth.*"));
+        assert_eq!(result.inputs.get("kbd"), Some(&pats(&[".*MyController.*"])));
+        assert_eq!(result.inputs.get("pad"), Some(&pats(&[".*MyController.*"])));
+        assert_eq!(result.outputs.get("synth"), Some(&pats(&[".*MySynth.*"])));
     }
 
     #[test]
     fn defaults_sentinel_fills_all_ports() {
         let mut raw = ConnectDecl::default();
-        raw.inputs.insert("".into(), ".*RouteLevel.*".into());
+        raw.inputs.insert("".into(), vec![".*RouteLevel.*".to_string()]);
         let result = apply_connect_defaults(
             raw, &ports(&["kbd", "pad"]), &ports(&["synth"]), None, None,
         );
-        assert_eq!(result.inputs.get("kbd").map(String::as_str), Some(".*RouteLevel.*"));
-        assert_eq!(result.inputs.get("pad").map(String::as_str), Some(".*RouteLevel.*"));
+        assert_eq!(result.inputs.get("kbd"), Some(&pats(&[".*RouteLevel.*"])));
+        assert_eq!(result.inputs.get("pad"), Some(&pats(&[".*RouteLevel.*"])));
         assert!(!result.inputs.contains_key(""));
     }
 
@@ -1501,30 +1565,30 @@ mod tests {
         let result = apply_connect_defaults(
             raw, &ports(&["kbd"]), &ports(&[]), Some(".*Global.*"), None,
         );
-        assert_eq!(result.inputs.get("kbd").map(String::as_str), Some(".*RouteLevel.*"));
+        assert_eq!(result.inputs.get("kbd"), Some(&pats(&[".*RouteLevel.*"])));
     }
 
     #[test]
     fn defaults_per_port_not_overridden_by_global() {
         let mut raw = ConnectDecl::default();
-        raw.inputs.insert("kbd".into(), ".*PerPort.*".into());
+        raw.inputs.insert("kbd".into(), vec![".*PerPort.*".to_string()]);
         let result = apply_connect_defaults(
             raw, &ports(&["kbd"]), &ports(&[]), Some(".*Global.*"), None,
         );
-        assert_eq!(result.inputs.get("kbd").map(String::as_str), Some(".*PerPort.*"));
+        assert_eq!(result.inputs.get("kbd"), Some(&pats(&[".*PerPort.*"])));
     }
 
     #[test]
     fn defaults_per_port_not_overridden_by_sentinel() {
         let mut raw = ConnectDecl::default();
-        raw.inputs.insert("kbd".into(), ".*PerPort.*".into());
-        raw.inputs.insert("".into(), ".*Sentinel.*".into());
+        raw.inputs.insert("kbd".into(), vec![".*PerPort.*".to_string()]);
+        raw.inputs.insert("".into(), vec![".*Sentinel.*".to_string()]);
         let result = apply_connect_defaults(
             raw, &ports(&["kbd", "pad"]), &ports(&[]), None, None,
         );
-        assert_eq!(result.inputs.get("kbd").map(String::as_str), Some(".*PerPort.*"));
+        assert_eq!(result.inputs.get("kbd"), Some(&pats(&[".*PerPort.*"])));
         // pad has no per-port entry, falls back to sentinel
-        assert_eq!(result.inputs.get("pad").map(String::as_str), Some(".*Sentinel.*"));
+        assert_eq!(result.inputs.get("pad"), Some(&pats(&[".*Sentinel.*"])));
     }
 
     #[test]
@@ -1532,22 +1596,22 @@ mod tests {
         // Route has a per-port entry for "kbd" but nothing for "pad".
         // Because the route specified any connect pattern, global must not be applied to "pad".
         let mut raw = ConnectDecl::default();
-        raw.inputs.insert("kbd".into(), ".*PerPort.*".into());
+        raw.inputs.insert("kbd".into(), vec![".*PerPort.*".to_string()]);
         let result = apply_connect_defaults(
             raw, &ports(&["kbd", "pad"]), &ports(&[]), Some(".*Global.*"), None,
         );
-        assert_eq!(result.inputs.get("kbd").map(String::as_str), Some(".*PerPort.*"));
+        assert_eq!(result.inputs.get("kbd"), Some(&pats(&[".*PerPort.*"])));
         assert!(!result.inputs.contains_key("pad"), "global must not fill 'pad' when route has any connect pattern");
     }
 
     #[test]
     fn defaults_per_port_on_one_output_suppresses_global_for_other_outputs() {
         let mut raw = ConnectDecl::default();
-        raw.outputs.insert("synth".into(), ".*PerPort.*".into());
+        raw.outputs.insert("synth".into(), vec![".*PerPort.*".to_string()]);
         let result = apply_connect_defaults(
             raw, &ports(&[]), &ports(&["synth", "drums"]), None, Some(".*Global.*"),
         );
-        assert_eq!(result.outputs.get("synth").map(String::as_str), Some(".*PerPort.*"));
+        assert_eq!(result.outputs.get("synth"), Some(&pats(&[".*PerPort.*"])));
         assert!(!result.outputs.contains_key("drums"), "global must not fill 'drums' when route has any connect pattern");
     }
 

@@ -38,33 +38,41 @@ impl ConnectionManager {
         specs.retain(|s| !s.our_client_name.starts_with(&prefix));
 
         for port_name in &decl.inputs {
-            if let Some(pat_str) = connect.inputs.get(port_name) {
-                match Regex::new(pat_str) {
-                    Ok(pattern) => {
-                        let client_name = if is_default {
-                            format!("{}-in", base)
-                        } else {
-                            format!("{}/{}-in", base, port_name)
-                        };
-                        specs.push(PortSpec { our_client_name: client_name, pattern, dir: ConnDir::Input });
+            if let Some(pat_strs) = connect.inputs.get(port_name) {
+                let client_name = if is_default {
+                    format!("{}-in", base)
+                } else {
+                    format!("{}/{}-in", base, port_name)
+                };
+                for pat_str in pat_strs {
+                    match Regex::new(pat_str) {
+                        Ok(pattern) => specs.push(PortSpec {
+                            our_client_name: client_name.clone(),
+                            pattern,
+                            dir: ConnDir::Input,
+                        }),
+                        Err(e) => warn!("[{}] invalid connect_input regex '{}': {}", route_name, pat_str, e),
                     }
-                    Err(e) => warn!("[{}] invalid connect_input regex '{}': {}", route_name, pat_str, e),
                 }
             }
         }
 
         for port_name in &decl.outputs {
-            if let Some(pat_str) = connect.outputs.get(port_name) {
-                match Regex::new(pat_str) {
-                    Ok(pattern) => {
-                        let client_name = if is_default {
-                            format!("{}-out", base)
-                        } else {
-                            format!("{}/{}-out", base, port_name)
-                        };
-                        specs.push(PortSpec { our_client_name: client_name, pattern, dir: ConnDir::Output });
+            if let Some(pat_strs) = connect.outputs.get(port_name) {
+                let client_name = if is_default {
+                    format!("{}-out", base)
+                } else {
+                    format!("{}/{}-out", base, port_name)
+                };
+                for pat_str in pat_strs {
+                    match Regex::new(pat_str) {
+                        Ok(pattern) => specs.push(PortSpec {
+                            our_client_name: client_name.clone(),
+                            pattern,
+                            dir: ConnDir::Output,
+                        }),
+                        Err(e) => warn!("[{}] invalid connect_output regex '{}': {}", route_name, pat_str, e),
                     }
-                    Err(e) => warn!("[{}] invalid connect_output regex '{}': {}", route_name, pat_str, e),
                 }
             }
         }
@@ -299,8 +307,15 @@ mod tests {
 
     fn make_connect(inputs: &[(&str, &str)], outputs: &[(&str, &str)]) -> ConnectDecl {
         ConnectDecl {
-            inputs:  inputs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
-            outputs: outputs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            inputs:  inputs.iter().map(|(k, v)| (k.to_string(), vec![v.to_string()])).collect(),
+            outputs: outputs.iter().map(|(k, v)| (k.to_string(), vec![v.to_string()])).collect(),
+        }
+    }
+
+    fn make_connect_multi(inputs: &[(&str, &[&str])], outputs: &[(&str, &[&str])]) -> ConnectDecl {
+        ConnectDecl {
+            inputs:  inputs.iter().map(|(k, vs)| (k.to_string(), vs.iter().map(|v| v.to_string()).collect())).collect(),
+            outputs: outputs.iter().map(|(k, vs)| (k.to_string(), vs.iter().map(|v| v.to_string()).collect())).collect(),
         }
     }
 
@@ -441,6 +456,37 @@ mod tests {
         assert!(mgr.spec_client_names().contains(&"midi-daemon:keep-in".to_string()));
     }
 
+    // ── multiple patterns per port ────────────────────────────────────────────
+
+    #[test]
+    fn multiple_patterns_per_input_port_creates_multiple_specs() {
+        let mgr = ConnectionManager::new();
+        let decl = PortDecl::default();
+        let connect = make_connect_multi(&[("default", &[".*KeyLab.*", ".*A-PRO.*"])], &[]);
+        mgr.register_route("t", &decl, &connect);
+        assert_eq!(mgr.spec_count(), 2);
+        let names = mgr.spec_client_names();
+        assert_eq!(names, vec!["midi-daemon:t-in", "midi-daemon:t-in"]);
+    }
+
+    #[test]
+    fn multiple_patterns_per_output_port_creates_multiple_specs() {
+        let mgr = ConnectionManager::new();
+        let decl = PortDecl::default();
+        let connect = make_connect_multi(&[], &[("default", &[".*Surge.*", ".*ZynAdd.*"])]);
+        mgr.register_route("t", &decl, &connect);
+        assert_eq!(mgr.spec_count(), 2);
+    }
+
+    #[test]
+    fn re_register_with_multiple_patterns_replaces_old_specs() {
+        let mgr = ConnectionManager::new();
+        let decl = PortDecl::default();
+        mgr.register_route("t", &decl, &make_connect(&[("default", ".*Old.*")], &[]));
+        mgr.register_route("t", &decl, &make_connect_multi(&[("default", &[".*New1.*", ".*New2.*"])], &[]));
+        assert_eq!(mgr.spec_count(), 2);
+    }
+
     // ── invalid regex is silently skipped ────────────────────────────────────
 
     #[test]
@@ -450,6 +496,15 @@ mod tests {
         let connect = make_connect(&[("default", "[invalid")], &[]);
         mgr.register_route("t", &decl, &connect);
         assert_eq!(mgr.spec_count(), 0);
+    }
+
+    #[test]
+    fn partial_invalid_regex_in_list_skips_only_invalid() {
+        let mgr = ConnectionManager::new();
+        let decl = PortDecl::default();
+        let connect = make_connect_multi(&[("default", &[".*Valid.*", "[invalid"])], &[]);
+        mgr.register_route("t", &decl, &connect);
+        assert_eq!(mgr.spec_count(), 1);
     }
 
     // ── ports without a connect pattern produce no spec ───────────────────────
