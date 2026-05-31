@@ -189,6 +189,54 @@ get_ppqn()             -- Get current PPQN (integer)
 log(message)           -- Log a string to the systemd journal / stdout
 ```
 
+### Global variables
+
+```lua
+ROUTE_NAME        -- string: the route's filename stem, e.g. "metronome" for metronome.lua
+OSC_SEND_ENABLED  -- bool: true when a send target is configured (global or per-route)
+```
+
+Useful for building OSC address prefixes that automatically match the route name:
+
+```lua
+send_osc("/" .. ROUTE_NAME .. "/beat", beat, bpm)
+on_osc = osc_params("/" .. ROUTE_NAME, { ... })
+```
+
+### Stdlib helpers
+
+The following helpers are available in every route without any `require` or `dofile`.
+
+#### `osc_params(prefix, params) → function`
+
+Builds an `on_osc` handler from a declarative table of named parameters. Each
+entry maps a parameter name to a `set` function (called when the message carries
+arguments), a `get` function (called on a no-argument query and whose return
+value is sent back on the same address), or both.
+
+```lua
+on_osc = osc_params("/" .. ROUTE_NAME, {
+    bpm = {
+        set = function(v) set_bpm(v) end,
+        get = get_bpm,               -- no-arg query → replies with current BPM
+    },
+    mute = {
+        set = function(v) muted = (v ~= 0) end,
+        get = function() return muted and 1 or 0 end,
+    },
+    start = { set = start_fn },      -- imperative: no-arg message also calls set
+    stop  = { set = stop_fn },
+})
+```
+
+Dispatch rules:
+
+| Message arrives with | `get` defined | `set` defined | Action |
+|---|---|---|---|
+| no arguments | yes | — | calls `get()`, sends return value back |
+| no arguments | no | yes | calls `set()` |
+| arguments | — | yes | calls `set(v1, v2, ...)` |
+
 ## OSC support
 
 Routes can receive and send [OSC](https://opensoundcontrol.stanford.edu/) (Open Sound
@@ -318,6 +366,13 @@ default_ppqn = 24
 # Applied to every route input/output that has no per-route pattern.
 # default_connect_input  = ".*My Keyboard.*"
 # default_connect_output = ".*My Synth.*"
+
+# Global OSC root — one UDP port shared by all routes.
+# Incoming messages are dispatched by address prefix: /route-name/... → that route.
+# All routes' send_osc() calls go to osc_send_addr unless the route declares its own
+# osc.send target in init().
+# osc_receive_port = 9000
+# osc_send_addr    = "127.0.0.1:9001"
 ```
 
 Changes to `config.toml` are picked up automatically and all routes are
@@ -448,8 +503,36 @@ Configurable via `[metronome]` in `config.toml`:
 | `start_stop_channel`    | 1    | MIDI channel for the start/stop CC                         |
 | `start_stop_controller` | 22   | CC controller that starts/stops the metronome              |
 | `start_running`      | `true`  | Whether the metronome starts playing immediately on launch  |
+| `osc_send_addr`      | *(none)* | UDP `"host:port"` to send beat/transport OSC messages to   |
+| `osc_receive_port`   | *(none)* | UDP port to listen on for incoming OSC control messages    |
 
 BPM is clamped to the range 20–200 regardless of source.
+
+### Metronome OSC interface
+
+When `osc_send_addr` is configured, the metronome emits:
+
+| Message | Arguments | When |
+|---------|-----------|------|
+| `/metronome/beat` | beat (int), beats\_per\_bar (int), bpm (float) | Every quarter-note click |
+| `/metronome/running` | 1 or 0 | On any start/stop transition |
+
+When `osc_receive_port` is configured, the metronome responds to:
+
+| Message | Argument | Effect |
+|---------|----------|--------|
+| `/metronome/bpm` | value (float/int) | Set BPM, same 20–200 range as the CC input |
+| `/metronome/start` | — | Reset to beat 1 and start (same as MIDI Transport Start) |
+| `/metronome/stop` | — | Stop and reset (same as MIDI Transport Stop) |
+| `/metronome/continue` | — | Resume from current position (same as MIDI Transport Continue) |
+
+Example `config.toml` for a TouchOSC or Lemur controller on the same machine:
+
+```toml
+[metronome]
+osc_receive_port = 9000
+osc_send_addr    = "127.0.0.1:9001"
+```
 
 The start/stop CC uses the value to determine state: value ≥ 64 starts the
 metronome, value < 64 stops it.

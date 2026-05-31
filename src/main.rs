@@ -17,6 +17,54 @@ use alsa_connect::ConnectionManager;
 use config::Config;
 use route::Route;
 
+/// A map from route name to an OSC injector closure.
+///
+/// `Route` is `!Send` (ALSA raw pointers), so we can't share the routes map
+/// with the receiver thread. Instead, each route hands out a lightweight
+/// `Send + 'static` closure that forwards events into its event channel.
+type OscDispatch = Arc<Mutex<HashMap<String, Box<dyn Fn(String, Vec<rosc::OscType>) + Send>>>>;
+
+fn register_route_osc(dispatch: &OscDispatch, name: &str, route: &Route) {
+    dispatch
+        .lock()
+        .unwrap()
+        .insert(name.to_string(), Box::new(route.make_osc_injector()));
+}
+
+fn unregister_route_osc(dispatch: &OscDispatch, name: &str) {
+    dispatch.lock().unwrap().remove(name);
+}
+
+/// Bind the global OSC receive port and dispatch incoming packets to routes by
+/// address prefix: `/route-name/rest` → the route named `route-name`.
+fn start_global_osc_receiver(
+    config: &Config,
+    dispatch: OscDispatch,
+) -> Option<osc::OscReceiver> {
+    let port = config.osc_receive_port?;
+    match osc::OscReceiver::spawn(port, move |address, args| {
+        let route_name = address
+            .strip_prefix('/')
+            .and_then(|s| s.split('/').next())
+            .unwrap_or("");
+        if route_name.is_empty() {
+            return;
+        }
+        if let Some(inject) = dispatch.lock().unwrap().get(route_name) {
+            inject(address, args);
+        }
+    }) {
+        Ok(rx) => {
+            info!("Global OSC receiver on UDP port {}", port);
+            Some(rx)
+        }
+        Err(e) => {
+            warn!("Failed to start global OSC receiver on port {}: {}", port, e);
+            None
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -41,8 +89,19 @@ async fn main() -> Result<()> {
     let conn_mgr = Arc::new(ConnectionManager::new());
     Arc::clone(&conn_mgr).spawn_watcher();
 
+    let osc_dispatch: OscDispatch = Arc::new(Mutex::new(HashMap::new()));
+
     // Initial load of all .lua files
-    load_all_routes(&routes_dir, Arc::clone(&config), Arc::clone(&routes), Arc::clone(&conn_mgr)).await?;
+    load_all_routes(
+        &routes_dir,
+        Arc::clone(&config),
+        Arc::clone(&routes),
+        Arc::clone(&conn_mgr),
+        Arc::clone(&osc_dispatch),
+    ).await?;
+
+    // Global OSC receiver (dispatches /route-name/... to the matching route).
+    let mut global_osc_rx = start_global_osc_receiver(&config, Arc::clone(&osc_dispatch));
 
     // inotify watcher for hot-reload
     enum WatchEvent {
@@ -103,6 +162,7 @@ async fn main() -> Result<()> {
                         Ok(route) => {
                             conn_mgr.register_route(&name, route.port_decl(), &route.connect_decl);
                             conn_mgr.apply_all();
+                            register_route_osc(&osc_dispatch, &name, &route);
                             // Replacing the old entry drops it, which stops its timer and
                             // detaches its event-loop thread (which will drain and exit).
                             routes.lock().unwrap().insert(name.clone(), route);
@@ -113,6 +173,7 @@ async fn main() -> Result<()> {
                 } else {
                     routes.lock().unwrap().remove(&name);
                     conn_mgr.unregister_route(&name);
+                    unregister_route_osc(&osc_dispatch, &name);
                     info!("Removed route: {}", name);
                 }
             }
@@ -125,8 +186,19 @@ async fn main() -> Result<()> {
                                 "routes_dir changed in config.toml — restart the daemon for this to take effect"
                             );
                         }
+                        let old_osc_port = config.osc_receive_port;
                         config = Arc::new(new_cfg);
-                        reload_all_routes(&routes_dir, Arc::clone(&config), Arc::clone(&routes), Arc::clone(&conn_mgr));
+                        // Restart global OSC receiver if the port changed.
+                        if config.osc_receive_port != old_osc_port {
+                            global_osc_rx = start_global_osc_receiver(&config, Arc::clone(&osc_dispatch));
+                        }
+                        reload_all_routes(
+                            &routes_dir,
+                            Arc::clone(&config),
+                            Arc::clone(&routes),
+                            Arc::clone(&conn_mgr),
+                            Arc::clone(&osc_dispatch),
+                        );
                         info!("Config reloaded");
                     }
                     Err(e) => error!("Failed to reload config.toml: {}", e),
@@ -143,6 +215,7 @@ fn reload_all_routes(
     config: Arc<Config>,
     routes: Arc<Mutex<HashMap<String, Route>>>,
     conn_mgr: Arc<ConnectionManager>,
+    osc_dispatch: OscDispatch,
 ) {
     let names: Vec<String> = routes.lock().unwrap().keys().cloned().collect();
     for name in names {
@@ -151,6 +224,7 @@ fn reload_all_routes(
         match Route::start(&path, Arc::clone(&config), old_ports) {
             Ok(route) => {
                 conn_mgr.register_route(&name, route.port_decl(), &route.connect_decl);
+                register_route_osc(&osc_dispatch, &name, &route);
                 routes.lock().unwrap().insert(name.clone(), route);
                 info!("Reloaded route '{}' with new config", name);
             }
@@ -165,6 +239,7 @@ async fn load_all_routes(
     config: Arc<Config>,
     routes: Arc<Mutex<HashMap<String, Route>>>,
     conn_mgr: Arc<ConnectionManager>,
+    osc_dispatch: OscDispatch,
 ) -> Result<()> {
     if !dir.exists() {
         std::fs::create_dir_all(dir)?;
@@ -187,6 +262,7 @@ async fn load_all_routes(
                 match Route::start(&path, Arc::clone(&config), None) {
                     Ok(route) => {
                         conn_mgr.register_route(&name, route.port_decl(), &route.connect_decl);
+                        register_route_osc(&osc_dispatch, &name, &route);
                         info!("Loaded route: {}", name);
                         map.insert(name, route);
                     }

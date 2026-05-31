@@ -17,6 +17,12 @@ pub struct Config {
     pub default_connect_input: Option<String>,
     /// Regex applied to all route outputs when no per-route pattern is set.
     pub default_connect_output: Option<String>,
+    /// Single global UDP port to receive all OSC messages on. Incoming packets
+    /// are dispatched to routes by address prefix: `/route-name/...`.
+    pub osc_receive_port: Option<u16>,
+    /// Global OSC send destination (`"host:port"`). Used by every route that
+    /// does not declare its own `osc.send` target in `init()`.
+    pub osc_send_addr: Option<String>,
 }
 
 /// Internal deserialization target. `routes_dir` is optional so the caller
@@ -30,6 +36,8 @@ struct RawConfig {
     default_ppqn: u32,
     default_connect_input: Option<String>,
     default_connect_output: Option<String>,
+    osc_receive_port: Option<u16>,
+    osc_send_addr: Option<String>,
     #[serde(flatten)]
     route_configs: HashMap<String, toml::Value>,
 }
@@ -44,6 +52,8 @@ impl RawConfig {
             config_path,
             default_connect_input: self.default_connect_input,
             default_connect_output: self.default_connect_output,
+            osc_receive_port: self.osc_receive_port,
+            osc_send_addr: self.osc_send_addr,
         }
     }
 }
@@ -67,6 +77,8 @@ fn default_config(routes_dir: PathBuf) -> Config {
         config_path: None,
         default_connect_input: None,
         default_connect_output: None,
+        osc_receive_port: None,
+        osc_send_addr: None,
     }
 }
 

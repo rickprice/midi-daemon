@@ -156,7 +156,23 @@ pub struct Route {
     _timer: Arc<Timer>,
     _thread: std::thread::JoinHandle<()>,
     _osc_receiver: Option<OscReceiver>,
+    /// Sender into the route's event channel, used by the global OSC dispatcher.
+    osc_tx: mpsc::Sender<RouteEvent>,
     pub connect_decl: ConnectDecl,
+}
+
+impl Route {
+    /// Returns a `Send + 'static` closure that injects OSC events into this
+    /// route's event loop. Used by the global listener in main.rs — avoids
+    /// sharing the full Route (which is !Send due to ALSA raw pointers).
+    pub fn make_osc_injector(
+        &self,
+    ) -> impl Fn(String, Vec<rosc::OscType>) + Send + 'static {
+        let tx = self.osc_tx.clone();
+        move |address: String, args: Vec<rosc::OscType>| {
+            let _ = tx.blocking_send(RouteEvent::Osc { address, args });
+        }
+    }
 }
 
 impl Route {
@@ -217,7 +233,8 @@ impl Route {
             }
         };
 
-        // Set up OSC sender (if any targets were declared in init()).
+        // Set up OSC sender.
+        // Priority: per-route init() targets > global config osc_send_addr.
         let OscDecl { receive_port: osc_receive_port, send_targets: osc_send_targets } = osc_decl;
 
         let osc_sender = if !osc_send_targets.is_empty() {
@@ -225,6 +242,16 @@ impl Route {
                 Ok(s) => Some(s),
                 Err(e) => {
                     warn!("Route '{}': failed to create OSC sender: {}", name, e);
+                    None
+                }
+            }
+        } else if let Some(addr) = config.osc_send_addr.as_deref().and_then(parse_socket_addr) {
+            let mut targets = HashMap::new();
+            targets.insert("default".to_string(), addr);
+            match OscSender::new(targets) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    warn!("Route '{}': failed to create OSC sender from global config: {}", name, e);
                     None
                 }
             }
@@ -253,6 +280,9 @@ impl Route {
         } else {
             None
         };
+
+        // Keep a sender for the global OSC dispatcher to inject events.
+        let osc_tx = tx.clone();
 
         let timer = Arc::new(Timer::new(config.default_bpm, config.default_ppqn));
         let _timer_thread = timer.spawn(tx.clone(), RouteEvent::Timer);
@@ -294,6 +324,7 @@ impl Route {
             _timer: timer,
             _thread: thread,
             _osc_receiver: osc_receiver,
+            osc_tx,
             connect_decl,
         })
     }
@@ -301,8 +332,11 @@ impl Route {
 
 // ── Extraction helpers ────────────────────────────────────────────────────────
 
-/// Install no-op stubs and the config table so init() can safely call globals.
-fn setup_extract_lua(lua: &Lua, route_cfg: Option<&toml::Table>) -> Result<()> {
+const LUA_STDLIB: &str = include_str!("lua/stdlib.lua");
+
+/// Install no-op stubs, the config table, and the stdlib so init() can safely
+/// call any global the live event loop exposes.
+fn setup_extract_lua(lua: &Lua, name: &str, route_cfg: Option<&toml::Table>) -> Result<()> {
     lua.globals().set("send", lua.create_function(|_, _: LuaMultiValue| Ok(()))?)?;
     lua.globals().set("send_osc", lua.create_function(|_, _: LuaMultiValue| Ok(()))?)?;
     lua.globals().set("set_bpm", lua.create_function(|_, _: f64| Ok(()))?)?;
@@ -310,12 +344,16 @@ fn setup_extract_lua(lua: &Lua, route_cfg: Option<&toml::Table>) -> Result<()> {
     lua.globals().set("set_ppqn", lua.create_function(|_, _: u32| Ok(()))?)?;
     lua.globals().set("get_ppqn", lua.create_function(|_, ()| -> LuaResult<u32> { Ok(24) })?)?;
     lua.globals().set("log", lua.create_function(|_, _: String| Ok(()))?)?;
+    lua.globals().set("ROUTE_NAME", name)?;
+    lua.globals().set("OSC_SEND_ENABLED", false)?;
     let cfg_table = match route_cfg {
         Some(tbl) => toml_table_to_lua(lua, tbl)
             .map_err(|e| anyhow::anyhow!("Failed to convert config to Lua: {}", e))?,
         None => lua.create_table()?,
     };
     lua.globals().set("config", cfg_table)?;
+    lua.load(LUA_STDLIB).set_name("stdlib").exec()
+        .map_err(|e| anyhow::anyhow!("Failed to load Lua stdlib: {}", e))?;
     Ok(())
 }
 
@@ -423,7 +461,7 @@ fn extract_all_decls(
     route_cfg: Option<&toml::Table>,
 ) -> Result<(PortDecl, ConnectDecl, OscDecl)> {
     let lua = Lua::new();
-    setup_extract_lua(&lua, route_cfg)?;
+    setup_extract_lua(&lua, name, route_cfg)?;
 
     if let Err(e) = lua.load(script).set_name(name).exec() {
         tracing::debug!(
@@ -724,6 +762,11 @@ fn run_lua_event_loop(
         lua.globals().set("log", f)?;
     }
 
+    // --- Expose `ROUTE_NAME` and `OSC_SEND_ENABLED` ---
+    // Must be set before the send_osc closure captures osc_sender.
+    lua.globals().set("ROUTE_NAME", name)?;
+    lua.globals().set("OSC_SEND_ENABLED", osc_sender.is_some())?;
+
     // --- Expose `send_osc(addr, ...)` or `send_osc(target, addr, ...)` ---
     //
     // One-arg (address) form sends to the only configured target.
@@ -818,6 +861,10 @@ fn run_lua_event_loop(
         };
         lua.globals().set("config", cfg_table)?;
     }
+
+    // --- Load the stdlib (osc_params etc.) ---
+    lua.load(LUA_STDLIB).set_name("stdlib").exec()
+        .map_err(|e| anyhow::anyhow!("Failed to load Lua stdlib: {}", e))?;
 
     // --- Load the user script ---
     anyhow::Context::with_context(lua.load(script).set_name(name).exec(), || {
