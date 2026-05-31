@@ -1,9 +1,10 @@
 mod alsa_connect;
 mod config;
+mod lua_api;
+mod lua_stdlib_tests;
 mod osc;
 mod route;
 mod timer;
-mod lua_api;
 
 use anyhow::Result;
 use notify::{Event, EventKind, RecursiveMode, Watcher};
