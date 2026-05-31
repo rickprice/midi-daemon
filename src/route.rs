@@ -894,7 +894,7 @@ fn run_lua_event_loop(
         lua.globals().set("config", cfg_table)?;
     }
 
-    // --- Load the stdlib (osc_params etc.) ---
+    // --- Load the stdlib ---
     lua.load(LUA_STDLIB).set_name("stdlib").exec()
         .map_err(|e| anyhow::anyhow!("Failed to load Lua stdlib: {}", e))?;
 
@@ -902,6 +902,25 @@ fn run_lua_event_loop(
     anyhow::Context::with_context(lua.load(script).set_name(name).exec(), || {
         format!("Lua load error in '{}'", name)
     })?;
+
+    // --- Build OscParamSet from init().osc.params if declared ---
+    let mut osc_param_set: Option<crate::osc_params::OscParamSet> =
+        lua.globals()
+            .get::<Option<LuaFunction>>("init")
+            .ok()
+            .flatten()
+            .and_then(|f| f.call::<LuaValue>(()).ok())
+            .and_then(|v| if let LuaValue::Table(t) = v { Some(t) } else { None })
+            .and_then(|tbl| {
+                let prefix = format!("/{}", name);
+                match crate::osc_params::from_init_table(&lua, &prefix, &tbl) {
+                    Ok(ps) => ps,
+                    Err(e) => {
+                        warn!("[{}] Failed to build OscParamSet from init(): {}", name, e);
+                        None
+                    }
+                }
+            });
 
     // Cache callbacks once — avoids a global-table lookup on every event.
     let on_midi_fn: Option<LuaFunction> = lua.globals().get("on_midi").ok();
@@ -920,7 +939,6 @@ fn run_lua_event_loop(
                 if let Some(ref on_midi) = on_midi_fn {
                     match midi_bytes_to_lua(&lua, &bytes) {
                         Ok(msg) => {
-                            // Add `port` field so Lua can distinguish which input fired.
                             let _ = msg.set("port", port.as_str());
                             if let Err(e) = on_midi.call::<()>(msg) {
                                 warn!("[{}] on_midi error: {}", name, e);
@@ -931,6 +949,11 @@ fn run_lua_event_loop(
                 }
             }
             RouteEvent::Timer(TimerEvent::Tick { tick, bpm, ppqn }) => {
+                if let Some(ref mut ps) = osc_param_set {
+                    if let Err(e) = ps.tick(&lua) {
+                        warn!("[{}] osc_params tick error: {}", name, e);
+                    }
+                }
                 if let Some(ref on_tick) = on_tick_fn {
                     if let Err(e) = on_tick.call::<()>((tick, bpm, ppqn)) {
                         warn!("[{}] on_tick error: {}", name, e);
@@ -938,17 +961,21 @@ fn run_lua_event_loop(
                 }
             }
             RouteEvent::Osc { from, address, args } => {
-                if let Some(ref on_osc) = on_osc_fn {
-                    match osc_message_to_lua(&lua, &address, &args) {
-                        Ok(msg) => {
-                            // msg.from = "ip:port" — used by osc_params for subscribe replies.
-                            let _ = msg.set("from", from.to_string());
+                match osc_message_to_lua(&lua, &address, &args) {
+                    Ok(msg) => {
+                        let _ = msg.set("from", from.to_string());
+                        if let Some(ref mut ps) = osc_param_set {
+                            if let Err(e) = ps.dispatch(&lua, &msg) {
+                                warn!("[{}] osc_params dispatch error: {}", name, e);
+                            }
+                        }
+                        if let Some(ref on_osc) = on_osc_fn {
                             if let Err(e) = on_osc.call::<()>(msg) {
                                 warn!("[{}] on_osc error: {}", name, e);
                             }
                         }
-                        Err(e) => warn!("[{}] OSC message parse error: {}", name, e),
                     }
+                    Err(e) => warn!("[{}] OSC message parse error: {}", name, e),
                 }
             }
         }

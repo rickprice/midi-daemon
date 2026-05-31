@@ -3,6 +3,7 @@ mod config;
 mod lua_api;
 mod lua_stdlib_tests;
 mod osc;
+mod osc_params;
 mod route;
 mod timer;
 

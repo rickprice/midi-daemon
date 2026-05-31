@@ -169,7 +169,7 @@ pub fn osc_message_to_lua(lua: &Lua, address: &str, args: &[rosc::OscType]) -> L
     Ok(msg)
 }
 
-fn osc_type_to_lua_value(lua: &Lua, t: &rosc::OscType) -> LuaResult<LuaValue> {
+pub(crate) fn osc_type_to_lua_value(lua: &Lua, t: &rosc::OscType) -> LuaResult<LuaValue> {
     use rosc::OscType as O;
     match t {
         O::Int(n)    => Ok(LuaValue::Integer(*n as i64)),

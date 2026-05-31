@@ -9,7 +9,7 @@
 --   /metronome/beat    <beat:int> <beats_per_bar:int> <bpm:float>
 --   /metronome/running <1|0>
 --
--- OSC input (when osc_receive_port is set):
+-- OSC params (handled automatically by Rust, declared in init()):
 --   /metronome/bpm <value>   — set BPM (20–200)
 --   /metronome/running <1|0> — start (1) or stop (0)
 --   /metronome/start         — reset to beat 1 and start
@@ -76,8 +76,33 @@ local function transport_start()
     if OSC_OUT then send_osc("/" .. ROUTE_NAME .. "/running", 1) end
 end
 
+function init()
+    return {
+        inputs  = {"midi"},
+        outputs = {"midi"},
+        osc = {
+            receive = 9000,
+            send = {
+                default = "127.0.0.1:9001",
+            },
+            params = {
+                bpm = {
+                    set = function(v) set_bpm(v); log(string.format("BPM: %.1f via OSC", v)) end,
+                    get = get_bpm,
+                },
+                running = {
+                    set = function(v) set_running(v ~= 0) end,
+                    get = function() return running and 1 or 0 end,
+                },
+                start    = { set = transport_start },
+                stop     = { set = function() set_running(false) end },
+                continue = { set = function() set_running(true)  end },
+            },
+        },
+    }
+end
+
 function on_tick(tick, bpm, ppqn)
-    osc_tick()   -- evict timed-out subscribers; send /heartbeat pings
     if not running then return end
 
     -- Handle pending note-offs
@@ -126,18 +151,3 @@ function on_midi(msg)
         set_running(false)
     end
 end
-
-local osc_tick
-on_osc, osc_tick = osc_params("/" .. ROUTE_NAME, {
-    bpm = {
-        set = function(v) set_bpm(v); log(string.format("BPM: %.1f via OSC", v)) end,
-        get = get_bpm,
-    },
-    running  = {
-        set = function(v) set_running(v ~= 0) end,
-        get = function() return running and 1 or 0 end,
-    },
-    start    = { set = transport_start },
-    stop     = { set = function() set_running(false) end },
-    continue = { set = function() set_running(true) end },
-})
