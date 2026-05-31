@@ -4,7 +4,6 @@ use midir::{MidiInput, MidiInputConnection, MidiOutput, MidiOutputConnection};
 use mlua::prelude::*;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::net::ToSocketAddrs;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
@@ -475,9 +474,24 @@ fn osc_from_lua_table(tbl: &LuaTable) -> OscDecl {
         _ => return decl,
     };
 
-    if let Ok(LuaValue::Integer(n)) = osc_tbl.get::<LuaValue>("receive") {
+    let port_num: Option<i64> = match osc_tbl.get::<LuaValue>("receive").unwrap_or(LuaValue::Nil) {
+        LuaValue::Integer(n) => Some(n),
+        LuaValue::Number(f) if f.fract() == 0.0 => Some(f as i64),
+        LuaValue::Number(f) => {
+            warn!("OSC receive port must be an integer, got {}", f);
+            None
+        }
+        LuaValue::Nil => None,
+        other => {
+            warn!("OSC receive port must be an integer, got {}", other.type_name());
+            None
+        }
+    };
+    if let Some(n) = port_num {
         if n > 0 && n <= 65535 {
             decl.receive_port = Some(n as u16);
+        } else {
+            warn!("OSC receive port {} is out of range (1–65535)", n);
         }
     }
 
@@ -500,9 +514,7 @@ fn osc_from_lua_table(tbl: &LuaTable) -> OscDecl {
 }
 
 fn parse_socket_addr(s: &str) -> Option<SocketAddr> {
-    s.parse::<SocketAddr>()
-        .ok()
-        .or_else(|| s.to_socket_addrs().ok()?.next())
+    s.parse::<SocketAddr>().ok()
 }
 
 // ── Connect default expansion ─────────────────────────────────────────────────
@@ -722,16 +734,21 @@ fn run_lua_event_loop(
         let f = lua.create_function(move |_, args: LuaMultiValue| -> LuaResult<()> {
             let sender = match &osc_sender {
                 Some(s) => s,
-                None => return Ok(()),
+                None => {
+                    warn!("send_osc: no OSC send targets configured in init()");
+                    return Ok(());
+                }
             };
 
-            let args: Vec<LuaValue> = args.into_iter().collect();
             if args.is_empty() {
                 return Err(LuaError::RuntimeError(
                     "send_osc: expected at least an OSC address argument".into(),
                 ));
             }
 
+            // Determine target and address without heap-allocating the whole arg list.
+            // Address-first form:  send_osc("/addr", ...)  — first arg starts with '/'
+            // Target-first form:   send_osc("name", "/addr", ...)
             let first = match &args[0] {
                 LuaValue::String(s) => s.to_str().map_err(LuaError::external)?.to_string(),
                 _ => {
@@ -742,7 +759,7 @@ fn run_lua_event_loop(
             };
 
             let (target, address, arg_start) = if first.starts_with('/') {
-                // Address-first form: use the single target or error.
+                // Address-first: pick the sole target or error.
                 let t = if sender.targets.len() == 1 {
                     sender.targets.keys().next().unwrap().clone()
                 } else {
@@ -752,7 +769,7 @@ fn run_lua_event_loop(
                 };
                 (t, first, 1usize)
             } else {
-                // Target-name-first form.
+                // Target-name-first.
                 if !sender.targets.contains_key(&first) {
                     return Err(LuaError::RuntimeError(format!(
                         "send_osc: unknown target '{}'",
@@ -769,12 +786,18 @@ fn run_lua_event_loop(
                         ))
                     }
                 };
+                if !address.starts_with('/') {
+                    return Err(LuaError::RuntimeError(format!(
+                        "send_osc: OSC address must start with '/', got '{}'",
+                        address
+                    )));
+                }
                 (first, address, 2usize)
             };
 
-            let osc_args = args[arg_start..]
-                .iter()
-                .map(lua_val_to_osc_type)
+            let osc_args = args.into_iter()
+                .skip(arg_start)
+                .map(|v| lua_val_to_osc_type(&v))
                 .collect::<LuaResult<Vec<_>>>()?;
 
             if let Err(e) = sender.send(&target, address, osc_args) {

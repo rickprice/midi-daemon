@@ -42,7 +42,7 @@ impl OscSender {
 
 pub struct OscReceiver {
     running: Arc<AtomicBool>,
-    _thread: std::thread::JoinHandle<()>,
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl OscReceiver {
@@ -62,7 +62,7 @@ impl OscReceiver {
             while running_clone.load(Ordering::Relaxed) {
                 match socket.recv(&mut buf) {
                     Ok(n) => match rosc::decoder::decode_udp(&buf[..n]) {
-                        Ok((_, packet)) => dispatch_packet(packet, &callback),
+                        Ok((_, packet)) => dispatch_packet(packet, &callback, 0),
                         Err(e) => debug!("OSC decode error: {:?}", e),
                     },
                     Err(e)
@@ -79,22 +79,34 @@ impl OscReceiver {
             }
         });
 
-        Ok(OscReceiver { running, _thread: thread })
+        Ok(OscReceiver { running, thread: Some(thread) })
     }
 }
 
 impl Drop for OscReceiver {
     fn drop(&mut self) {
         self.running.store(false, Ordering::Relaxed);
+        // Join the thread so the UDP socket is released before we return.
+        // With the 100 ms read timeout this waits at most ~100 ms, ensuring a
+        // hot-reload that re-binds the same port does not hit EADDRINUSE.
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
     }
 }
 
-fn dispatch_packet<F: Fn(String, Vec<OscType>)>(packet: rosc::OscPacket, callback: &F) {
+const MAX_BUNDLE_DEPTH: u8 = 16;
+
+fn dispatch_packet<F: Fn(String, Vec<OscType>)>(packet: rosc::OscPacket, callback: &F, depth: u8) {
     match packet {
         rosc::OscPacket::Message(msg) => callback(msg.addr, msg.args),
         rosc::OscPacket::Bundle(bundle) => {
+            if depth >= MAX_BUNDLE_DEPTH {
+                warn!("OSC bundle nesting exceeds depth limit ({}); ignoring", MAX_BUNDLE_DEPTH);
+                return;
+            }
             for item in bundle.content {
-                dispatch_packet(item, callback);
+                dispatch_packet(item, callback, depth + 1);
             }
         }
     }

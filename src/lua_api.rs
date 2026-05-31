@@ -181,7 +181,7 @@ fn osc_type_to_lua_value(lua: &Lua, t: &rosc::OscType) -> LuaResult<LuaValue> {
         O::Nil       => Ok(LuaValue::Nil),
         O::Inf       => Ok(LuaValue::Number(f64::INFINITY)),
         O::Blob(b)   => Ok(LuaValue::String(lua.create_string(b)?)),
-        O::Char(c)   => Ok(LuaValue::String(lua.create_string(&c.to_string())?)),
+        O::Char(c)   => Ok(LuaValue::String(lua.create_string(c.encode_utf8(&mut [0u8; 4]))?)),
         O::Time(t)   => Ok(LuaValue::Number(
             t.seconds as f64 + t.fractional as f64 / (u32::MAX as f64 + 1.0),
         )),
@@ -212,12 +212,28 @@ fn osc_type_to_lua_value(lua: &Lua, t: &rosc::OscType) -> LuaResult<LuaValue> {
 }
 
 /// Convert a single Lua value to the most appropriate OSC type.
-/// Integers → `Int`, floats → `Float`, strings → `String`, booleans → `Bool`, nil → `Nil`.
+/// Integers → `Int32`, floats → `Float32`, strings → `String`, booleans → `Bool`, nil → `Nil`.
+/// Returns an error if an integer is outside i32 range or a float would overflow to infinity.
 pub fn lua_val_to_osc_type(v: &LuaValue) -> LuaResult<rosc::OscType> {
     match v {
-        LuaValue::Integer(n) => Ok(rosc::OscType::Int(*n as i32)),
-        LuaValue::Number(f)  => Ok(rosc::OscType::Float(*f as f32)),
-        LuaValue::String(s)  => Ok(rosc::OscType::String(
+        LuaValue::Integer(n) => i32::try_from(*n).map(rosc::OscType::Int).map_err(|_| {
+            LuaError::RuntimeError(format!(
+                "send_osc: integer {} is out of range for OSC Int32 ({} to {})",
+                n,
+                i32::MIN,
+                i32::MAX,
+            ))
+        }),
+        LuaValue::Number(f) => {
+            if f.abs() > f32::MAX as f64 {
+                return Err(LuaError::RuntimeError(format!(
+                    "send_osc: float {} is out of range for OSC Float32; use a smaller value",
+                    f
+                )));
+            }
+            Ok(rosc::OscType::Float(*f as f32))
+        }
+        LuaValue::String(s) => Ok(rosc::OscType::String(
             s.to_str().map_err(LuaError::external)?.to_string(),
         )),
         LuaValue::Boolean(b) => Ok(rosc::OscType::Bool(*b)),
