@@ -207,14 +207,15 @@ on_osc = osc_params("/" .. ROUTE_NAME, { ... })
 
 The following helpers are available in every route without any `require` or `dofile`.
 
-#### `osc_params(prefix, params) → function`
+#### `osc_params(prefix, params [, default_timeout]) → on_osc_fn, on_tick_fn`
 
-Builds an `on_osc` handler from a declarative table of named parameters,
-following Ardour's subscribe/notify pattern. Returns a function suitable for
-assigning to `on_osc`.
+Builds `on_osc` and `on_tick` handlers from a declarative parameter table,
+following Ardour's subscribe/notify/heartbeat pattern. Returns **two values**;
+assign both so subscriber management works correctly:
 
 ```lua
-on_osc = osc_params("/" .. ROUTE_NAME, {
+local osc_tick
+on_osc, osc_tick = osc_params("/" .. ROUTE_NAME, {
     bpm = {
         set = function(v) set_bpm(v) end,
         get = get_bpm,
@@ -226,29 +227,40 @@ on_osc = osc_params("/" .. ROUTE_NAME, {
     start = { set = start_fn },   -- imperative: no-arg message calls set
     stop  = { set = stop_fn },
 })
+
+function on_tick(tick, bpm, ppqn)
+    osc_tick()   -- must be called; evicts timed-out subscribers and sends /heartbeat
+    -- ... route logic ...
+end
 ```
+
+Call `osc_tick()` **before** any early-return guards in `on_tick` so subscriber
+state is maintained even when the route is paused.
 
 **Automatically handled addresses** (no entries needed in `params`):
 
-| Address | Effect |
-|---|---|
-| `prefix/subscribe [port]` | Register sender for change notifications; immediately sends current state of all `get`-able params |
-| `prefix/unsubscribe [port]` | Remove sender from subscriber list |
+| Address | Arguments | Effect |
+|---|---|---|
+| `prefix/subscribe` | `[port [timeout_secs]]` | Register (or renew) sender; sends current state of all `get`-able params immediately |
+| `prefix/unsubscribe` | `[port]` | Remove subscriber immediately |
+| `prefix/heartbeat` | — | Sent by the daemon to subscribers every 5 s |
 
-The optional `port` argument overrides the sender's source port as the
-feedback address — the same convention Ardour uses for surfaces that send
-from one port and receive on another.
+`port` overrides the source port as the feedback address — the same convention
+Ardour uses for surfaces that send and receive on different ports.
+`timeout_secs` overrides the per-subscription expiry (default `30`, matching
+Ardour). Clients should re-send `/subscribe` before their timeout expires to
+renew their subscription.
 
 **Dispatch rules for `prefix/<param>`:**
 
-| Message arrives with | `get` defined | `set` defined | Action |
+| Message | `get` | `set` | Action |
 |---|---|---|---|
-| no arguments | yes | — | calls `get()`, sends value back to `msg.from` only |
+| no arguments | yes | — | calls `get()`, replies to `msg.from` only |
 | no arguments | no | yes | calls `set()` |
-| arguments | — | yes | calls `set(v…)`, then notifies all subscribers via `get()` |
+| with arguments | — | yes | calls `set(v…)`, then notifies all subscribers via `get()` |
 
 Post-set notification uses `get()` rather than echoing the raw args, so
-clamped or coerced values are reported correctly.
+clamped or coerced values are always what gets reported.
 
 ### `msg.from`
 

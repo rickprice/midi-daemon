@@ -1,71 +1,113 @@
 -- midi-daemon Lua stdlib — loaded into every route before its script.
 -- All symbols defined here are globals available without any require/dofile.
 
---- Build an on_osc handler from a declarative parameter table.
+--- Build on_osc and on_tick handlers from a declarative parameter table,
+--- following Ardour's subscribe/notify/heartbeat pattern.
 --
--- Follows Ardour's subscribe/notify pattern:
+-- Returns TWO values: on_osc_fn, on_tick_fn.
+-- Assign both so that subscriber eviction and /heartbeat pings work:
 --
---   /prefix/subscribe [feedback_port]
---       Register msg.from (or src_ip:feedback_port) for change notifications.
---       Immediately sends the current value of every get-able param.
+--   local osc_tick
+--   on_osc, osc_tick = osc_params("/" .. ROUTE_NAME, { ... })
+--
+--   function on_tick(tick, bpm, ppqn)
+--       osc_tick()         -- evict timed-out subscribers; send /heartbeat
+--       -- ...route logic...
+--   end
+--
+-- ── Subscribe/unsubscribe ─────────────────────────────────────────────────────
+--
+--   /prefix/subscribe [feedback_port [timeout_secs]]
+--       Register (or renew) the sender as a subscriber.
+--       feedback_port  — port on the sender's host to send notifications to;
+--                        defaults to the source port of the message.
+--       timeout_secs   — how long before the subscription expires without renewal;
+--                        defaults to default_timeout (30 s, matching Ardour).
+--       On subscribe, the current value of every get-able param is sent
+--       immediately to the feedback address.
 --
 --   /prefix/unsubscribe [feedback_port]
---       Remove the address from the subscriber list.
+--       Remove the subscriber immediately.
+--
+-- ── Heartbeat (Ardour-compatible) ────────────────────────────────────────────
+--
+--   The daemon sends /prefix/heartbeat to every active subscriber every
+--   HEARTBEAT_INTERVAL seconds (default 5 s) so clients know it is alive.
+--   Clients are expected to re-send /subscribe before their timeout expires
+--   to renew their subscription.
+--
+-- ── Normal param dispatch ─────────────────────────────────────────────────────
 --
 --   /prefix/<param>  (no args)
---       Query: reply with current value via get() to msg.from directly.
+--       Query: get() → reply to msg.from only.
+--   /prefix/<param> v…
+--       Set: set(v…), then notify all subscribers via get().
+--       Post-set notification uses get() so clamped/coerced values are reported.
 --
---   /prefix/<param> v1 v2 ...
---       Set: call set(v1, v2, ...), then notify all subscribers with get().
+-- ── Parameters ───────────────────────────────────────────────────────────────
 --
--- prefix   string   OSC address prefix, e.g. "/" .. ROUTE_NAME
--- params   table    param_name -> { set = fn, get = fn }
---
---   get()           Called on a no-argument message (query or post-set notify).
---                   Return value(s) are sent back on the originating address.
---   set(v, ...)     Called with the message arguments when args are present.
---                   If only set is defined, a no-argument message calls set().
+-- prefix           string   OSC address prefix, e.g. "/" .. ROUTE_NAME
+-- params           table    param_name -> { set = fn, get = fn }
+-- default_timeout  number   seconds before a subscription expires (default 30)
 --
 -- Example:
---   on_osc = osc_params("/" .. ROUTE_NAME, {
+--   local osc_tick
+--   on_osc, osc_tick = osc_params("/" .. ROUTE_NAME, {
 --       bpm  = { set = function(v) set_bpm(v) end, get = get_bpm },
 --       mute = { set = function(v) muted = (v ~= 0) end,
 --                get = function() return muted and 1 or 0 end },
 --       stop = { set = function() running = false end },
 --   })
-function osc_params(prefix, params)
+
+local HEARTBEAT_INTERVAL = 5   -- send /heartbeat to subscribers every N seconds
+local EVICTION_INTERVAL  = 5   -- check for expired subscriptions every N seconds
+
+function osc_params(prefix, params, default_timeout)
+    default_timeout = default_timeout or 30
+
     local slash_prefix     = prefix .. "/"
     local prefix_len       = #slash_prefix
     local subscribe_addr   = prefix .. "/subscribe"
     local unsubscribe_addr = prefix .. "/unsubscribe"
-    local subscribers      = {}  -- "ip:port" -> true
+    local heartbeat_addr   = prefix .. "/heartbeat"
 
-    -- Compute the feedback address for subscribe/unsubscribe messages:
-    -- if the message carries an explicit port number, combine sender IP with that port;
-    -- otherwise use msg.from directly (same address the sender came from).
-    local function feedback_addr(msg)
+    -- subscribers[feedback_addr] = { expiry = <unix time>, timeout = <secs> }
+    local subscribers    = {}
+    local last_eviction  = os.time()
+    local last_heartbeat = os.time()
+
+    -- Compute feedback address and timeout from a subscribe/unsubscribe message.
+    -- msg.args[1]: feedback port (optional, overrides source port)
+    -- msg.args[2]: timeout in seconds (optional, subscribe only)
+    local function parse_feedback(msg)
+        local fb = msg.from
         if #msg.args >= 1 then
             local ip = msg.from:match("^([^:]+):")
-            if ip then return ip .. ":" .. tostring(msg.args[1]) end
+            if ip then fb = ip .. ":" .. tostring(msg.args[1]) end
         end
-        return msg.from
+        local timeout = default_timeout
+        if #msg.args >= 2 then
+            timeout = tonumber(msg.args[2]) or default_timeout
+        end
+        return fb, timeout
     end
 
     local function notify_subscribers(addr, ...)
-        for sub in pairs(subscribers) do
-            send_osc(sub, addr, ...)
+        for fb in pairs(subscribers) do
+            send_osc(fb, addr, ...)
         end
     end
 
-    return function(msg)
+    -- on_osc handler ──────────────────────────────────────────────────────────
+    local on_osc_fn = function(msg)
         local addr = msg.address
         local from = msg.from
 
-        -- /prefix/subscribe [feedback_port]
+        -- /prefix/subscribe [port [timeout]]
         if addr == subscribe_addr then
-            local fb = feedback_addr(msg)
-            subscribers[fb] = true
-            -- Initial state dump: send every queryable param to the new subscriber.
+            local fb, timeout = parse_feedback(msg)
+            subscribers[fb] = { expiry = os.time() + timeout, timeout = timeout }
+            -- Initial state dump to the new (or renewed) subscriber.
             for pname, p in pairs(params) do
                 if p.get then
                     send_osc(fb, slash_prefix .. pname, p.get())
@@ -74,9 +116,9 @@ function osc_params(prefix, params)
             return
         end
 
-        -- /prefix/unsubscribe [feedback_port]
+        -- /prefix/unsubscribe [port]
         if addr == unsubscribe_addr then
-            subscribers[feedback_addr(msg)] = nil
+            subscribers[(parse_feedback(msg))] = nil   -- () truncates to 1 return value
             return
         end
 
@@ -89,16 +131,39 @@ function osc_params(prefix, params)
             if p.get then
                 send_osc(from, addr, p.get())   -- query → reply to sender only
             elseif p.set then
-                p.set()                          -- imperative with no args
+                p.set()
             end
         elseif p.set then
             p.set(table.unpack(msg.args))
-            -- Post-set notification: tell all subscribers (including the sender
-            -- if subscribed) about the new value, using the canonical get() result
-            -- rather than echoing the raw args (handles clamping, coercion, etc.).
             if p.get then
                 notify_subscribers(addr, p.get())
             end
         end
     end
+
+    -- on_tick handler ─────────────────────────────────────────────────────────
+    -- Call this from your route's on_tick (before any early-return guards).
+    local on_tick_fn = function()
+        local now = os.time()
+
+        -- Evict timed-out subscribers.
+        if now - last_eviction >= EVICTION_INTERVAL then
+            last_eviction = now
+            for fb, sub in pairs(subscribers) do
+                if now >= sub.expiry then
+                    subscribers[fb] = nil
+                end
+            end
+        end
+
+        -- Send /heartbeat to every active subscriber so clients know we are alive.
+        if now - last_heartbeat >= HEARTBEAT_INTERVAL then
+            last_heartbeat = now
+            for fb in pairs(subscribers) do
+                send_osc(fb, heartbeat_addr)
+            end
+        end
+    end
+
+    return on_osc_fn, on_tick_fn
 end

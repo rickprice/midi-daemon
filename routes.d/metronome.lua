@@ -77,6 +77,7 @@ local function transport_start()
 end
 
 function on_tick(tick, bpm, ppqn)
+    osc_tick()   -- evict timed-out subscribers; send /heartbeat pings
     if not running then return end
 
     -- Handle pending note-offs
@@ -126,7 +127,8 @@ function on_midi(msg)
     end
 end
 
-on_osc = osc_params("/" .. ROUTE_NAME, {
+local osc_tick
+on_osc, osc_tick = osc_params("/" .. ROUTE_NAME, {
     bpm = {
         set = function(v) set_bpm(v); log(string.format("BPM: %.1f via OSC", v)) end,
         get = get_bpm,
