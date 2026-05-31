@@ -155,6 +155,80 @@ pub fn lua_to_midi_bytes(msg: &LuaTable) -> LuaResult<Vec<u8>> {
     }
 }
 
+/// Convert an OSC message into a Lua table: `{ address = "...", args = { ... } }`.
+/// OSC numeric types map to Lua integer/number; strings/blobs to Lua strings; complex
+/// types (color, MIDI, array) become nested tables.
+pub fn osc_message_to_lua(lua: &Lua, address: &str, args: &[rosc::OscType]) -> LuaResult<LuaTable> {
+    let msg = lua.create_table()?;
+    msg.set("address", address)?;
+    let args_tbl = lua.create_table()?;
+    for (i, arg) in args.iter().enumerate() {
+        args_tbl.set(i + 1, osc_type_to_lua_value(lua, arg)?)?;
+    }
+    msg.set("args", args_tbl)?;
+    Ok(msg)
+}
+
+fn osc_type_to_lua_value(lua: &Lua, t: &rosc::OscType) -> LuaResult<LuaValue> {
+    use rosc::OscType as O;
+    match t {
+        O::Int(n)    => Ok(LuaValue::Integer(*n as i64)),
+        O::Long(n)   => Ok(LuaValue::Integer(*n)),
+        O::Float(f)  => Ok(LuaValue::Number(*f as f64)),
+        O::Double(d) => Ok(LuaValue::Number(*d)),
+        O::String(s) => Ok(LuaValue::String(lua.create_string(s)?)),
+        O::Bool(b)   => Ok(LuaValue::Boolean(*b)),
+        O::Nil       => Ok(LuaValue::Nil),
+        O::Inf       => Ok(LuaValue::Number(f64::INFINITY)),
+        O::Blob(b)   => Ok(LuaValue::String(lua.create_string(b)?)),
+        O::Char(c)   => Ok(LuaValue::String(lua.create_string(&c.to_string())?)),
+        O::Time(t)   => Ok(LuaValue::Number(
+            t.seconds as f64 + t.fractional as f64 / (u32::MAX as f64 + 1.0),
+        )),
+        O::Color(c) => {
+            let tbl = lua.create_table()?;
+            tbl.set("r", c.red)?;
+            tbl.set("g", c.green)?;
+            tbl.set("b", c.blue)?;
+            tbl.set("a", c.alpha)?;
+            Ok(LuaValue::Table(tbl))
+        }
+        O::Midi(m) => {
+            let tbl = lua.create_table()?;
+            tbl.set("port", m.port)?;
+            tbl.set("status", m.status)?;
+            tbl.set("data1", m.data1)?;
+            tbl.set("data2", m.data2)?;
+            Ok(LuaValue::Table(tbl))
+        }
+        O::Array(a) => {
+            let tbl = lua.create_table()?;
+            for (i, item) in a.content.iter().enumerate() {
+                tbl.set(i + 1, osc_type_to_lua_value(lua, item)?)?;
+            }
+            Ok(LuaValue::Table(tbl))
+        }
+    }
+}
+
+/// Convert a single Lua value to the most appropriate OSC type.
+/// Integers → `Int`, floats → `Float`, strings → `String`, booleans → `Bool`, nil → `Nil`.
+pub fn lua_val_to_osc_type(v: &LuaValue) -> LuaResult<rosc::OscType> {
+    match v {
+        LuaValue::Integer(n) => Ok(rosc::OscType::Int(*n as i32)),
+        LuaValue::Number(f)  => Ok(rosc::OscType::Float(*f as f32)),
+        LuaValue::String(s)  => Ok(rosc::OscType::String(
+            s.to_str().map_err(LuaError::external)?.to_string(),
+        )),
+        LuaValue::Boolean(b) => Ok(rosc::OscType::Bool(*b)),
+        LuaValue::Nil        => Ok(rosc::OscType::Nil),
+        other => Err(LuaError::RuntimeError(format!(
+            "send_osc: cannot convert {} to an OSC type (use integer, number, string, boolean, or nil)",
+            other.type_name()
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

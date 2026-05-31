@@ -1,5 +1,6 @@
 mod alsa_connect;
 mod config;
+mod osc;
 mod route;
 mod timer;
 mod lua_api;

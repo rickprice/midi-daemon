@@ -3,6 +3,8 @@ use midir::os::unix::{VirtualInput, VirtualOutput};
 use midir::{MidiInput, MidiInputConnection, MidiOutput, MidiOutputConnection};
 use mlua::prelude::*;
 use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::net::ToSocketAddrs;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
@@ -16,12 +18,17 @@ pub struct ConnectDecl {
 }
 
 use crate::config::Config;
-use crate::lua_api::{lua_to_midi_bytes, midi_bytes_to_lua, toml_table_to_lua};
+use crate::lua_api::{
+    lua_to_midi_bytes, lua_val_to_osc_type, midi_bytes_to_lua, osc_message_to_lua,
+    toml_table_to_lua,
+};
+use crate::osc::{OscDecl, OscReceiver, OscSender};
 use crate::timer::{Timer, TimerEvent};
 
 enum RouteEvent {
     Midi { port: String, bytes: Vec<u8> },
     Timer(TimerEvent),
+    Osc { address: String, args: Vec<rosc::OscType> },
 }
 
 /// Named input and output ports declared by a route.
@@ -143,12 +150,13 @@ impl RoutePorts {
     }
 }
 
-/// A running route: owns its MIDI ports, Lua VM, and timer.
+/// A running route: owns its MIDI ports, Lua VM, timer, and OSC sockets.
 /// Dropping this stops everything cleanly.
 pub struct Route {
     ports: Arc<RoutePorts>,
     _timer: Arc<Timer>,
     _thread: std::thread::JoinHandle<()>,
+    _osc_receiver: Option<OscReceiver>,
     pub connect_decl: ConnectDecl,
 }
 
@@ -179,8 +187,9 @@ impl Route {
 
         let route_cfg = config.route_config(&name).cloned();
 
-        // Run the script once to extract both port layout and connect patterns.
-        let (decl, raw_connect) = extract_all_decls(&script, &name, route_cfg.as_ref())?;
+        // Run the script once to extract port layout, connect patterns, and OSC declarations.
+        let (decl, raw_connect, osc_decl) =
+            extract_all_decls(&script, &name, route_cfg.as_ref())?;
 
         // Fill missing connect patterns with global defaults from config.
         let connect_decl = apply_connect_defaults(
@@ -209,6 +218,43 @@ impl Route {
             }
         };
 
+        // Set up OSC sender (if any targets were declared in init()).
+        let OscDecl { receive_port: osc_receive_port, send_targets: osc_send_targets } = osc_decl;
+
+        let osc_sender = if !osc_send_targets.is_empty() {
+            match OscSender::new(osc_send_targets) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    warn!("Route '{}': failed to create OSC sender: {}", name, e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // Start OSC receiver thread (if a receive port was declared in init()).
+        let osc_receiver = if let Some(port) = osc_receive_port {
+            let tx_clone = tx.clone();
+            match OscReceiver::spawn(port, move |address, args| {
+                let _ = tx_clone.blocking_send(RouteEvent::Osc { address, args });
+            }) {
+                Ok(r) => {
+                    info!("Route '{}': OSC receiver on UDP port {}", name, port);
+                    Some(r)
+                }
+                Err(e) => {
+                    warn!(
+                        "Route '{}': failed to start OSC receiver on port {}: {}",
+                        name, port, e
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let timer = Arc::new(Timer::new(config.default_bpm, config.default_ppqn));
         let _timer_thread = timer.spawn(tx.clone(), RouteEvent::Timer);
 
@@ -231,6 +277,7 @@ impl Route {
                 default_out,
                 timer_for_thread,
                 route_cfg,
+                osc_sender,
             ) {
                 error!("Route '{}' event loop error: {}", name_for_thread, e);
             }
@@ -247,6 +294,7 @@ impl Route {
             ports,
             _timer: timer,
             _thread: thread,
+            _osc_receiver: osc_receiver,
             connect_decl,
         })
     }
@@ -257,6 +305,7 @@ impl Route {
 /// Install no-op stubs and the config table so init() can safely call globals.
 fn setup_extract_lua(lua: &Lua, route_cfg: Option<&toml::Table>) -> Result<()> {
     lua.globals().set("send", lua.create_function(|_, _: LuaMultiValue| Ok(()))?)?;
+    lua.globals().set("send_osc", lua.create_function(|_, _: LuaMultiValue| Ok(()))?)?;
     lua.globals().set("set_bpm", lua.create_function(|_, _: f64| Ok(()))?)?;
     lua.globals().set("get_bpm", lua.create_function(|_, ()| -> LuaResult<f64> { Ok(120.0) })?)?;
     lua.globals().set("set_ppqn", lua.create_function(|_, _: u32| Ok(()))?)?;
@@ -367,13 +416,13 @@ fn connect_from_toml(mut decl: ConnectDecl, route_cfg: Option<&toml::Table>) -> 
     decl
 }
 
-/// Run the script once in a temporary Lua VM to extract both port layout and
-/// connect patterns. Falls back to config.toml, then to the single default port.
+/// Run the script once in a temporary Lua VM to extract port layout, connect
+/// patterns, and OSC declarations. Falls back to config.toml, then defaults.
 fn extract_all_decls(
     script: &str,
     name: &str,
     route_cfg: Option<&toml::Table>,
-) -> Result<(PortDecl, ConnectDecl)> {
+) -> Result<(PortDecl, ConnectDecl, OscDecl)> {
     let lua = Lua::new();
     setup_extract_lua(&lua, route_cfg)?;
 
@@ -382,7 +431,11 @@ fn extract_all_decls(
             "[{}] extract_all_decls: script error (will be reported by event loop): {}",
             name, e
         );
-        return Ok((PortDecl::default(), connect_from_toml(ConnectDecl::default(), route_cfg)));
+        return Ok((
+            PortDecl::default(),
+            connect_from_toml(ConnectDecl::default(), route_cfg),
+            OscDecl::default(),
+        ));
     }
 
     if let Ok(Some(f)) = lua.globals().get::<Option<LuaFunction>>("init") {
@@ -390,7 +443,8 @@ fn extract_all_decls(
             Ok(LuaValue::Table(ref tbl)) => {
                 let port_decl = parse_port_decl_from_lua(tbl)?;
                 let connect_decl = connect_from_toml(connect_from_lua_table(tbl), route_cfg);
-                return Ok((port_decl, connect_decl));
+                let osc_decl = osc_from_lua_table(tbl);
+                return Ok((port_decl, connect_decl, osc_decl));
             }
             Ok(_) => warn!("[{}] init() did not return a table; using default ports", name),
             Err(e) => warn!("[{}] init() error: {}; using default ports", name, e),
@@ -402,7 +456,53 @@ fn extract_all_decls(
         .and_then(parse_port_decl_from_toml)
         .unwrap_or_default();
     let connect_decl = connect_from_toml(ConnectDecl::default(), route_cfg);
-    Ok((port_decl, connect_decl))
+    Ok((port_decl, connect_decl, OscDecl::default()))
+}
+
+/// Parse OSC receive/send declarations from the table returned by `init()`.
+///
+/// ```lua
+/// osc = {
+///     receive = 9000,                       -- UDP port to listen on
+///     send = { synth = "127.0.0.1:9001" },  -- named send targets
+/// }
+/// ```
+fn osc_from_lua_table(tbl: &LuaTable) -> OscDecl {
+    let mut decl = OscDecl::default();
+
+    let osc_tbl = match tbl.get::<LuaValue>("osc") {
+        Ok(LuaValue::Table(t)) => t,
+        _ => return decl,
+    };
+
+    if let Ok(LuaValue::Integer(n)) = osc_tbl.get::<LuaValue>("receive") {
+        if n > 0 && n <= 65535 {
+            decl.receive_port = Some(n as u16);
+        }
+    }
+
+    if let Ok(LuaValue::Table(send_tbl)) = osc_tbl.get::<LuaValue>("send") {
+        for pair in send_tbl.pairs::<String, LuaValue>() {
+            if let Ok((target_name, LuaValue::String(addr_str))) = pair {
+                if let Ok(s) = addr_str.to_str() {
+                    match parse_socket_addr(&s) {
+                        Some(addr) => {
+                            decl.send_targets.insert(target_name, addr);
+                        }
+                        None => warn!("OSC send target '{}': invalid address '{}'", target_name, s),
+                    }
+                }
+            }
+        }
+    }
+
+    decl
+}
+
+fn parse_socket_addr(s: &str) -> Option<SocketAddr> {
+    s.parse::<SocketAddr>()
+        .ok()
+        .or_else(|| s.to_socket_addrs().ok()?.next())
 }
 
 // ── Connect default expansion ─────────────────────────────────────────────────
@@ -499,6 +599,7 @@ fn run_lua_event_loop(
     default_out: String,
     timer: Arc<Timer>,
     route_cfg: Option<toml::Table>,
+    osc_sender: Option<OscSender>,
 ) -> Result<()> {
     let lua = Lua::new();
 
@@ -611,6 +712,80 @@ fn run_lua_event_loop(
         lua.globals().set("log", f)?;
     }
 
+    // --- Expose `send_osc(addr, ...)` or `send_osc(target, addr, ...)` ---
+    //
+    // One-arg (address) form sends to the only configured target.
+    // Two-arg (target, address) form selects a named target.
+    // Additional arguments become typed OSC args: integers → Int32, floats → Float,
+    // strings → String, booleans → Bool, nil → Nil.
+    {
+        let f = lua.create_function(move |_, args: LuaMultiValue| -> LuaResult<()> {
+            let sender = match &osc_sender {
+                Some(s) => s,
+                None => return Ok(()),
+            };
+
+            let args: Vec<LuaValue> = args.into_iter().collect();
+            if args.is_empty() {
+                return Err(LuaError::RuntimeError(
+                    "send_osc: expected at least an OSC address argument".into(),
+                ));
+            }
+
+            let first = match &args[0] {
+                LuaValue::String(s) => s.to_str().map_err(LuaError::external)?.to_string(),
+                _ => {
+                    return Err(LuaError::RuntimeError(
+                        "send_osc: first argument must be a string".into(),
+                    ))
+                }
+            };
+
+            let (target, address, arg_start) = if first.starts_with('/') {
+                // Address-first form: use the single target or error.
+                let t = if sender.targets.len() == 1 {
+                    sender.targets.keys().next().unwrap().clone()
+                } else {
+                    return Err(LuaError::RuntimeError(
+                        "send_osc: multiple targets configured — specify target name as first argument".into(),
+                    ));
+                };
+                (t, first, 1usize)
+            } else {
+                // Target-name-first form.
+                if !sender.targets.contains_key(&first) {
+                    return Err(LuaError::RuntimeError(format!(
+                        "send_osc: unknown target '{}'",
+                        first
+                    )));
+                }
+                let address = match args.get(1) {
+                    Some(LuaValue::String(s)) => {
+                        s.to_str().map_err(LuaError::external)?.to_string()
+                    }
+                    _ => {
+                        return Err(LuaError::RuntimeError(
+                            "send_osc: OSC address (second argument) must be a string".into(),
+                        ))
+                    }
+                };
+                (first, address, 2usize)
+            };
+
+            let osc_args = args[arg_start..]
+                .iter()
+                .map(lua_val_to_osc_type)
+                .collect::<LuaResult<Vec<_>>>()?;
+
+            if let Err(e) = sender.send(&target, address, osc_args) {
+                warn!("OSC send error: {}", e);
+            }
+
+            Ok(())
+        })?;
+        lua.globals().set("send_osc", f)?;
+    }
+
     // --- Expose `config` table ---
     {
         let cfg_table = match route_cfg {
@@ -629,6 +804,7 @@ fn run_lua_event_loop(
     // Cache callbacks once — avoids a global-table lookup on every event.
     let on_midi_fn: Option<LuaFunction> = lua.globals().get("on_midi").ok();
     let on_tick_fn: Option<LuaFunction> = lua.globals().get("on_tick").ok();
+    let on_osc_fn: Option<LuaFunction> = lua.globals().get("on_osc").ok();
 
     // --- Event loop ---
     loop {
@@ -656,6 +832,18 @@ fn run_lua_event_loop(
                 if let Some(ref on_tick) = on_tick_fn {
                     if let Err(e) = on_tick.call::<()>((tick, bpm, ppqn)) {
                         warn!("[{}] on_tick error: {}", name, e);
+                    }
+                }
+            }
+            RouteEvent::Osc { address, args } => {
+                if let Some(ref on_osc) = on_osc_fn {
+                    match osc_message_to_lua(&lua, &address, &args) {
+                        Ok(msg) => {
+                            if let Err(e) = on_osc.call::<()>(msg) {
+                                warn!("[{}] on_osc error: {}", name, e);
+                            }
+                        }
+                        Err(e) => warn!("[{}] OSC message parse error: {}", name, e),
                     }
                 }
             }

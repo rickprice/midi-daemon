@@ -180,11 +180,121 @@ end
 ```lua
 send(msg)              -- Send msg to the first/only output port
 send(port_name, msg)   -- Send msg to a named output port (multi-port routes)
+send_osc(address, ...) -- Send OSC to the only configured target
+send_osc(target, address, ...) -- Send OSC to a named target
 set_bpm(bpm)           -- Set timer BPM (float)
 get_bpm()              -- Get current BPM (float)
 set_ppqn(ppqn)         -- Set pulses per quarter note (integer)
 get_ppqn()             -- Get current PPQN (integer)
 log(message)           -- Log a string to the systemd journal / stdout
+```
+
+## OSC support
+
+Routes can receive and send [OSC](https://opensoundcontrol.stanford.edu/) (Open Sound
+Control) messages over UDP. OSC receive/send is declared in the table returned by
+`init()` using the `osc` key.
+
+```lua
+function init()
+    return {
+        inputs  = {"midi"},
+        outputs = {"midi"},
+        osc = {
+            -- UDP port to listen on for incoming OSC messages.
+            receive = 9000,
+            -- Named outgoing destinations.  Use any name; single-target
+            -- routes can omit the name when calling send_osc.
+            send = {
+                default = "127.0.0.1:9001",
+                reaper  = "192.168.1.5:9002",
+            },
+        },
+    }
+end
+```
+
+### `on_osc(msg)` callback
+
+Called for every incoming OSC message. `msg` contains:
+
+| Field      | Type            | Description                                    |
+|------------|-----------------|------------------------------------------------|
+| `address`  | string          | OSC address pattern, e.g. `"/note/on"`         |
+| `args`     | table (1-indexed) | Typed argument values                        |
+
+```lua
+function on_osc(msg)
+    log("OSC " .. msg.address .. " args=" .. #msg.args)
+    if msg.address == "/note/on" and #msg.args >= 2 then
+        send({ type="note_on", channel=1, note=msg.args[1], velocity=msg.args[2] })
+    end
+end
+```
+
+### OSC type mapping (received)
+
+| OSC type     | Lua value                             |
+|--------------|---------------------------------------|
+| `Int32`      | integer                               |
+| `Int64`      | integer                               |
+| `Float32`    | number                                |
+| `Float64`    | number                                |
+| `String`     | string                                |
+| `Blob`       | string (raw bytes)                    |
+| `Bool`       | boolean                               |
+| `Nil`        | nil                                   |
+| `Inf`        | `math.huge`                           |
+| `Char`       | string (single character)             |
+| `Time`       | number (NTP seconds as float)         |
+| `Color`      | table `{ r, g, b, a }` (0–255 each)   |
+| `Array`      | table (1-indexed, recursive)          |
+| `Midi`       | table `{ port, status, data1, data2 }`|
+
+### `send_osc` function
+
+```lua
+-- Single target: omit the target name
+send_osc("/address", arg1, arg2, ...)
+
+-- Multiple targets: name the target
+send_osc("reaper", "/transport/play", 1)
+```
+
+When only one target is configured its name can be omitted and `send_osc` takes
+the OSC address as the first argument (detected by the leading `/`). When
+multiple targets are configured the target name must come first.
+
+### OSC argument type mapping (sent)
+
+| Lua type  | OSC type   |
+|-----------|------------|
+| integer   | `Int32`    |
+| number    | `Float32`  |
+| string    | `String`   |
+| boolean   | `Bool`     |
+| nil       | `Nil`      |
+
+### Configuring OSC ports from `config.toml`
+
+Expose the address or port through the route's `config` table so it can be
+changed without editing the script:
+
+```toml
+[osc-bridge]
+osc_receive_port = 9000
+osc_send_addr    = "127.0.0.1:9001"
+```
+
+```lua
+function init()
+    return {
+        osc = {
+            receive = config.osc_receive_port or 9000,
+            send    = { default = config.osc_send_addr or "127.0.0.1:9001" },
+        },
+    }
+end
 ```
 
 ## config.toml
@@ -390,6 +500,19 @@ connect_lead  = ".*Surge.*"
 The `connect_*` keys are all optional — omit any you don't need and connect
 that port manually with `aconnect`, or rely on `default_connect_input` /
 `default_connect_output` in the top-level config.
+
+## Example: OSC Bridge
+
+See `routes.d/osc-bridge.lua`. Listens for OSC messages on UDP port 9000 and
+maps `/note/on <note> <vel>` and `/note/off <note>` to MIDI note events.
+Conversely, incoming MIDI note events are forwarded as `/midi/note_on` and
+`/midi/note_off` OSC messages to `127.0.0.1:9001`.
+
+Quick loopback test:
+```bash
+nc -lu 9001 &
+oscsend osc.udp://localhost:9000 /note/on ii 60 100
+```
 
 ## Example: Transpose
 

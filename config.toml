@@ -34,6 +34,27 @@ default_ppqn = 24
 # connect_keyboard-in  = ".*My Keyboard.*"
 # connect_metronome-in = ".*metronome-out.*"
 
+# OSC receive/send is declared per-route in init(), not in config.toml.
+# Example init() return value (in your .lua file):
+#
+#   function init()
+#       return {
+#           osc = {
+#               receive = 9000,                       -- UDP port to listen on
+#               send = { default = "127.0.0.1:9001" } -- named send targets
+#           }
+#       }
+#   end
+#
+# Use config.toml values to make the port/address configurable:
+#
+#   function init()
+#       return { osc = { receive = config.osc_port or 9000 } }
+#   end
+#
+# [osc-bridge]
+# osc_port = 9000
+
 [invert_controllers]
 # Message type to match
 type = "cc"
