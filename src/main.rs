@@ -22,7 +22,8 @@ use route::Route;
 /// `Route` is `!Send` (ALSA raw pointers), so we can't share the routes map
 /// with the receiver thread. Instead, each route hands out a lightweight
 /// `Send + 'static` closure that forwards events into its event channel.
-type OscDispatch = Arc<Mutex<HashMap<String, Box<dyn Fn(String, Vec<rosc::OscType>) + Send>>>>;
+type OscDispatch =
+    Arc<Mutex<HashMap<String, Box<dyn Fn(std::net::SocketAddr, String, Vec<rosc::OscType>) + Send>>>>;
 
 fn register_route_osc(dispatch: &OscDispatch, name: &str, route: &Route) {
     dispatch
@@ -42,7 +43,7 @@ fn start_global_osc_receiver(
     dispatch: OscDispatch,
 ) -> Option<osc::OscReceiver> {
     let port = config.osc_receive_port?;
-    match osc::OscReceiver::spawn(port, move |address, args| {
+    match osc::OscReceiver::spawn(port, move |from, address, args| {
         let route_name = address
             .strip_prefix('/')
             .and_then(|s| s.split('/').next())
@@ -51,7 +52,7 @@ fn start_global_osc_receiver(
             return;
         }
         if let Some(inject) = dispatch.lock().unwrap().get(route_name) {
-            inject(address, args);
+            inject(from, address, args);
         }
     }) {
         Ok(rx) => {

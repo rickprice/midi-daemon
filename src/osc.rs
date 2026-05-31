@@ -32,6 +32,12 @@ impl OscSender {
             .targets
             .get(target)
             .ok_or_else(|| anyhow::anyhow!("Unknown OSC target: '{}'", target))?;
+        self.send_to_addr(*dest, address, args)
+    }
+
+    /// Send to an ad-hoc address not in the named targets map.
+    /// Used for subscriber replies and notifications.
+    pub fn send_to_addr(&self, dest: SocketAddr, address: String, args: Vec<OscType>) -> Result<()> {
         let packet = rosc::OscPacket::Message(rosc::OscMessage { addr: address, args });
         let encoded = rosc::encoder::encode(&packet)
             .map_err(|e| anyhow::anyhow!("OSC encode error: {:?}", e))?;
@@ -46,9 +52,11 @@ pub struct OscReceiver {
 }
 
 impl OscReceiver {
+    /// Spawn a UDP listener on `port`. The callback receives the sender's
+    /// address so routes can reply to dynamic subscriber addresses.
     pub fn spawn<F>(port: u16, callback: F) -> Result<Self>
     where
-        F: Fn(String, Vec<OscType>) + Send + 'static,
+        F: Fn(SocketAddr, String, Vec<OscType>) + Send + 'static,
     {
         let socket = UdpSocket::bind(format!("0.0.0.0:{}", port))
             .with_context(|| format!("Failed to bind OSC receive port {}", port))?;
@@ -60,9 +68,9 @@ impl OscReceiver {
         let thread = std::thread::spawn(move || {
             let mut buf = [0u8; 65536];
             while running_clone.load(Ordering::Relaxed) {
-                match socket.recv(&mut buf) {
-                    Ok(n) => match rosc::decoder::decode_udp(&buf[..n]) {
-                        Ok((_, packet)) => dispatch_packet(packet, &callback, 0),
+                match socket.recv_from(&mut buf) {
+                    Ok((n, from)) => match rosc::decoder::decode_udp(&buf[..n]) {
+                        Ok((_, packet)) => dispatch_packet(packet, &callback, from, 0),
                         Err(e) => debug!("OSC decode error: {:?}", e),
                     },
                     Err(e)
@@ -97,16 +105,21 @@ impl Drop for OscReceiver {
 
 const MAX_BUNDLE_DEPTH: u8 = 16;
 
-fn dispatch_packet<F: Fn(String, Vec<OscType>)>(packet: rosc::OscPacket, callback: &F, depth: u8) {
+fn dispatch_packet<F: Fn(SocketAddr, String, Vec<OscType>)>(
+    packet: rosc::OscPacket,
+    callback: &F,
+    from: SocketAddr,
+    depth: u8,
+) {
     match packet {
-        rosc::OscPacket::Message(msg) => callback(msg.addr, msg.args),
+        rosc::OscPacket::Message(msg) => callback(from, msg.addr, msg.args),
         rosc::OscPacket::Bundle(bundle) => {
             if depth >= MAX_BUNDLE_DEPTH {
                 warn!("OSC bundle nesting exceeds depth limit ({}); ignoring", MAX_BUNDLE_DEPTH);
                 return;
             }
             for item in bundle.content {
-                dispatch_packet(item, callback, depth + 1);
+                dispatch_packet(item, callback, from, depth + 1);
             }
         }
     }

@@ -209,33 +209,64 @@ The following helpers are available in every route without any `require` or `dof
 
 #### `osc_params(prefix, params) → function`
 
-Builds an `on_osc` handler from a declarative table of named parameters. Each
-entry maps a parameter name to a `set` function (called when the message carries
-arguments), a `get` function (called on a no-argument query and whose return
-value is sent back on the same address), or both.
+Builds an `on_osc` handler from a declarative table of named parameters,
+following Ardour's subscribe/notify pattern. Returns a function suitable for
+assigning to `on_osc`.
 
 ```lua
 on_osc = osc_params("/" .. ROUTE_NAME, {
     bpm = {
         set = function(v) set_bpm(v) end,
-        get = get_bpm,               -- no-arg query → replies with current BPM
+        get = get_bpm,
     },
     mute = {
         set = function(v) muted = (v ~= 0) end,
         get = function() return muted and 1 or 0 end,
     },
-    start = { set = start_fn },      -- imperative: no-arg message also calls set
+    start = { set = start_fn },   -- imperative: no-arg message calls set
     stop  = { set = stop_fn },
 })
 ```
 
-Dispatch rules:
+**Automatically handled addresses** (no entries needed in `params`):
+
+| Address | Effect |
+|---|---|
+| `prefix/subscribe [port]` | Register sender for change notifications; immediately sends current state of all `get`-able params |
+| `prefix/unsubscribe [port]` | Remove sender from subscriber list |
+
+The optional `port` argument overrides the sender's source port as the
+feedback address — the same convention Ardour uses for surfaces that send
+from one port and receive on another.
+
+**Dispatch rules for `prefix/<param>`:**
 
 | Message arrives with | `get` defined | `set` defined | Action |
 |---|---|---|---|
-| no arguments | yes | — | calls `get()`, sends return value back |
+| no arguments | yes | — | calls `get()`, sends value back to `msg.from` only |
 | no arguments | no | yes | calls `set()` |
-| arguments | — | yes | calls `set(v1, v2, ...)` |
+| arguments | — | yes | calls `set(v…)`, then notifies all subscribers via `get()` |
+
+Post-set notification uses `get()` rather than echoing the raw args, so
+clamped or coerced values are reported correctly.
+
+### `msg.from`
+
+Every `on_osc` message includes `msg.from = "ip:port"` — the sender's UDP
+address. Use it for direct replies outside of `osc_params`, or pass it to
+`send_osc` for ad-hoc responses.
+
+### `send_osc` calling forms
+
+```lua
+send_osc("/addr", v…)              -- address-first: uses sole named target
+send_osc("name", "/addr", v…)      -- named target
+send_osc("192.168.1.5:9001", "/addr", v…)  -- ad-hoc IP:port (subscriber replies)
+```
+
+The ad-hoc form is what `osc_params` uses internally for subscriber
+notifications — it requires only that any OSC receive is active (no named
+send target needed).
 
 ## OSC support
 

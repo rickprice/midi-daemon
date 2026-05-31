@@ -27,7 +27,7 @@ use crate::timer::{Timer, TimerEvent};
 enum RouteEvent {
     Midi { port: String, bytes: Vec<u8> },
     Timer(TimerEvent),
-    Osc { address: String, args: Vec<rosc::OscType> },
+    Osc { from: SocketAddr, address: String, args: Vec<rosc::OscType> },
 }
 
 /// Named input and output ports declared by a route.
@@ -167,10 +167,10 @@ impl Route {
     /// sharing the full Route (which is !Send due to ALSA raw pointers).
     pub fn make_osc_injector(
         &self,
-    ) -> impl Fn(String, Vec<rosc::OscType>) + Send + 'static {
+    ) -> impl Fn(SocketAddr, String, Vec<rosc::OscType>) + Send + 'static {
         let tx = self.osc_tx.clone();
-        move |address: String, args: Vec<rosc::OscType>| {
-            let _ = tx.blocking_send(RouteEvent::Osc { address, args });
+        move |from: SocketAddr, address: String, args: Vec<rosc::OscType>| {
+            let _ = tx.blocking_send(RouteEvent::Osc { from, address, args });
         }
     }
 }
@@ -235,7 +235,12 @@ impl Route {
 
         // Set up OSC sender.
         // Priority: per-route init() targets > global config osc_send_addr.
+        // When receive is active but no send destination is configured, create a
+        // socket-only sender (empty targets) so the route can still send replies
+        // and subscriber notifications to dynamic addresses.
         let OscDecl { receive_port: osc_receive_port, send_targets: osc_send_targets } = osc_decl;
+
+        let any_receive = osc_receive_port.is_some() || config.osc_receive_port.is_some();
 
         let osc_sender = if !osc_send_targets.is_empty() {
             match OscSender::new(osc_send_targets) {
@@ -255,6 +260,15 @@ impl Route {
                     None
                 }
             }
+        } else if any_receive {
+            // Receive-only: socket still needed to send subscribe replies/notifications.
+            match OscSender::new(HashMap::new()) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    warn!("Route '{}': failed to create OSC reply socket: {}", name, e);
+                    None
+                }
+            }
         } else {
             None
         };
@@ -262,8 +276,8 @@ impl Route {
         // Start OSC receiver thread (if a receive port was declared in init()).
         let osc_receiver = if let Some(port) = osc_receive_port {
             let tx_clone = tx.clone();
-            match OscReceiver::spawn(port, move |address, args| {
-                let _ = tx_clone.blocking_send(RouteEvent::Osc { address, args });
+            match OscReceiver::spawn(port, move |from, address, args| {
+                let _ = tx_clone.blocking_send(RouteEvent::Osc { from, address, args });
             }) {
                 Ok(r) => {
                     info!("Route '{}': OSC receiver on UDP port {}", name, port);
@@ -765,20 +779,27 @@ fn run_lua_event_loop(
     // --- Expose `ROUTE_NAME` and `OSC_SEND_ENABLED` ---
     // Must be set before the send_osc closure captures osc_sender.
     lua.globals().set("ROUTE_NAME", name)?;
-    lua.globals().set("OSC_SEND_ENABLED", osc_sender.is_some())?;
+    // OSC_SEND_ENABLED: true when a named outbound target is configured (global or per-route).
+    // Routes should guard proactive sends (beats, state broadcasts) with this flag.
+    // Ad-hoc sends to subscriber addresses ("ip:port" form) always work when any
+    // receive is active, regardless of this flag.
+    lua.globals().set(
+        "OSC_SEND_ENABLED",
+        osc_sender.as_ref().map(|s| !s.targets.is_empty()).unwrap_or(false),
+    )?;
 
-    // --- Expose `send_osc(addr, ...)` or `send_osc(target, addr, ...)` ---
+    // --- Expose `send_osc` ---
     //
-    // One-arg (address) form sends to the only configured target.
-    // Two-arg (target, address) form selects a named target.
-    // Additional arguments become typed OSC args: integers → Int32, floats → Float,
-    // strings → String, booleans → Bool, nil → Nil.
+    // Three calling forms:
+    //   send_osc("/addr", v…)          address-first → sole named target
+    //   send_osc("name", "/addr", v…)  named target
+    //   send_osc("ip:port", "/addr", v…)  ad-hoc address (subscriber replies, notifications)
     {
         let f = lua.create_function(move |_, args: LuaMultiValue| -> LuaResult<()> {
             let sender = match &osc_sender {
                 Some(s) => s,
                 None => {
-                    warn!("send_osc: no OSC send targets configured in init()");
+                    warn!("send_osc: no OSC socket available");
                     return Ok(());
                 }
             };
@@ -789,20 +810,37 @@ fn run_lua_event_loop(
                 ));
             }
 
-            // Determine target and address without heap-allocating the whole arg list.
-            // Address-first form:  send_osc("/addr", ...)  — first arg starts with '/'
-            // Target-first form:   send_osc("name", "/addr", ...)
             let first = match &args[0] {
                 LuaValue::String(s) => s.to_str().map_err(LuaError::external)?.to_string(),
-                _ => {
-                    return Err(LuaError::RuntimeError(
-                        "send_osc: first argument must be a string".into(),
-                    ))
-                }
+                _ => return Err(LuaError::RuntimeError(
+                    "send_osc: first argument must be a string".into(),
+                )),
             };
 
+            // Ad-hoc address form: first arg parses as SocketAddr ("ip:port")
+            if let Ok(dest) = first.parse::<SocketAddr>() {
+                let address = match args.get(1) {
+                    Some(LuaValue::String(s)) => s.to_str().map_err(LuaError::external)?.to_string(),
+                    _ => return Err(LuaError::RuntimeError(
+                        "send_osc: OSC address (second argument) must be a string".into(),
+                    )),
+                };
+                if !address.starts_with('/') {
+                    return Err(LuaError::RuntimeError(format!(
+                        "send_osc: OSC address must start with '/', got '{}'", address
+                    )));
+                }
+                let osc_args = args.into_iter().skip(2)
+                    .map(|v| lua_val_to_osc_type(&v))
+                    .collect::<LuaResult<Vec<_>>>()?;
+                if let Err(e) = sender.send_to_addr(dest, address, osc_args) {
+                    warn!("OSC send error: {}", e);
+                }
+                return Ok(());
+            }
+
             let (target, address, arg_start) = if first.starts_with('/') {
-                // Address-first: pick the sole target or error.
+                // Address-first: pick the sole named target or error.
                 let t = if sender.targets.len() == 1 {
                     sender.targets.keys().next().unwrap().clone()
                 } else {
@@ -812,27 +850,21 @@ fn run_lua_event_loop(
                 };
                 (t, first, 1usize)
             } else {
-                // Target-name-first.
+                // Named-target form.
                 if !sender.targets.contains_key(&first) {
                     return Err(LuaError::RuntimeError(format!(
-                        "send_osc: unknown target '{}'",
-                        first
+                        "send_osc: unknown target '{}'", first
                     )));
                 }
                 let address = match args.get(1) {
-                    Some(LuaValue::String(s)) => {
-                        s.to_str().map_err(LuaError::external)?.to_string()
-                    }
-                    _ => {
-                        return Err(LuaError::RuntimeError(
-                            "send_osc: OSC address (second argument) must be a string".into(),
-                        ))
-                    }
+                    Some(LuaValue::String(s)) => s.to_str().map_err(LuaError::external)?.to_string(),
+                    _ => return Err(LuaError::RuntimeError(
+                        "send_osc: OSC address (second argument) must be a string".into(),
+                    )),
                 };
                 if !address.starts_with('/') {
                     return Err(LuaError::RuntimeError(format!(
-                        "send_osc: OSC address must start with '/', got '{}'",
-                        address
+                        "send_osc: OSC address must start with '/', got '{}'", address
                     )));
                 }
                 (first, address, 2usize)
@@ -905,10 +937,12 @@ fn run_lua_event_loop(
                     }
                 }
             }
-            RouteEvent::Osc { address, args } => {
+            RouteEvent::Osc { from, address, args } => {
                 if let Some(ref on_osc) = on_osc_fn {
                     match osc_message_to_lua(&lua, &address, &args) {
                         Ok(msg) => {
+                            // msg.from = "ip:port" — used by osc_params for subscribe replies.
+                            let _ = msg.set("from", from.to_string());
                             if let Err(e) = on_osc.call::<()>(msg) {
                                 warn!("[{}] on_osc error: {}", name, e);
                             }
