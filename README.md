@@ -390,6 +390,14 @@ end
 
 ## config.toml
 
+Config is split into two parts: **global defaults** (top-level keys) and
+**per-route sections** (`[route-name]`). A route's Lua `init()` can override
+anything declared in either place, so the priority order is:
+
+```
+global defaults  <  per-route [section] values  <  init() return value
+```
+
 The daemon searches for a config file in this order:
 
 1. `$MIDI_DAEMON_CONFIG` — explicit path via environment variable

@@ -1,5 +1,16 @@
 # midi-daemon configuration
 # Default values shown — all fields are optional.
+#
+# Structure:
+#   Top-level keys (this section) set global defaults that apply to every route.
+#   A [section-name] adds per-route config for routes/<section-name>.lua.
+#   Values in a [section-name] block are available in that route as the `config`
+#   Lua global (e.g. config.bpm, config.osc_receive_port).
+#
+# Priority order (lowest → highest):
+#   global defaults in this file
+#   → per-route [section] values
+#   → connect patterns returned by init() in the .lua script
 
 # Directory containing .lua route files.
 # Each .lua file gets its own virtual ALSA MIDI port pair.
@@ -61,6 +72,12 @@ default_ppqn = 24
 #
 # [osc-bridge]
 # osc_port = 9000
+
+# ── Per-route sections ────────────────────────────────────────────────────────
+# Each [section-name] below corresponds to routes.d/<section-name>.lua.
+# Keys become the `config` Lua global in that route.
+# Any TOML type is supported: strings, integers, floats, booleans, arrays,
+# and nested tables.
 
 [invert_controllers]
 # Message type to match
