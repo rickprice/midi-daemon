@@ -936,12 +936,20 @@ fn run_lua_event_loop(
 
         match event {
             RouteEvent::Midi { port, bytes } => {
-                if let Some(ref on_midi) = on_midi_fn {
+                let needs_parse = on_midi_fn.is_some() || osc_param_set.is_some();
+                if needs_parse {
                     match midi_bytes_to_lua(&lua, &bytes) {
                         Ok(msg) => {
                             let _ = msg.set("port", port.as_str());
-                            if let Err(e) = on_midi.call::<()>(msg) {
-                                warn!("[{}] on_midi error: {}", name, e);
+                            if let Some(ref mut ps) = osc_param_set {
+                                if let Err(e) = ps.dispatch_midi(&lua, &msg) {
+                                    warn!("[{}] midi param dispatch error: {}", name, e);
+                                }
+                            }
+                            if let Some(ref on_midi) = on_midi_fn {
+                                if let Err(e) = on_midi.call::<()>(msg) {
+                                    warn!("[{}] on_midi error: {}", name, e);
+                                }
                             }
                         }
                         Err(e) => warn!("[{}] MIDI parse error: {}", name, e),

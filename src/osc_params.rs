@@ -2,6 +2,125 @@ use mlua::prelude::*;
 use std::collections::HashMap;
 use tracing::warn;
 
+// ── MIDI binding types ────────────────────────────────────────────────────────
+
+/// The "address" part of a MIDI message — the routing key for param dispatch.
+/// Mirrors the TouchOSC model: type + channel (+ note/controller where applicable).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum MidiKey {
+    Cc            { channel: u8, controller: u8 },
+    NoteOn        { channel: u8, note: u8 },
+    NoteOff       { channel: u8, note: u8 },
+    ProgramChange { channel: u8 },
+    PitchBend     { channel: u8 },
+    /// Transport messages carry no address fields beyond the type itself.
+    Start,
+    Stop,
+    Continue,
+    Clock,
+}
+
+/// How to map the raw MIDI payload value into the parameter's value domain.
+#[derive(Debug, Clone)]
+pub enum MidiScale {
+    /// Pass the raw MIDI value unchanged (0–127, or −8192..8191 for pitch bend).
+    Raw,
+    /// Linear map from the type's full payload range to [min, max].
+    Linear { min: f64, max: f64 },
+    /// Gate: raw ≥ threshold → 1.0, raw < threshold → 0.0.
+    Threshold(f64),
+}
+
+struct MidiBinding {
+    param_name: String,
+    scale: MidiScale,
+}
+
+// ── MIDI key helpers ──────────────────────────────────────────────────────────
+
+/// Build a `MidiKey` from a Lua table — works for both runtime MIDI messages
+/// and the static binding specs in `init()`.
+fn midi_key_from_table(tbl: &LuaTable) -> Option<MidiKey> {
+    let msg_type: String = tbl.get::<Option<String>>("type").ok().flatten()?;
+    match msg_type.as_str() {
+        "cc" => {
+            let ch  = tbl.get::<Option<i64>>("channel").ok().flatten()? as u8;
+            let ctl = tbl.get::<Option<i64>>("controller").ok().flatten()? as u8;
+            Some(MidiKey::Cc { channel: ch, controller: ctl })
+        }
+        "note_on" => {
+            let ch   = tbl.get::<Option<i64>>("channel").ok().flatten()? as u8;
+            let note = tbl.get::<Option<i64>>("note").ok().flatten()? as u8;
+            Some(MidiKey::NoteOn { channel: ch, note })
+        }
+        "note_off" => {
+            let ch   = tbl.get::<Option<i64>>("channel").ok().flatten()? as u8;
+            let note = tbl.get::<Option<i64>>("note").ok().flatten()? as u8;
+            Some(MidiKey::NoteOff { channel: ch, note })
+        }
+        "program_change" => {
+            let ch = tbl.get::<Option<i64>>("channel").ok().flatten()? as u8;
+            Some(MidiKey::ProgramChange { channel: ch })
+        }
+        "pitch_bend" => {
+            let ch = tbl.get::<Option<i64>>("channel").ok().flatten()? as u8;
+            Some(MidiKey::PitchBend { channel: ch })
+        }
+        "start"    => Some(MidiKey::Start),
+        "stop"     => Some(MidiKey::Stop),
+        "continue" => Some(MidiKey::Continue),
+        "clock"    => Some(MidiKey::Clock),
+        _          => None,
+    }
+}
+
+/// Extract the raw numeric payload from a runtime MIDI message table.
+/// Returns `None` for transport messages (no-arg triggers).
+fn midi_payload_raw(key: &MidiKey, msg: &LuaTable) -> Option<f64> {
+    match key {
+        MidiKey::Cc { .. } =>
+            msg.get::<Option<i64>>("value").ok().flatten().map(|v| v as f64),
+        MidiKey::NoteOn { .. } | MidiKey::NoteOff { .. } =>
+            msg.get::<Option<i64>>("velocity").ok().flatten().map(|v| v as f64),
+        MidiKey::ProgramChange { .. } =>
+            msg.get::<Option<i64>>("program").ok().flatten().map(|v| v as f64),
+        MidiKey::PitchBend { .. } =>
+            msg.get::<Option<i64>>("value").ok().flatten().map(|v| v as f64),
+        MidiKey::Start | MidiKey::Stop | MidiKey::Continue | MidiKey::Clock => None,
+    }
+}
+
+fn midi_payload_range(key: &MidiKey) -> (f64, f64) {
+    match key {
+        MidiKey::PitchBend { .. } => (-8192.0, 8191.0),
+        _ => (0.0, 127.0),
+    }
+}
+
+fn apply_midi_scale(raw: f64, scale: &MidiScale, key: &MidiKey) -> f64 {
+    match scale {
+        MidiScale::Raw => raw,
+        MidiScale::Threshold(t) => if raw >= *t { 1.0 } else { 0.0 },
+        MidiScale::Linear { min, max } => {
+            let (lo, hi) = midi_payload_range(key);
+            min + (raw - lo) / (hi - lo) * (max - min)
+        }
+    }
+}
+
+/// Parse a `MidiScale` from a binding spec table (`scale`, `threshold`, or nothing).
+fn parse_midi_scale(spec: &LuaTable) -> MidiScale {
+    if let Ok(t) = spec.get::<f64>("threshold") {
+        return MidiScale::Threshold(t);
+    }
+    if let Ok(LuaValue::Table(arr)) = spec.get::<LuaValue>("scale") {
+        let min = arr.get::<f64>(1).unwrap_or(0.0);
+        let max = arr.get::<f64>(2).unwrap_or(127.0);
+        return MidiScale::Linear { min, max };
+    }
+    MidiScale::Raw
+}
+
 const HEARTBEAT_INTERVAL: f64 = 5.0;
 const EVICTION_INTERVAL: f64 = 5.0;
 
@@ -24,6 +143,7 @@ pub struct OscParamSet {
     params: HashMap<String, Param>,
     last_eviction: f64,
     last_heartbeat: f64,
+    midi_bindings: HashMap<MidiKey, Vec<MidiBinding>>,
 }
 
 fn lua_now(lua: &Lua) -> LuaResult<f64> {
@@ -64,6 +184,7 @@ impl OscParamSet {
             params: HashMap::new(),
             last_eviction: now,
             last_heartbeat: now,
+            midi_bindings: HashMap::new(),
         }
     }
 
@@ -78,6 +199,77 @@ impl OscParamSet {
         let set_key = set.map(|f| lua.create_registry_value(f)).transpose()?;
         self.params.insert(name, Param { get: get_key, set: set_key });
         Ok(())
+    }
+
+    pub fn add_midi_binding(&mut self, key: MidiKey, param_name: String, scale: MidiScale) {
+        self.midi_bindings
+            .entry(key)
+            .or_default()
+            .push(MidiBinding { param_name, scale });
+    }
+
+    /// Dispatch an incoming MIDI message to any params that have a matching `midi` binding.
+    /// Calls `set()`, then notifies OSC subscribers via `get()` — same path as OSC dispatch.
+    pub fn dispatch_midi(&mut self, lua: &Lua, msg: &LuaTable) -> LuaResult<bool> {
+        let key = match midi_key_from_table(msg) {
+            Some(k) => k,
+            None => return Ok(false),
+        };
+
+        let bindings: Vec<(String, MidiScale)> = match self.midi_bindings.get(&key) {
+            Some(b) if !b.is_empty() =>
+                b.iter().map(|b| (b.param_name.clone(), b.scale.clone())).collect(),
+            _ => return Ok(false),
+        };
+
+        let raw = midi_payload_raw(&key, msg);
+
+        for (param_name, scale) in &bindings {
+            let (set_key, get_key) = match self.params.get(param_name.as_str()) {
+                Some(p) => (p.set.as_ref(), p.get.as_ref()),
+                None => continue,
+            };
+            let set_fn: Option<LuaFunction> =
+                set_key.map(|k| lua.registry_value(k)).transpose()?;
+            let get_fn: Option<LuaFunction> =
+                get_key.map(|k| lua.registry_value(k)).transpose()?;
+
+            if let Some(f) = set_fn {
+                match raw {
+                    Some(r) => {
+                        let scaled = apply_midi_scale(r, scale, &key);
+                        if let Err(e) = f.call::<()>(scaled) {
+                            warn!("dispatch_midi set '{}': {}", param_name, e);
+                        }
+                    }
+                    None => {
+                        if let Err(e) = f.call::<()>(()) {
+                            warn!("dispatch_midi trigger '{}': {}", param_name, e);
+                        }
+                    }
+                }
+                if let Some(g) = get_fn {
+                    let value: LuaValue = g.call(())?;
+                    let subscribers: Vec<String> =
+                        self.subscribers.keys().cloned().collect();
+                    if !subscribers.is_empty() {
+                        let send_osc: LuaFunction = lua.globals().get("send_osc")?;
+                        let param_addr = format!("{}{}", self.slash_prefix, param_name);
+                        for fb in &subscribers {
+                            if let Err(e) = send_osc.call::<()>((
+                                fb.as_str(),
+                                param_addr.as_str(),
+                                value.clone(),
+                            )) {
+                                warn!("dispatch_midi notify subscriber: {}", e);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(true)
     }
 
     pub fn dispatch(&mut self, lua: &Lua, msg: &LuaTable) -> LuaResult<()> {
@@ -242,7 +434,28 @@ pub fn from_init_table(
         let (name, desc) = pair?;
         let get: Option<LuaFunction> = desc.get("get").ok().flatten();
         let set: Option<LuaFunction> = desc.get("set").ok().flatten();
-        ps.add_param(lua, name, get, set)?;
+        ps.add_param(lua, name.clone(), get, set)?;
+
+        // Optional midi bindings: midi = { {type, channel, controller, scale/threshold}, ... }
+        if let Ok(LuaValue::Table(midi_arr)) = desc.get::<LuaValue>("midi") {
+            for i in 1u32.. {
+                match midi_arr.get::<LuaValue>(i) {
+                    Ok(LuaValue::Table(spec)) => {
+                        if let Some(key) = midi_key_from_table(&spec) {
+                            let scale = parse_midi_scale(&spec);
+                            ps.add_midi_binding(key, name.clone(), scale);
+                        } else {
+                            warn!(
+                                "osc.params[{}].midi[{}]: unrecognised type or missing fields, skipping",
+                                name, i
+                            );
+                        }
+                    }
+                    Ok(LuaValue::Nil) | Err(_) => break,
+                    _ => break,
+                }
+            }
+        }
     }
     Ok(Some(ps))
 }
@@ -811,5 +1024,174 @@ mod tests {
             assert(notified, "subscriber should still be active after 2 seconds")
             "#,
         );
+    }
+
+    // ── dispatch_midi ─────────────────────────────────────────────────────────
+
+    fn make_midi_msg(lua: &Lua, fields: &str) -> LuaTable {
+        lua.load(&format!("{{ {} }}", fields)).eval().unwrap()
+    }
+
+    fn ps_with_bpm(lua: &Lua) -> OscParamSet {
+        lua.globals().set("bpm", 120i64).unwrap();
+        let mut ps = make_ps(lua, "/p");
+        let set_fn: LuaFunction = lua
+            .load("function(v) bpm = v end")
+            .eval()
+            .unwrap();
+        let get_fn: LuaFunction = lua.load("function() return bpm end").eval().unwrap();
+        ps.add_param(lua, "bpm".to_string(), Some(get_fn), Some(set_fn))
+            .unwrap();
+        ps
+    }
+
+    #[test]
+    fn dispatch_midi_cc_raw_calls_set() {
+        let lua = make_lua();
+        let mut ps = ps_with_bpm(&lua);
+        ps.add_midi_binding(
+            MidiKey::Cc { channel: 1, controller: 21 },
+            "bpm".to_string(),
+            MidiScale::Raw,
+        );
+        let msg = make_midi_msg(&lua, r#"type="cc", channel=1, controller=21, value=64"#);
+        ps.dispatch_midi(&lua, &msg).unwrap();
+        assert_lua(&lua, r#"assert(bpm == 64, "expected 64, got " .. tostring(bpm))"#);
+    }
+
+    #[test]
+    fn dispatch_midi_cc_linear_scale() {
+        let lua = make_lua();
+        let mut ps = ps_with_bpm(&lua);
+        ps.add_midi_binding(
+            MidiKey::Cc { channel: 1, controller: 21 },
+            "bpm".to_string(),
+            MidiScale::Linear { min: 20.0, max: 200.0 },
+        );
+        // value=0 → 20.0, value=127 → 200.0, value=63.5 ≈ 110
+        let msg = make_midi_msg(&lua, r#"type="cc", channel=1, controller=21, value=0"#);
+        ps.dispatch_midi(&lua, &msg).unwrap();
+        assert_lua(&lua, r#"assert(math.abs(bpm - 20) < 0.01, "expected 20, got " .. tostring(bpm))"#);
+
+        let msg127 = make_midi_msg(&lua, r#"type="cc", channel=1, controller=21, value=127"#);
+        ps.dispatch_midi(&lua, &msg127).unwrap();
+        assert_lua(&lua, r#"assert(math.abs(bpm - 200) < 0.01, "expected 200, got " .. tostring(bpm))"#);
+    }
+
+    #[test]
+    fn dispatch_midi_cc_threshold() {
+        let lua = make_lua();
+        lua.globals().set("running", false).unwrap();
+        let mut ps = make_ps(&lua, "/p");
+        let set_fn: LuaFunction = lua
+            .load("function(v) running = (v ~= 0) end")
+            .eval()
+            .unwrap();
+        let get_fn: LuaFunction =
+            lua.load("function() return running and 1 or 0 end").eval().unwrap();
+        ps.add_param(&lua, "running".to_string(), Some(get_fn), Some(set_fn))
+            .unwrap();
+        ps.add_midi_binding(
+            MidiKey::Cc { channel: 1, controller: 22 },
+            "running".to_string(),
+            MidiScale::Threshold(64.0),
+        );
+
+        let high = make_midi_msg(&lua, r#"type="cc", channel=1, controller=22, value=100"#);
+        ps.dispatch_midi(&lua, &high).unwrap();
+        assert_lua(&lua, r#"assert(running == true, "value>=64 should set running true")"#);
+
+        let low = make_midi_msg(&lua, r#"type="cc", channel=1, controller=22, value=0"#);
+        ps.dispatch_midi(&lua, &low).unwrap();
+        assert_lua(&lua, r#"assert(running == false, "value<64 should set running false")"#);
+    }
+
+    #[test]
+    fn dispatch_midi_transport_start_no_arg_trigger() {
+        let lua = make_lua();
+        lua.globals().set("started", false).unwrap();
+        let mut ps = make_ps(&lua, "/p");
+        let set_fn: LuaFunction = lua
+            .load("function() started = true end")
+            .eval()
+            .unwrap();
+        ps.add_param(&lua, "start".to_string(), None, Some(set_fn)).unwrap();
+        ps.add_midi_binding(MidiKey::Start, "start".to_string(), MidiScale::Raw);
+
+        let msg = make_midi_msg(&lua, r#"type="start""#);
+        ps.dispatch_midi(&lua, &msg).unwrap();
+        assert_lua(&lua, r#"assert(started, "transport start should trigger set()")"#);
+    }
+
+    #[test]
+    fn dispatch_midi_unmatched_key_returns_false() {
+        let lua = make_lua();
+        let mut ps = ps_with_bpm(&lua);
+        ps.add_midi_binding(
+            MidiKey::Cc { channel: 1, controller: 21 },
+            "bpm".to_string(),
+            MidiScale::Raw,
+        );
+        // Wrong controller
+        let msg = make_midi_msg(&lua, r#"type="cc", channel=1, controller=99, value=64"#);
+        let matched = ps.dispatch_midi(&lua, &msg).unwrap();
+        assert!(!matched, "unmatched key should return false");
+        assert_lua(&lua, r#"assert(bpm == 120, "bpm should be unchanged")"#);
+    }
+
+    #[test]
+    fn dispatch_midi_notifies_osc_subscribers() {
+        let lua = make_lua();
+        lua.globals().set("bpm", 120i64).unwrap();
+        let mut ps = make_ps(&lua, "/p");
+        let set_fn: LuaFunction = lua.load("function(v) bpm = v end").eval().unwrap();
+        let get_fn: LuaFunction = lua.load("function() return bpm end").eval().unwrap();
+        ps.add_param(&lua, "bpm".to_string(), Some(get_fn), Some(set_fn)).unwrap();
+        ps.add_midi_binding(
+            MidiKey::Cc { channel: 1, controller: 21 },
+            "bpm".to_string(),
+            MidiScale::Raw,
+        );
+
+        // Subscribe an OSC client
+        let sub = make_msg(&lua, "/p/subscribe", "10.0.0.1:9001", "");
+        ps.dispatch(&lua, &sub).unwrap();
+        assert_lua(&lua, "clear()");
+
+        // Now drive the param via MIDI
+        let msg = make_midi_msg(&lua, r#"type="cc", channel=1, controller=21, value=88"#);
+        ps.dispatch_midi(&lua, &msg).unwrap();
+
+        assert_lua(
+            &lua,
+            r#"
+            local notified = false
+            for _, s in ipairs(_sent) do
+                if s[1] == "10.0.0.1:9001" and s[2] == "/p/bpm" then
+                    notified = true
+                    assert(s[3] == 88, "notification should carry value 88, got " .. tostring(s[3]))
+                end
+            end
+            assert(notified, "OSC subscriber should be notified of MIDI-driven change")
+            "#,
+        );
+    }
+
+    #[test]
+    fn dispatch_midi_note_on_velocity_raw() {
+        let lua = make_lua();
+        lua.globals().set("vel", 0i64).unwrap();
+        let mut ps = make_ps(&lua, "/p");
+        let set_fn: LuaFunction = lua.load("function(v) vel = v end").eval().unwrap();
+        ps.add_param(&lua, "vel".to_string(), None, Some(set_fn)).unwrap();
+        ps.add_midi_binding(
+            MidiKey::NoteOn { channel: 1, note: 60 },
+            "vel".to_string(),
+            MidiScale::Raw,
+        );
+
+        let msg = make_midi_msg(&lua, r#"type="note_on", channel=1, note=60, velocity=100"#);
+        ps.dispatch_midi(&lua, &msg).unwrap();
+        assert_lua(&lua, r#"assert(vel == 100, "expected velocity 100, got " .. tostring(vel))"#);
     }
 }

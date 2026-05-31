@@ -25,15 +25,11 @@ local VELOCITY      = config.velocity      or 100
 local BEATS_PER_BAR = config.beats_per_bar or 4
 local NOTE_LEN_MS   = config.note_len_ms   or 20   -- fixed note duration in ms
 
--- CC that controls BPM (maps 0–127 → 20–200 BPM)
-local CC_TYPE       = config.cc_type       or "cc"
-local CC_CHANNEL    = config.cc_channel    or 1
-local CC_CONTROLLER = config.cc_controller or 21
-
--- CC that starts/stops the metronome (value >= 64 = start, value < 64 = stop)
--- MIDI Transport Start (0xFA), Stop (0xFC), and Continue (0xFB) are also honoured.
-local START_STOP_CHANNEL    = config.start_stop_channel    or 1
-local START_STOP_CONTROLLER = config.start_stop_controller or 22
+-- MIDI binding config — read in init() for the param midi arrays.
+local CC_CHANNEL             = config.cc_channel             or 1
+local CC_CONTROLLER          = config.cc_controller          or 21
+local START_STOP_CHANNEL     = config.start_stop_channel     or 1
+local START_STOP_CONTROLLER  = config.start_stop_controller  or 22
 
 local OSC_OUT = OSC_SEND_ENABLED
 
@@ -82,21 +78,38 @@ function init()
         outputs = {"midi"},
         osc = {
             receive = 9000,
-            send = {
-                default = "127.0.0.1:9001",
-            },
+            send = { default = "127.0.0.1:9001" },
             params = {
                 bpm = {
-                    set = function(v) set_bpm(v); log(string.format("BPM: %.1f via OSC", v)) end,
+                    set = function(v) set_bpm(v); log(string.format("BPM: %.1f", v)) end,
                     get = get_bpm,
+                    -- CC payload 0–127 scaled linearly to 20–200 BPM
+                    midi = {
+                        { type = "cc", channel = CC_CHANNEL,
+                          controller = CC_CONTROLLER, scale = {20, 200} },
+                    },
                 },
                 running = {
                     set = function(v) set_running(v ~= 0) end,
                     get = function() return running and 1 or 0 end,
+                    -- CC value ≥ 64 → start (1), < 64 → stop (0)
+                    midi = {
+                        { type = "cc", channel = START_STOP_CHANNEL,
+                          controller = START_STOP_CONTROLLER, threshold = 64 },
+                    },
                 },
-                start    = { set = transport_start },
-                stop     = { set = function() set_running(false) end },
-                continue = { set = function() set_running(true)  end },
+                start = {
+                    set = transport_start,
+                    midi = { { type = "start" } },
+                },
+                stop = {
+                    set = function() set_running(false) end,
+                    midi = { { type = "stop" } },
+                },
+                continue = {
+                    set = function() set_running(true) end,
+                    midi = { { type = "continue" } },
+                },
             },
         },
     }
@@ -132,22 +145,3 @@ function on_tick(tick, bpm, ppqn)
     end
 end
 
-function on_midi(msg)
-    -- BPM control CC
-    if msg.type == CC_TYPE and msg.channel == CC_CHANNEL and msg.controller == CC_CONTROLLER then
-        local new_bpm = 20 + (msg.value / 127.0) * 180
-        set_bpm(new_bpm)
-        log(string.format("BPM changed to %.1f via MIDI", new_bpm))
-    -- Start/stop CC (value >= 64 starts, value < 64 stops)
-    elseif msg.type == "cc" and msg.channel == START_STOP_CHANNEL
-            and msg.controller == START_STOP_CONTROLLER then
-        set_running(msg.value >= 64)
-    -- MIDI Transport messages
-    elseif msg.type == "start" then
-        transport_start()
-    elseif msg.type == "continue" then
-        set_running(true)
-    elseif msg.type == "stop" then
-        set_running(false)
-    end
-end
