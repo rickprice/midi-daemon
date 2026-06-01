@@ -683,6 +683,47 @@ nc -lu 9001 &
 oscsend osc.udp://localhost:9000 /note/on ii 60 100
 ```
 
+## Example: VolumePanMuteControl
+
+See `routes.d/VolumePanMuteControl.lua`. Bidirectional OSC ↔ MIDI bridge for
+channel volume, pan, and mute. OSC controllers (e.g. TouchOSC faders and toggles)
+drive the three MIDI CCs; incoming MIDI CCs update the internal state and notify
+OSC subscribers, keeping hardware and software UIs in sync.
+
+Configurable via `[VolumePanMuteControl]` in `config.toml`:
+
+| Key                | Default | Description                                                      |
+|--------------------|---------|------------------------------------------------------------------|
+| `channel`          | 1       | Shared MIDI channel for all CCs (per-param keys take precedence) |
+| `volume_channel`   | 1       | MIDI channel for the volume CC                                   |
+| `volume_controller`| 7       | CC number for volume (7 = MIDI Channel Volume)                   |
+| `pan_channel`      | 1       | MIDI channel for the pan CC                                      |
+| `pan_controller`   | 10      | CC number for pan (10 = MIDI Pan; 0=left, 64=center, 127=right) |
+| `mute_channel`     | 1       | MIDI channel for the mute CC                                     |
+| `mute_controller`  | 118     | CC number for mute (no universal standard; configure for your DAW) |
+| `osc_receive_port` | *(none)*| UDP port for incoming OSC (falls back to global `osc_receive_port`) |
+| `osc_send_addr`    | *(none)*| UDP `"host:port"` for OSC output (falls back to global `osc_send_addr`) |
+
+### OSC interface
+
+| Address                          | Type          | Description                              |
+|----------------------------------|---------------|------------------------------------------|
+| `/VolumePanMuteControl/volume`   | float 0–1     | Channel volume (0 = silent, 1 = full)    |
+| `/VolumePanMuteControl/pan`      | float −1–1    | Stereo pan (−1=left, 0=center, 1=right)  |
+| `/VolumePanMuteControl/mute`     | int/bool 0\|1 | Mute toggle (1 = muted, 0 = unmuted)     |
+| `/VolumePanMuteControl/subscribe`| —             | Register for change notifications        |
+
+### MIDI mapping
+
+| Param  | CC (default) | Raw range | OSC range |
+|--------|-------------|-----------|-----------|
+| volume | CC 7        | 0–127     | 0.0–1.0   |
+| pan    | CC 10       | 0–127     | −1.0–1.0 (CC 64 = 0.0) |
+| mute   | CC 118      | ≥64=muted | 0 or 1    |
+
+For mute, incoming CC ≥ 64 triggers muted (1) and < 64 triggers unmuted (0).
+Outgoing MIDI sends 127 for muted and 0 for unmuted.
+
 ## Example: Transpose
 
 See `routes.d/transpose.lua`. Shifts all notes up by a configurable interval,
