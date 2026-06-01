@@ -383,6 +383,12 @@ impl OscParamSet {
         Ok(())
     }
 
+    /// Returns the addresses of all current subscribers (may include recently expired ones
+    /// that haven't been evicted yet by the next tick).
+    pub fn subscriber_addrs(&self) -> Vec<String> {
+        self.subscribers.keys().cloned().collect()
+    }
+
     pub fn tick(&mut self, lua: &Lua) -> LuaResult<()> {
         let now = lua_now(lua)?;
         if now - self.last_eviction >= EVICTION_INTERVAL {

@@ -779,22 +779,24 @@ fn run_lua_event_loop(
     // --- Expose `ROUTE_NAME` and `OSC_SEND_ENABLED` ---
     // Must be set before the send_osc closure captures osc_sender.
     lua.globals().set("ROUTE_NAME", name)?;
-    // OSC_SEND_ENABLED: true when a named outbound target is configured (global or per-route).
-    // Routes should guard proactive sends (beats, state broadcasts) with this flag.
-    // Ad-hoc sends to subscriber addresses ("ip:port" form) always work when any
-    // receive is active, regardless of this flag.
-    lua.globals().set(
-        "OSC_SEND_ENABLED",
-        osc_sender.as_ref().map(|s| !s.targets.is_empty()).unwrap_or(false),
-    )?;
+    // OSC_SEND_ENABLED: true when the OSC send socket is available — either a named target
+    // was declared or a receive port is active (enabling dynamic subscriber sends).
+    // Routes can use this to suppress proactive sends when no OSC infrastructure is wired up.
+    lua.globals().set("OSC_SEND_ENABLED", osc_sender.is_some())?;
+
+    // Subscriber address cache: updated after every osc_param_set dispatch/tick so the
+    // send_osc closure can fan out to subscribers when no named target is configured.
+    let subs_cache: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
 
     // --- Expose `send_osc` ---
     //
     // Three calling forms:
-    //   send_osc("/addr", v…)          address-first → sole named target
+    //   send_osc("/addr", v…)          address-first → named target, or fans out to subscribers
     //   send_osc("name", "/addr", v…)  named target
     //   send_osc("ip:port", "/addr", v…)  ad-hoc address (subscriber replies, notifications)
     {
+        let subs_cache_for_send = std::sync::Arc::clone(&subs_cache);
         let f = lua.create_function(move |_, args: LuaMultiValue| -> LuaResult<()> {
             let sender = match &osc_sender {
                 Some(s) => s,
@@ -840,15 +842,31 @@ fn run_lua_event_loop(
             }
 
             let (target, address, arg_start) = if first.starts_with('/') {
-                // Address-first: pick the sole named target or error.
-                let t = if sender.targets.len() == 1 {
-                    sender.targets.keys().next().unwrap().clone()
+                // Address-first: pick the sole named target, fan out to subscribers, or error.
+                if sender.targets.len() == 1 {
+                    let t = sender.targets.keys().next().unwrap().clone();
+                    (t, first, 1usize)
+                } else if sender.targets.is_empty() {
+                    // No named target: send to all live subscribers instead.
+                    let subs: Vec<String> = subs_cache_for_send.lock().unwrap().clone();
+                    if !subs.is_empty() {
+                        let osc_args = args.into_iter().skip(1)
+                            .map(|v| lua_val_to_osc_type(&v))
+                            .collect::<LuaResult<Vec<_>>>()?;
+                        for sub_addr in &subs {
+                            if let Ok(dest) = sub_addr.parse::<SocketAddr>() {
+                                if let Err(e) = sender.send_to_addr(dest, first.clone(), osc_args.clone()) {
+                                    warn!("OSC send error: {}", e);
+                                }
+                            }
+                        }
+                    }
+                    return Ok(());
                 } else {
                     return Err(LuaError::RuntimeError(
                         "send_osc: multiple targets configured — specify target name as first argument".into(),
                     ));
-                };
-                (t, first, 1usize)
+                }
             } else {
                 // Named-target form.
                 if !sender.targets.contains_key(&first) {
@@ -961,6 +979,7 @@ fn run_lua_event_loop(
                     if let Err(e) = ps.tick(&lua) {
                         warn!("[{}] osc_params tick error: {}", name, e);
                     }
+                    *subs_cache.lock().unwrap() = ps.subscriber_addrs();
                 }
                 if let Some(ref on_tick) = on_tick_fn {
                     if let Err(e) = on_tick.call::<()>((tick, bpm, ppqn)) {
@@ -976,6 +995,7 @@ fn run_lua_event_loop(
                             if let Err(e) = ps.dispatch(&lua, &msg) {
                                 warn!("[{}] osc_params dispatch error: {}", name, e);
                             }
+                            *subs_cache.lock().unwrap() = ps.subscriber_addrs();
                         }
                         if let Some(ref on_osc) = on_osc_fn {
                             if let Err(e) = on_osc.call::<()>(msg) {
