@@ -121,7 +121,6 @@ fn parse_midi_scale(spec: &LuaTable) -> MidiScale {
     MidiScale::Raw
 }
 
-const HEARTBEAT_INTERVAL: f64 = 5.0;
 const EVICTION_INTERVAL: f64 = 5.0;
 
 struct Param {
@@ -139,6 +138,7 @@ pub struct OscParamSet {
     unsubscribe_addr: String,
     heartbeat_addr: String,
     default_timeout: f64,
+    heartbeat_interval: f64,
     subscribers: HashMap<String, Subscriber>,
     params: HashMap<String, Param>,
     last_eviction: f64,
@@ -173,13 +173,14 @@ fn parse_feedback(from: &str, args: &LuaTable, default_timeout: f64) -> LuaResul
 }
 
 impl OscParamSet {
-    fn new(prefix: &str, default_timeout: f64, now: f64) -> Self {
+    fn new(prefix: &str, default_timeout: f64, heartbeat_interval: f64, now: f64) -> Self {
         OscParamSet {
             slash_prefix: format!("{}/", prefix),
             subscribe_addr: format!("{}/subscribe", prefix),
             unsubscribe_addr: format!("{}/unsubscribe", prefix),
             heartbeat_addr: format!("{}/heartbeat", prefix),
             default_timeout,
+            heartbeat_interval,
             subscribers: HashMap::new(),
             params: HashMap::new(),
             last_eviction: now,
@@ -395,7 +396,7 @@ impl OscParamSet {
             self.last_eviction = now;
             self.subscribers.retain(|_, sub| now < sub.expiry);
         }
-        if now - self.last_heartbeat >= HEARTBEAT_INTERVAL {
+        if now - self.last_heartbeat >= self.heartbeat_interval {
             self.last_heartbeat = now;
             let subs: Vec<String> = self.subscribers.keys().cloned().collect();
             if !subs.is_empty() {
@@ -420,6 +421,7 @@ pub fn from_init_table(
     lua: &Lua,
     prefix: &str,
     init_tbl: &LuaTable,
+    heartbeat_interval: f64,
 ) -> LuaResult<Option<OscParamSet>> {
     let osc_tbl = match init_tbl.get::<LuaValue>("osc")? {
         LuaValue::Table(t) => t,
@@ -435,7 +437,7 @@ pub fn from_init_table(
         _ => 30.0,
     };
     let now = lua_now(lua)?;
-    let mut ps = OscParamSet::new(prefix, default_timeout, now);
+    let mut ps = OscParamSet::new(prefix, default_timeout, heartbeat_interval, now);
     for pair in params_tbl.pairs::<String, LuaTable>() {
         let (name, desc) = pair?;
         let get: Option<LuaFunction> = desc.get("get").ok().flatten();
@@ -487,7 +489,7 @@ mod tests {
     }
 
     fn make_ps(lua: &Lua, prefix: &str) -> OscParamSet {
-        OscParamSet::new(prefix, 30.0, lua_now(lua).unwrap())
+        OscParamSet::new(prefix, 30.0, 5.0, lua_now(lua).unwrap())
     }
 
     fn make_msg(lua: &Lua, addr: &str, from: &str, args_lua: &str) -> LuaTable {

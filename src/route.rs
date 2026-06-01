@@ -292,6 +292,7 @@ impl Route {
         let timer_for_thread = Arc::clone(&timer);
         let name_for_thread = name.clone();
 
+        let osc_heartbeat_interval = config.osc_heartbeat_interval;
         let thread = std::thread::spawn(move || {
             if let Err(e) = run_lua_event_loop(
                 &name_for_thread,
@@ -302,6 +303,7 @@ impl Route {
                 timer_for_thread,
                 route_cfg,
                 osc_sender,
+                osc_heartbeat_interval,
             ) {
                 error!("Route '{}' event loop error: {}", name_for_thread, e);
             }
@@ -645,6 +647,7 @@ fn run_lua_event_loop(
     timer: Arc<Timer>,
     route_cfg: Option<toml::Table>,
     osc_sender: Option<OscSender>,
+    osc_heartbeat_interval: f64,
 ) -> Result<()> {
     let lua = Lua::new();
 
@@ -912,7 +915,7 @@ fn run_lua_event_loop(
             .and_then(|v| if let LuaValue::Table(t) = v { Some(t) } else { None })
             .and_then(|tbl| {
                 let prefix = format!("/{}", name);
-                match crate::osc_params::from_init_table(&lua, &prefix, &tbl) {
+                match crate::osc_params::from_init_table(&lua, &prefix, &tbl, osc_heartbeat_interval) {
                     Ok(ps) => ps,
                     Err(e) => {
                         warn!("[{}] Failed to build OscParamSet from init(): {}", name, e);

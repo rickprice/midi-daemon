@@ -23,6 +23,8 @@ pub struct Config {
     /// Global OSC send destination (`"host:port"`). Used by every route that
     /// does not declare its own `osc.send` target in `init()`.
     pub osc_send_addr: Option<String>,
+    /// How often (in seconds) the daemon sends `/route/heartbeat` to OSC subscribers.
+    pub osc_heartbeat_interval: f64,
 }
 
 /// Internal deserialization target. `routes_dir` is optional so the caller
@@ -38,6 +40,8 @@ struct RawConfig {
     default_connect_output: Option<String>,
     osc_receive_port: Option<u16>,
     osc_send_addr: Option<String>,
+    #[serde(default = "default_osc_heartbeat_interval")]
+    osc_heartbeat_interval: f64,
     #[serde(flatten)]
     route_configs: HashMap<String, toml::Value>,
 }
@@ -54,6 +58,7 @@ impl RawConfig {
             default_connect_output: self.default_connect_output,
             osc_receive_port: self.osc_receive_port,
             osc_send_addr: self.osc_send_addr,
+            osc_heartbeat_interval: self.osc_heartbeat_interval,
         }
     }
 }
@@ -68,6 +73,10 @@ fn default_ppqn() -> u32 {
     24
 }
 
+fn default_osc_heartbeat_interval() -> f64 {
+    5.0
+}
+
 fn default_config(routes_dir: PathBuf) -> Config {
     Config {
         routes_dir,
@@ -79,6 +88,7 @@ fn default_config(routes_dir: PathBuf) -> Config {
         default_connect_output: None,
         osc_receive_port: None,
         osc_send_addr: None,
+        osc_heartbeat_interval: default_osc_heartbeat_interval(),
     }
 }
 

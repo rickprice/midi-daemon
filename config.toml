@@ -33,6 +33,9 @@ default_bpm = 120.0
 # osc_receive_port = 9000
 # osc_send_addr    = "127.0.0.1:9001"
 
+# How often (in seconds) the daemon sends /route/heartbeat to OSC subscribers.
+# osc_heartbeat_interval = 5.0
+
 # Pulses per quarter note — controls tick resolution.
 # 24 = standard MIDI clock, 96 = high resolution.
 # Can be overridden at runtime from Lua with set_ppqn().

@@ -324,7 +324,7 @@ with params for any logic that doesn't map cleanly to a single parameter.
 |---|---|---|
 | `prefix/subscribe` | `[port [timeout_secs]]` | Register (or renew) sender; sends current state of all `get`-able params immediately |
 | `prefix/unsubscribe` | `[port]` | Remove subscriber immediately |
-| `prefix/heartbeat` | — | Sent by the daemon to subscribers every 5 s |
+| `prefix/heartbeat` | — | Sent by the daemon to subscribers at the configured `osc_heartbeat_interval` (default 5 s) |
 
 **OSC dispatch rules for `prefix/<param>`:**
 
@@ -456,6 +456,9 @@ default_ppqn = 24
 # osc.send target in init().
 # osc_receive_port = 9000
 # osc_send_addr    = "127.0.0.1:9001"
+
+# How often (in seconds) the daemon sends /route/heartbeat to OSC subscribers.
+# osc_heartbeat_interval = 5.0
 ```
 
 Changes to `config.toml` are picked up automatically and all routes are
