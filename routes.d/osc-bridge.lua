@@ -1,9 +1,10 @@
 -- OSC bridge example: receive OSC messages and forward to MIDI,
 -- and send OSC when MIDI note events arrive.
 --
--- Run a loopback test with netcat:
+-- All incoming OSC must be addressed under the /osc-bridge/ prefix so the
+-- shared dispatcher routes them here.  Example loopback test:
 --   nc -lu 9001 &
---   oscsend osc.udp://localhost:9000 /hello s "world"
+--   oscsend osc.udp://localhost:9000 /osc-bridge/note/on i 60 i 100
 
 function init()
     return {
@@ -24,15 +25,15 @@ end
 function on_osc(msg)
     log("OSC " .. msg.address .. " (" .. #msg.args .. " args)")
 
-    -- Map /note/on <note> <vel> to a MIDI note_on on channel 1
-    if msg.address == "/note/on" and #msg.args >= 2 then
+    -- Map /osc-bridge/note/on <note> <vel> to a MIDI note_on on channel 1
+    if msg.address == "/osc-bridge/note/on" and #msg.args >= 2 then
         send({
             type     = "note_on",
             channel  = 1,
             note     = msg.args[1],
             velocity = msg.args[2],
         })
-    elseif msg.address == "/note/off" and #msg.args >= 1 then
+    elseif msg.address == "/osc-bridge/note/off" and #msg.args >= 1 then
         send({
             type     = "note_off",
             channel  = 1,

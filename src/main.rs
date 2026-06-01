@@ -9,7 +9,7 @@ mod timer;
 
 use anyhow::Result;
 use notify::{Event, EventKind, RecursiveMode, Watcher};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
@@ -38,13 +38,9 @@ fn unregister_route_osc(dispatch: &OscDispatch, name: &str) {
     dispatch.lock().unwrap().remove(name);
 }
 
-/// Bind the global OSC receive port and dispatch incoming packets to routes by
-/// address prefix: `/route-name/rest` → the route named `route-name`.
-fn start_global_osc_receiver(
-    config: &Config,
-    dispatch: OscDispatch,
-) -> Option<osc::OscReceiver> {
-    let port = config.osc_receive_port?;
+/// Bind a UDP port and dispatch incoming packets to routes by address prefix
+/// (`/route-name/rest` → the route named `route-name`).
+fn start_osc_receiver(port: u16, dispatch: OscDispatch) -> Option<osc::OscReceiver> {
     match osc::OscReceiver::spawn(port, move |from, address, args| {
         let route_name = address
             .strip_prefix('/')
@@ -58,14 +54,49 @@ fn start_global_osc_receiver(
         }
     }) {
         Ok(rx) => {
-            info!("Global OSC receiver on UDP port {}", port);
+            info!("OSC receiver on UDP port {}", port);
             Some(rx)
         }
         Err(e) => {
-            warn!("Failed to start global OSC receiver on port {}: {}", port, e);
+            warn!("Failed to start OSC receiver on port {}: {}", port, e);
             None
         }
     }
+}
+
+/// Collect the set of UDP ports that need a running receiver: the global
+/// config port (if set) plus every per-route declared receive port.
+fn needed_osc_ports(config: &Config, routes: &HashMap<String, Route>) -> HashSet<u16> {
+    let mut ports = HashSet::new();
+    if let Some(p) = config.osc_receive_port {
+        ports.insert(p);
+    }
+    for route in routes.values() {
+        if let Some(p) = route.osc_receive_port {
+            ports.insert(p);
+        }
+    }
+    ports
+}
+
+/// Ensure exactly one receiver is running for each needed port.
+/// Starts receivers for ports not yet covered; drops receivers for ports
+/// no longer needed.
+fn sync_osc_receivers(
+    config: &Config,
+    routes: &Arc<Mutex<HashMap<String, Route>>>,
+    receivers: &mut HashMap<u16, osc::OscReceiver>,
+    dispatch: &OscDispatch,
+) {
+    let needed = needed_osc_ports(config, &routes.lock().unwrap());
+    for &port in &needed {
+        if !receivers.contains_key(&port) {
+            if let Some(rx) = start_osc_receiver(port, Arc::clone(dispatch)) {
+                receivers.insert(port, rx);
+            }
+        }
+    }
+    receivers.retain(|p, _| needed.contains(p));
 }
 
 #[tokio::main]
@@ -103,8 +134,10 @@ async fn main() -> Result<()> {
         Arc::clone(&osc_dispatch),
     ).await?;
 
-    // Global OSC receiver (dispatches /route-name/... to the matching route).
-    let mut global_osc_rx = start_global_osc_receiver(&config, Arc::clone(&osc_dispatch));
+    // One shared OSC receiver per unique declared port.
+    // Dispatches /route-name/... to the matching route.
+    let mut osc_receivers: HashMap<u16, osc::OscReceiver> = HashMap::new();
+    sync_osc_receivers(&config, &routes, &mut osc_receivers, &osc_dispatch);
 
     // inotify watcher for hot-reload
     enum WatchEvent {
@@ -169,6 +202,7 @@ async fn main() -> Result<()> {
                             // Replacing the old entry drops it, which stops its timer and
                             // detaches its event-loop thread (which will drain and exit).
                             routes.lock().unwrap().insert(name.clone(), route);
+                            sync_osc_receivers(&config, &routes, &mut osc_receivers, &osc_dispatch);
                             info!("Reloaded route: {}", name);
                         }
                         Err(e) => error!("Failed to reload route {}: {}", name, e),
@@ -177,6 +211,7 @@ async fn main() -> Result<()> {
                     routes.lock().unwrap().remove(&name);
                     conn_mgr.unregister_route(&name);
                     unregister_route_osc(&osc_dispatch, &name);
+                    sync_osc_receivers(&config, &routes, &mut osc_receivers, &osc_dispatch);
                     info!("Removed route: {}", name);
                 }
             }
@@ -189,12 +224,7 @@ async fn main() -> Result<()> {
                                 "routes_dir changed in config.toml — restart the daemon for this to take effect"
                             );
                         }
-                        let old_osc_port = config.osc_receive_port;
                         config = Arc::new(new_cfg);
-                        // Restart global OSC receiver if the port changed.
-                        if config.osc_receive_port != old_osc_port {
-                            global_osc_rx = start_global_osc_receiver(&config, Arc::clone(&osc_dispatch));
-                        }
                         reload_all_routes(
                             &routes_dir,
                             Arc::clone(&config),
@@ -202,6 +232,7 @@ async fn main() -> Result<()> {
                             Arc::clone(&conn_mgr),
                             Arc::clone(&osc_dispatch),
                         );
+                        sync_osc_receivers(&config, &routes, &mut osc_receivers, &osc_dispatch);
                         info!("Config reloaded");
                     }
                     Err(e) => error!("Failed to reload config.toml: {}", e),

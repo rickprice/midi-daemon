@@ -21,7 +21,7 @@ use crate::lua_api::{
     lua_to_midi_bytes, lua_val_to_osc_type, midi_bytes_to_lua, osc_message_to_lua,
     toml_table_to_lua,
 };
-use crate::osc::{OscDecl, OscReceiver, OscSender};
+use crate::osc::{OscDecl, OscSender};
 use crate::timer::{Timer, TimerEvent};
 
 enum RouteEvent {
@@ -155,10 +155,12 @@ pub struct Route {
     ports: Arc<RoutePorts>,
     _timer: Arc<Timer>,
     _thread: std::thread::JoinHandle<()>,
-    _osc_receiver: Option<OscReceiver>,
     /// Sender into the route's event channel, used by the global OSC dispatcher.
     osc_tx: mpsc::Sender<RouteEvent>,
     pub connect_decl: ConnectDecl,
+    /// OSC receive port declared by this route's init(). The daemon starts exactly
+    /// one shared receiver per unique port and dispatches by /route-name/ prefix.
+    pub osc_receive_port: Option<u16>,
 }
 
 impl Route {
@@ -273,29 +275,8 @@ impl Route {
             None
         };
 
-        // Start OSC receiver thread (if a receive port was declared in init()).
-        let osc_receiver = if let Some(port) = osc_receive_port {
-            let tx_clone = tx.clone();
-            match OscReceiver::spawn(port, move |from, address, args| {
-                let _ = tx_clone.blocking_send(RouteEvent::Osc { from, address, args });
-            }) {
-                Ok(r) => {
-                    info!("Route '{}': OSC receiver on UDP port {}", name, port);
-                    Some(r)
-                }
-                Err(e) => {
-                    warn!(
-                        "Route '{}': failed to start OSC receiver on port {}: {}",
-                        name, port, e
-                    );
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
         // Keep a sender for the global OSC dispatcher to inject events.
+        // OSC receivers are managed centrally by main.rs — routes never bind their own sockets.
         let osc_tx = tx.clone();
 
         let timer = Arc::new(Timer::new(config.default_bpm, config.default_ppqn));
@@ -337,9 +318,9 @@ impl Route {
             ports,
             _timer: timer,
             _thread: thread,
-            _osc_receiver: osc_receiver,
             osc_tx,
             connect_decl,
+            osc_receive_port,
         })
     }
 }
