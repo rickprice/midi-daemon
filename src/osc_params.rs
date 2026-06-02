@@ -317,6 +317,10 @@ impl OscParamSet {
             return Ok(());
         }
         let param_name = addr[self.slash_prefix.len()..].to_string();
+        if !self.params.contains_key(&param_name) {
+            warn!("OSC: unrecognized param '{}' (address '{}')", param_name, addr);
+            return Ok(());
+        }
         let n_args = args.len()?;
 
         if n_args == 0 {
@@ -560,7 +564,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_param_is_silently_ignored() {
+    fn unknown_param_logs_warning_and_sends_nothing() {
         let lua = make_lua();
         let mut ps = make_ps(&lua, "/p");
         let set_fn: LuaFunction = lua.load("function(v) end").eval().unwrap();
