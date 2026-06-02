@@ -312,6 +312,16 @@ impl OscParamSet {
             return Ok(());
         }
 
+        // /prefix/heartbeat [port [timeout]] — renews the subscriber's expiry
+        if addr == self.heartbeat_addr {
+            let (fb, timeout) = parse_feedback(&from, &args, self.default_timeout)?;
+            let now = lua_now(lua)?;
+            if let Some(sub) = self.subscribers.get_mut(&fb) {
+                sub.expiry = now + timeout;
+            }
+            return Ok(());
+        }
+
         // Normal param: /prefix/<param>
         if !addr.starts_with(&self.slash_prefix) {
             return Ok(());
@@ -929,6 +939,46 @@ mod tests {
             "#,
         );
     }
+
+    #[test]
+    fn heartbeat_from_client_renews_expiry() {
+        let lua = make_lua();
+        lua.globals().set("v", 0i64).unwrap();
+        let mut ps = make_ps(&lua, "/p");
+        let set_fn: LuaFunction = lua.load("function(a) v = a end").eval().unwrap();
+        let get_fn: LuaFunction = lua.load("function() return v end").eval().unwrap();
+        ps.add_param(&lua, "x".to_string(), Some(get_fn), Some(set_fn)).unwrap();
+
+        let sub = make_msg(&lua, "/p/subscribe", "1.2.3.4:9001", "");
+        ps.dispatch(&lua, &sub).unwrap();
+
+        // Advance 25 s; send heartbeat → expiry resets to 1025+30=1055
+        assert_lua(&lua, "_time = 1025");
+        let hb = make_msg(&lua, "/p/heartbeat", "1.2.3.4:9001", "");
+        ps.dispatch(&lua, &hb).unwrap();
+        assert_lua(&lua, "clear()");
+
+        // 1040 would have expired (1030) without the heartbeat
+        assert_lua(&lua, "_time = 1040");
+        ps.tick(&lua).unwrap();
+        assert_lua(&lua, "_time = 1045");
+        ps.tick(&lua).unwrap();
+
+        let msg = make_msg(&lua, "/p/x", "1.2.3.4:9000", "9");
+        ps.dispatch(&lua, &msg).unwrap();
+
+        assert_lua(
+            &lua,
+            r#"
+            local notified = false
+            for _, s in ipairs(_sent) do
+                if s[1] == "1.2.3.4:9001" and s[2] == "/p/x" then notified = true end
+            end
+            assert(notified, "subscriber kept alive by heartbeat should still receive notifications")
+            "#,
+        );
+    }
+
 
     #[test]
     fn heartbeat_sent_after_interval() {
