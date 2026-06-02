@@ -104,11 +104,19 @@ fn sync_osc_receivers(
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    let cli_level = args.windows(2)
+        .find(|w| w[0] == "--log-level")
+        .map(|w| w[1].clone());
+
+    let log_filter = if let Some(level) = cli_level {
+        format!("midi_daemon={}", level)
+    } else {
+        std::env::var("RUST_LOG").unwrap_or_else(|_| "midi_daemon=info".to_string())
+    };
+
     tracing_subscriber::fmt()
-        .with_env_filter(
-            std::env::var("RUST_LOG")
-                .unwrap_or_else(|_| "midi_daemon=info".to_string()),
-        )
+        .with_env_filter(log_filter)
         .init();
 
     let config = Config::find_and_load()?;
