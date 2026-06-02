@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use alsa_connect::ConnectionManager;
 use config::Config;
@@ -42,11 +42,13 @@ fn unregister_route_osc(dispatch: &OscDispatch, name: &str) {
 /// (`/route-name/rest` → the route named `route-name`).
 fn start_osc_receiver(port: u16, dispatch: OscDispatch) -> Option<osc::OscReceiver> {
     match osc::OscReceiver::spawn(port, move |from, address, args| {
+        debug!("OSC received: address='{}' from={}", address, from);
         let route_name = address
             .strip_prefix('/')
             .and_then(|s| s.split('/').next())
             .unwrap_or("");
         if route_name.is_empty() {
+            warn!("OSC: ignoring message with empty route prefix: '{}'", address);
             return;
         }
         let guard = dispatch.lock().unwrap();
