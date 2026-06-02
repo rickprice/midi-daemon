@@ -985,6 +985,8 @@ fn run_lua_event_loop(
                             if let Err(e) = on_osc.call::<()>(msg) {
                                 warn!("[{}] on_osc error: {}", name, e);
                             }
+                        } else if osc_param_set.is_none() {
+                            warn!("[{}] OSC message '{}' received but no on_osc handler defined", name, address);
                         }
                     }
                     Err(e) => warn!("[{}] OSC message parse error: {}", name, e),

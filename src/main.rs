@@ -49,8 +49,11 @@ fn start_osc_receiver(port: u16, dispatch: OscDispatch) -> Option<osc::OscReceiv
         if route_name.is_empty() {
             return;
         }
-        if let Some(inject) = dispatch.lock().unwrap().get(route_name) {
+        let guard = dispatch.lock().unwrap();
+        if let Some(inject) = guard.get(route_name) {
             inject(from, address, args);
+        } else {
+            warn!("OSC: no route for address '{}' (prefix '{}')", address, route_name);
         }
     }) {
         Ok(rx) => {
