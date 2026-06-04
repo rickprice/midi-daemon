@@ -2,6 +2,7 @@ use anyhow::Result;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use libc;
 
 /// Public config — fully resolved (no Option fields).
 #[derive(Debug, Clone)]
@@ -119,13 +120,10 @@ pub fn default_config_path() -> PathBuf {
 // ── Config impl ───────────────────────────────────────────────────────────────
 
 impl Config {
-    /// Returns the cache directory appropriate for this configuration:
-    /// system cache if loaded from `/etc/midi-daemon/`, user cache otherwise.
+    /// Returns the cache directory appropriate for this process:
+    /// `/var/cache/midi-daemon` when running as root, user cache otherwise.
     pub fn cache_dir(&self) -> PathBuf {
-        let from_system_config = self.config_path.as_deref()
-            .map(|p| p.starts_with(system_config_dir()))
-            .unwrap_or(false);
-        if from_system_config || user_config_dir().is_none() {
+        if unsafe { libc::getuid() } == 0 {
             return system_cache_dir();
         }
         dirs::cache_dir()

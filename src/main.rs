@@ -133,17 +133,25 @@ fn pid_file_path(config: &Config) -> PathBuf {
     config.cache_dir().join("midi-daemon.pid")
 }
 
-/// Try to locate the PID file of a running daemon (user cache first, then system).
+/// Locate the PID file for the running daemon.  Searches own cache first
+/// (user cache for non-root, system cache for root), then falls back to the
+/// other location so a non-root caller can still find and signal a root daemon
+/// (or vice versa), getting a clean EPERM rather than "not found".
 fn find_pid_file() -> Option<PathBuf> {
-    // User cache (most common)
-    if let Some(d) = dirs::cache_dir() {
-        let p = d.join("midi-daemon/midi-daemon.pid");
-        if p.exists() { return Some(p); }
-    }
-    // System cache
-    let p = PathBuf::from("/var/cache/midi-daemon/midi-daemon.pid");
-    if p.exists() { return Some(p); }
-    None
+    let system = PathBuf::from("/var/cache/midi-daemon/midi-daemon.pid");
+    let user   = dirs::cache_dir().map(|d| d.join("midi-daemon/midi-daemon.pid"));
+
+    let (first, second): (PathBuf, Option<PathBuf>) = if unsafe { libc::getuid() } == 0 {
+        (system, user)
+    } else {
+        match user {
+            Some(u) => (u, Some(system)),
+            None    => (system, None),
+        }
+    };
+
+    if first.exists() { return Some(first); }
+    second.filter(|p| p.exists())
 }
 
 // ── Graceful shutdown ─────────────────────────────────────────────────────────
