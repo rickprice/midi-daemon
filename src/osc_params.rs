@@ -1,6 +1,8 @@
+use anyhow::Context as _;
 use mlua::prelude::*;
 use std::collections::HashMap;
-use tracing::warn;
+use std::path::Path;
+use tracing::{info, warn};
 
 // ── MIDI binding types ────────────────────────────────────────────────────────
 
@@ -425,6 +427,99 @@ impl OscParamSet {
             }
         }
         Ok(())
+    }
+}
+
+// ── State persistence helpers ─────────────────────────────────────────────────
+
+fn lua_val_to_toml(val: LuaValue) -> Option<toml::Value> {
+    match val {
+        LuaValue::Integer(n) => Some(toml::Value::Integer(n)),
+        LuaValue::Number(f)  => Some(toml::Value::Float(f)),
+        LuaValue::Boolean(b) => Some(toml::Value::Boolean(b)),
+        LuaValue::String(s)  => s.to_str().ok().map(|s| toml::Value::String(s.to_string())),
+        _ => None,
+    }
+}
+
+fn toml_to_lua_val(lua: &Lua, val: &toml::Value) -> Option<LuaValue> {
+    match val {
+        toml::Value::Integer(n) => Some(LuaValue::Integer(*n)),
+        toml::Value::Float(f)   => Some(LuaValue::Number(*f)),
+        toml::Value::Boolean(b) => Some(LuaValue::Boolean(*b)),
+        toml::Value::String(s)  => lua.create_string(s.as_str()).ok().map(LuaValue::String),
+        _ => None,
+    }
+}
+
+impl OscParamSet {
+    /// Snapshot current param values (via `get()`) and write them to `path` as TOML.
+    pub fn save_state(&self, lua: &Lua, path: &Path) -> anyhow::Result<()> {
+        let mut map = toml::map::Map::new();
+        for (name, param) in &self.params {
+            if let Some(get_key) = &param.get {
+                match lua.registry_value::<LuaFunction>(get_key) {
+                    Ok(get_fn) => match get_fn.call::<LuaValue>(()) {
+                        Ok(val) => {
+                            if let Some(tv) = lua_val_to_toml(val) {
+                                map.insert(name.clone(), tv);
+                            }
+                        }
+                        Err(e) => warn!("save_state get '{}': {}", name, e),
+                    },
+                    Err(e) => warn!("save_state registry '{}': {}", name, e),
+                }
+            }
+        }
+        if map.is_empty() {
+            return Ok(());
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create cache dir {}", parent.display()))?;
+        }
+        let text = toml::to_string(&toml::Value::Table(map)).context("serialize route state")?;
+        std::fs::write(path, text)
+            .with_context(|| format!("write route state {}", path.display()))?;
+        info!("Saved route state to {}", path.display());
+        Ok(())
+    }
+
+    /// Restore param values from `path` by calling each param's `set()`.
+    /// Warns about unrecognized param names but skips them gracefully.
+    /// Does nothing if the file does not exist yet.
+    pub fn load_state(&self, lua: &Lua, path: &Path) {
+        if !path.exists() {
+            return;
+        }
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) => { warn!("load_state: read {}: {}", path.display(), e); return; }
+        };
+        let table: toml::Table = match toml::from_str(&text) {
+            Ok(t) => t,
+            Err(e) => { warn!("load_state: parse {}: {}", path.display(), e); return; }
+        };
+        for (name, value) in &table {
+            match self.params.get(name) {
+                Some(param) => {
+                    if let Some(set_key) = &param.set {
+                        match lua.registry_value::<LuaFunction>(set_key) {
+                            Ok(set_fn) => {
+                                if let Some(lua_val) = toml_to_lua_val(lua, value) {
+                                    if let Err(e) = set_fn.call::<()>(lua_val) {
+                                        warn!("load_state set '{}': {}", name, e);
+                                    }
+                                }
+                            }
+                            Err(e) => warn!("load_state registry '{}': {}", name, e),
+                        }
+                    }
+                }
+                None => warn!("load_state: unrecognized param '{}', skipping", name),
+            }
+        }
+        info!("Loaded route state from {}", path.display());
     }
 }
 

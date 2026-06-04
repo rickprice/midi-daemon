@@ -100,6 +100,10 @@ fn system_config_dir() -> PathBuf {
     PathBuf::from("/etc/midi-daemon")
 }
 
+fn system_cache_dir() -> PathBuf {
+    PathBuf::from("/var/cache/midi-daemon")
+}
+
 #[allow(dead_code)]
 pub fn default_config_path() -> PathBuf {
     user_config_dir()
@@ -110,6 +114,25 @@ pub fn default_config_path() -> PathBuf {
 // ── Config impl ───────────────────────────────────────────────────────────────
 
 impl Config {
+    /// Returns the cache directory appropriate for this configuration:
+    /// system cache if loaded from `/etc/midi-daemon/`, user cache otherwise.
+    pub fn cache_dir(&self) -> PathBuf {
+        if self.config_path.as_deref()
+            .map(|p| p.starts_with(system_config_dir()))
+            .unwrap_or(false)
+        {
+            system_cache_dir()
+        } else {
+            dirs::cache_dir()
+                .map(|d| d.join("midi-daemon"))
+                .unwrap_or_else(|| {
+                    dirs::home_dir()
+                        .map(|h| h.join(".cache/midi-daemon"))
+                        .unwrap_or_else(system_cache_dir)
+                })
+        }
+    }
+
     /// Returns the `[route_name]` section from config.toml, if present.
     pub fn route_config(&self, name: &str) -> Option<&toml::Table> {
         self.route_configs.get(name)?.as_table()

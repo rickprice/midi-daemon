@@ -76,6 +76,21 @@ default_ppqn = 24
 # [osc-bridge]
 # osc_port = 9000
 
+# ── Per-route state persistence ───────────────────────────────────────────────
+# Each route that declares osc.params in init() can optionally save its param
+# values on shutdown and restore them on the next startup.
+#
+# Add to any [route-name] section to enable:
+#   persist_state = true
+#
+# Saved to:
+#   User config  → ~/.cache/midi-daemon/route-state/<name>.toml
+#   System config → /var/cache/midi-daemon/route-state/<name>.toml
+#
+# On load, each saved param is restored via its set() function.
+# Unknown param names in the file are logged and skipped.
+# Default: false (disabled).
+
 # ── Per-route sections ────────────────────────────────────────────────────────
 # Each [section-name] below corresponds to routes.d/<section-name>.lua.
 # Keys become the `config` Lua global in that route.

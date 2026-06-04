@@ -486,6 +486,29 @@ local num   = config.some_number or 0
 Any TOML type is supported: strings, integers, floats, booleans, arrays, and
 nested tables.
 
+### Route state persistence
+
+Routes that expose `osc.params` in `init()` can save their param values on
+shutdown and restore them on the next startup. Enable per-route:
+
+```toml
+[my-route]
+persist_state = true   # default: false
+```
+
+On shutdown the daemon calls each param's `get()` function and writes the
+values to a TOML file:
+
+| Config origin | State file location |
+|---|---|
+| User (`~/.config/midi-daemon/`) | `~/.cache/midi-daemon/route-state/<name>.toml` |
+| System (`/etc/midi-daemon/`) | `/var/cache/midi-daemon/route-state/<name>.toml` |
+
+On startup, each saved value is restored by calling the param's `set()`
+function, exactly as if an OSC message had arrived. Param names that exist in
+the file but are no longer declared by the route are logged as warnings and
+skipped. Params with no saved value start at their Lua-script default.
+
 ## Auto-connect
 
 The daemon can automatically wire its virtual ALSA ports to physical or

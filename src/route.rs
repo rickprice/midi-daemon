@@ -204,6 +204,17 @@ impl Route {
 
         let route_cfg = config.route_config(&name).cloned();
 
+        let persist_state = route_cfg.as_ref()
+            .and_then(|c| c.get("persist_state"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let state_file: Option<std::path::PathBuf> = if persist_state {
+            Some(config.cache_dir().join("route-state").join(format!("{}.toml", name)))
+        } else {
+            None
+        };
+
         // Run the script once to extract port layout, connect patterns, and OSC declarations.
         let (decl, raw_connect, osc_decl) =
             extract_all_decls(&script, &name, route_cfg.as_ref())?;
@@ -304,6 +315,7 @@ impl Route {
                 route_cfg,
                 osc_sender,
                 osc_heartbeat_interval,
+                state_file,
             ) {
                 error!("Route '{}' event loop error: {}", name_for_thread, e);
             }
@@ -648,6 +660,7 @@ fn run_lua_event_loop(
     route_cfg: Option<toml::Table>,
     osc_sender: Option<OscSender>,
     osc_heartbeat_interval: f64,
+    state_file: Option<std::path::PathBuf>,
 ) -> Result<()> {
     let lua = Lua::new();
 
@@ -924,6 +937,11 @@ fn run_lua_event_loop(
                 }
             });
 
+    // --- Restore persisted state ---
+    if let (Some(ref ps), Some(ref path)) = (&osc_param_set, &state_file) {
+        ps.load_state(&lua, path);
+    }
+
     // Cache callbacks once — avoids a global-table lookup on every event.
     let on_midi_fn: Option<LuaFunction> = lua.globals().get("on_midi").ok();
     let on_tick_fn: Option<LuaFunction> = lua.globals().get("on_tick").ok();
@@ -992,6 +1010,13 @@ fn run_lua_event_loop(
                     Err(e) => warn!("[{}] OSC message parse error: {}", name, e),
                 }
             }
+        }
+    }
+
+    // --- Persist state on shutdown ---
+    if let (Some(ref ps), Some(ref path)) = (&osc_param_set, &state_file) {
+        if let Err(e) = ps.save_state(&lua, path) {
+            warn!("[{}] Failed to save route state: {}", name, e);
         }
     }
 
