@@ -88,6 +88,21 @@ rm ~/.config/midi-daemon/routes.d/my-route.lua
 Edit `config.toml` — the daemon detects the change and reloads all routes
 with the updated configuration automatically (no restart needed).
 
+Stop and start the daemon:
+```bash
+systemctl --user stop    midi-daemon   # graceful stop (saves persisted state)
+systemctl --user start   midi-daemon
+systemctl --user restart midi-daemon
+```
+
+Re-apply all current route param values (useful after connecting a new device
+or recovering from a UI desync):
+```bash
+systemctl --user reload midi-daemon
+# or equivalently, from anywhere:
+midi-daemon --resync
+```
+
 ### System-wide
 
 ```bash
@@ -102,6 +117,59 @@ sudo rm /etc/midi-daemon/routes.d/my-route.lua
 
 Edit `config.toml` — the daemon detects the change and reloads all routes
 with the updated configuration automatically (no restart needed).
+
+```bash
+systemctl stop    midi-daemon   # graceful stop (saves persisted state)
+systemctl restart midi-daemon
+systemctl reload  midi-daemon   # resync all route params
+# or:
+midi-daemon --resync
+```
+
+## Daemon control
+
+| Action | systemd (user) | systemd (system) | Signal |
+|--------|---------------|-----------------|--------|
+| Graceful stop | `systemctl --user stop midi-daemon` | `systemctl stop midi-daemon` | `SIGTERM` |
+| Resync params | `systemctl --user reload midi-daemon` | `systemctl reload midi-daemon` | `SIGUSR1` |
+
+### Graceful shutdown (SIGTERM)
+
+When the daemon receives SIGTERM — whether from `systemctl stop`, `kill`, or
+the system shutting down — it:
+
+1. Sends a shutdown command to every running route's event loop.
+2. Waits for each event loop thread to finish (which includes saving any
+   persisted param state for routes with `persist_state = true`).
+3. Exits cleanly.
+
+`systemctl stop` will wait up to 30 seconds for this to complete before
+sending SIGKILL.
+
+### Param resync (SIGUSR1 / `--resync`)
+
+Sending SIGUSR1 to the daemon, or running `midi-daemon --resync`, causes
+every route to re-apply its current OSC param values:
+
+1. For each param, call `get()` to read the current value.
+2. Call `set(value)` to push it through the set function again (re-runs any
+   clamping, MIDI output, or side-effects).
+3. Notify all current OSC subscribers with the post-set value from `get()`.
+
+This is useful when a device reconnects and needs to be told the current
+state, or when the UI has gotten out of sync with the daemon's internal state.
+
+```bash
+# All equivalent:
+systemctl --user reload midi-daemon
+midi-daemon --resync
+kill -USR1 $(pidof midi-daemon)
+```
+
+`midi-daemon --resync` locates the running daemon via its PID file
+(`~/.cache/midi-daemon/midi-daemon.pid` for user installs,
+`/var/cache/midi-daemon/midi-daemon.pid` for system installs) and sends
+SIGUSR1 to it.
 
 ## Lua API
 
@@ -496,8 +564,8 @@ shutdown and restore them on the next startup. Enable per-route:
 persist_state = true   # default: false
 ```
 
-On shutdown the daemon calls each param's `get()` function and writes the
-values to a TOML file:
+On **graceful shutdown** (SIGTERM / `systemctl stop`) the daemon calls each
+param's `get()` function and writes the values to a TOML file:
 
 | Config origin | State file location |
 |---|---|
@@ -508,6 +576,9 @@ On startup, each saved value is restored by calling the param's `set()`
 function, exactly as if an OSC message had arrived. Param names that exist in
 the file but are no longer declared by the route are logged as warnings and
 skipped. Params with no saved value start at their Lua-script default.
+
+State is **not** saved on SIGKILL or a crash — always use `systemctl stop`
+(or `kill -TERM`) to preserve state.
 
 ## Auto-connect
 
