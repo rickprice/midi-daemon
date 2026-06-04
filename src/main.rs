@@ -10,9 +10,11 @@ mod timer;
 use anyhow::{Context as _, Result};
 use notify::{Event, EventKind, RecursiveMode, Watcher};
 use std::collections::{HashMap, HashSet};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use tokio::sync::mpsc;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 
 use alsa_connect::ConnectionManager;
@@ -133,25 +135,89 @@ fn pid_file_path(config: &Config) -> PathBuf {
     config.cache_dir().join("midi-daemon.pid")
 }
 
-/// Locate the PID file for the running daemon.  Searches own cache first
-/// (user cache for non-root, system cache for root), then falls back to the
-/// other location so a non-root caller can still find and signal a root daemon
-/// (or vice versa), getting a clean EPERM rather than "not found".
-fn find_pid_file() -> Option<PathBuf> {
-    let system = PathBuf::from("/var/cache/midi-daemon/midi-daemon.pid");
-    let user   = dirs::cache_dir().map(|d| d.join("midi-daemon/midi-daemon.pid"));
+// ── Control socket ────────────────────────────────────────────────────────────
 
-    let (first, second): (PathBuf, Option<PathBuf>) = if unsafe { libc::getuid() } == 0 {
-        (system, user)
-    } else {
-        match user {
-            Some(u) => (u, Some(system)),
-            None    => (system, None),
+enum ControlCmd {
+    Resync { reply: oneshot::Sender<String> },
+    Reload { reply: oneshot::Sender<String> },
+    Status { reply: oneshot::Sender<String> },
+}
+
+/// RAII guard: removes the socket file on drop.
+struct ControlSocketFile(PathBuf);
+
+impl Drop for ControlSocketFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Bind the control socket, set permissions (0o660), and spawn the accept loop.
+fn start_control_socket(
+    path: &Path,
+    tx: mpsc::Sender<ControlCmd>,
+) -> Result<ControlSocketFile> {
+    let _ = std::fs::remove_file(path);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create socket dir {}", parent.display()))?;
+    }
+    let listener = tokio::net::UnixListener::bind(path)
+        .with_context(|| format!("bind control socket {}", path.display()))?;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660));
+    info!("Control socket: {}", path.display());
+
+    tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((stream, _)) => {
+                    let tx = tx.clone();
+                    tokio::spawn(async move { handle_control_conn(stream, tx).await });
+                }
+                Err(e) => { error!("Control socket accept: {}", e); break; }
+            }
+        }
+    });
+
+    Ok(ControlSocketFile(path.to_path_buf()))
+}
+
+/// Handle one control connection: read a command, send to the main loop, write the reply.
+async fn handle_control_conn(stream: tokio::net::UnixStream, tx: mpsc::Sender<ControlCmd>) {
+    let (read_half, mut write_half) = stream.into_split();
+    let line = match tokio::io::BufReader::new(read_half).lines().next_line().await {
+        Ok(Some(l)) => l,
+        _ => return,
+    };
+    let (reply_tx, reply_rx) = oneshot::channel();
+    let cmd = match line.trim() {
+        "resync" => ControlCmd::Resync { reply: reply_tx },
+        "reload" => ControlCmd::Reload { reply: reply_tx },
+        "status" => ControlCmd::Status { reply: reply_tx },
+        other => {
+            let _ = write_half.write_all(format!("error: unknown command '{}'\n", other).as_bytes()).await;
+            return;
         }
     };
+    if tx.send(cmd).await.is_ok() {
+        if let Ok(response) = reply_rx.await {
+            let _ = write_half.write_all(response.as_bytes()).await;
+        }
+    }
+}
 
-    if first.exists() { return Some(first); }
-    second.filter(|p| p.exists())
+/// Client-side: connect to the control socket, send a command, print the reply.
+async fn do_control_cmd(cmd: &str) -> Result<()> {
+    let path = config::control_socket_path();
+    let stream = tokio::net::UnixStream::connect(&path).await
+        .with_context(|| format!("connect to {}: is midi-daemon running?", path.display()))?;
+    let (read_half, mut write_half) = stream.into_split();
+    write_half.write_all(format!("{}\n", cmd).as_bytes()).await?;
+    let mut lines = tokio::io::BufReader::new(read_half).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        println!("{}", line);
+    }
+    Ok(())
 }
 
 // ── Graceful shutdown ─────────────────────────────────────────────────────────
@@ -179,10 +245,9 @@ fn graceful_shutdown(routes: &Arc<Mutex<HashMap<String, Route>>>) {
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
-    // --resync: send SIGUSR1 to the running daemon then exit.
-    if args.iter().any(|a| a == "--resync") {
-        return do_resync();
-    }
+    if args.iter().any(|a| a == "--resync")  { return do_control_cmd("resync").await; }
+    if args.iter().any(|a| a == "--reload")  { return do_control_cmd("reload").await; }
+    if args.iter().any(|a| a == "--status")  { return do_control_cmd("status").await; }
 
     let cli_level = args.windows(2)
         .find(|w| w[0] == "--log-level")
@@ -208,6 +273,10 @@ async fn main() -> Result<()> {
 
     // Write PID file (removed automatically on drop).
     let _pid_file = PidFile::write(&config)?;
+
+    // Bind control socket (removed automatically on drop).
+    let (ctrl_tx, mut ctrl_rx) = mpsc::channel::<ControlCmd>(8);
+    let _ctrl_socket = start_control_socket(&config::control_socket_path(), ctrl_tx)?;
 
     // Map of route name -> Route handle.
     let routes: Arc<Mutex<HashMap<String, Route>>> =
@@ -287,6 +356,46 @@ async fn main() -> Result<()> {
                     debug!("Queued resync for route '{}'", name);
                 }
             }
+            Some(cmd) = ctrl_rx.recv() => {
+                match cmd {
+                    ControlCmd::Resync { reply } => {
+                        info!("Control: resync");
+                        let guard = routes.lock().unwrap();
+                        for (name, route) in guard.iter() {
+                            route.send_resync();
+                            debug!("Queued resync for route '{}'", name);
+                        }
+                        let _ = reply.send("ok\n".to_string());
+                    }
+                    ControlCmd::Reload { reply } => {
+                        info!("Control: reload");
+                        handle_config_changed(
+                            &routes_dir, &mut config, &routes, &conn_mgr,
+                            &osc_dispatch, &mut osc_receivers,
+                        );
+                        let _ = reply.send("ok\n".to_string());
+                    }
+                    ControlCmd::Status { reply } => {
+                        let mut route_names: Vec<String> =
+                            routes.lock().unwrap().keys().cloned().collect();
+                        route_names.sort();
+                        let mut ports: Vec<u16> = osc_receivers.keys().copied().collect();
+                        ports.sort_unstable();
+                        let text = format!(
+                            "pid: {}\nroutes: {}\nosc_recv: {}\nconfig: {}\ncache: {}\nsocket: {}\n",
+                            std::process::id(),
+                            if route_names.is_empty() { "(none)".into() } else { route_names.join(", ") },
+                            if ports.is_empty() { "(none)".into() } else { ports.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ") },
+                            config.config_path.as_deref()
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_else(|| "(defaults)".into()),
+                            config.cache_dir().display(),
+                            config::control_socket_path().display(),
+                        );
+                        let _ = reply.send(text);
+                    }
+                }
+            }
             event = rx.recv() => {
                 match event {
                     Some(WatchEvent::RouteChanged(path)) => {
@@ -310,27 +419,6 @@ async fn main() -> Result<()> {
     }
 
     graceful_shutdown(&routes);
-    Ok(())
-}
-
-// ── --resync subcommand ───────────────────────────────────────────────────────
-
-fn do_resync() -> Result<()> {
-    let pid_path = find_pid_file()
-        .context("No midi-daemon PID file found. Is the daemon running?")?;
-
-    let pid_str = std::fs::read_to_string(&pid_path)
-        .with_context(|| format!("read PID file {}", pid_path.display()))?;
-    let pid: libc::pid_t = pid_str.trim().parse()
-        .context("PID file contains invalid PID")?;
-
-    let rc = unsafe { libc::kill(pid, libc::SIGUSR1) };
-    if rc != 0 {
-        let errno = std::io::Error::last_os_error();
-        anyhow::bail!("Failed to send SIGUSR1 to PID {}: {}", pid, errno);
-    }
-
-    println!("Sent resync signal to midi-daemon (PID {})", pid);
     Ok(())
 }
 

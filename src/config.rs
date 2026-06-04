@@ -117,6 +117,22 @@ pub fn default_config_path() -> PathBuf {
         .join("config.toml")
 }
 
+/// Path to the Unix control socket.
+/// Root uses `/run/midi-daemon/control.sock`; non-root uses `$XDG_RUNTIME_DIR`.
+pub fn control_socket_path() -> PathBuf {
+    if unsafe { libc::getuid() } == 0 {
+        PathBuf::from("/run/midi-daemon/control.sock")
+    } else {
+        std::env::var("XDG_RUNTIME_DIR")
+            .map(|d| PathBuf::from(d).join("midi-daemon/control.sock"))
+            .unwrap_or_else(|_| {
+                dirs::cache_dir()
+                    .map(|d| d.join("midi-daemon/control.sock"))
+                    .unwrap_or_else(|| PathBuf::from("/tmp/midi-daemon.sock"))
+            })
+    }
+}
+
 // ── Config impl ───────────────────────────────────────────────────────────────
 
 impl Config {
