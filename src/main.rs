@@ -106,35 +106,6 @@ fn sync_osc_receivers(
     receivers.retain(|p, _| needed.contains(p));
 }
 
-// ── PID file ──────────────────────────────────────────────────────────────────
-
-/// RAII PID file: written on creation, removed on drop.
-struct PidFile(PathBuf);
-
-impl PidFile {
-    fn write(config: &Config) -> Result<Self> {
-        let path = pid_file_path(config);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("create PID dir {}", parent.display()))?;
-        }
-        std::fs::write(&path, format!("{}\n", std::process::id()))
-            .with_context(|| format!("write PID file {}", path.display()))?;
-        info!("PID file: {}", path.display());
-        Ok(PidFile(path))
-    }
-}
-
-impl Drop for PidFile {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
-
-fn pid_file_path(config: &Config) -> PathBuf {
-    config.cache_dir().join("midi-daemon.pid")
-}
-
 // ── Control socket ────────────────────────────────────────────────────────────
 
 enum ControlCmd {
@@ -270,9 +241,6 @@ async fn main() -> Result<()> {
 
     let routes_dir = config.routes_dir.clone();
     let mut config = Arc::new(config);
-
-    // Write PID file (removed automatically on drop).
-    let _pid_file = PidFile::write(&config)?;
 
     // Bind control socket (removed automatically on drop).
     let (ctrl_tx, mut ctrl_rx) = mpsc::channel::<ControlCmd>(8);
