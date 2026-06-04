@@ -99,8 +99,18 @@ Re-apply all current route param values (useful after connecting a new device
 or recovering from a UI desync):
 ```bash
 systemctl --user reload midi-daemon
-# or equivalently, from anywhere:
+# or equivalently:
 midi-daemon --resync
+```
+
+Force an immediate reload of `config.toml` and all route scripts (without restarting):
+```bash
+midi-daemon --reload
+```
+
+Show a brief status report from the running daemon:
+```bash
+midi-daemon --status
 ```
 
 ### System-wide
@@ -122,16 +132,19 @@ with the updated configuration automatically (no restart needed).
 systemctl stop    midi-daemon   # graceful stop (saves persisted state)
 systemctl restart midi-daemon
 systemctl reload  midi-daemon   # resync all route params
-# or:
-midi-daemon --resync
+midi-daemon --resync            # equivalent to the above
+midi-daemon --reload            # force reload config + all routes
+midi-daemon --status            # show status report
 ```
 
 ## Daemon control
 
-| Action | systemd (user) | systemd (system) | Signal |
-|--------|---------------|-----------------|--------|
-| Graceful stop | `systemctl --user stop midi-daemon` | `systemctl stop midi-daemon` | `SIGTERM` |
-| Resync params | `systemctl --user reload midi-daemon` | `systemctl reload midi-daemon` | `SIGUSR1` |
+| Action | systemd (user) | systemd (system) | CLI |
+|--------|---------------|-----------------|-----|
+| Graceful stop | `systemctl --user stop midi-daemon` | `systemctl stop midi-daemon` | *(SIGTERM)* |
+| Resync params | `systemctl --user reload midi-daemon` | `systemctl reload midi-daemon` | `midi-daemon --resync` |
+| Reload config + routes | — | — | `midi-daemon --reload` |
+| Show status | — | — | `midi-daemon --status` |
 
 ### Graceful shutdown (SIGTERM)
 
@@ -146,30 +159,77 @@ the system shutting down — it:
 `systemctl stop` will wait up to 30 seconds for this to complete before
 sending SIGKILL.
 
-### Param resync (SIGUSR1 / `--resync`)
+### Control socket
 
-Sending SIGUSR1 to the daemon, or running `midi-daemon --resync`, causes
-every route to re-apply its current OSC param values:
+All CLI control commands communicate with the running daemon over a Unix
+socket. The socket location depends on the user running the daemon:
+
+| Running as | Socket path |
+|---|---|
+| root | `/run/midi-daemon/control.sock` |
+| non-root | `$XDG_RUNTIME_DIR/midi-daemon/control.sock` (typically `/run/user/<uid>/midi-daemon/control.sock`) |
+
+The socket is created with mode `0660`. By default only the daemon's owner
+(and root) can connect to it.
+
+**Allowing unprivileged users to control a root-run daemon:**
+
+Change the socket's group to one the users belong to (e.g. `audio`). In a
+systemd system service unit add:
+
+```ini
+[Service]
+ExecStartPost=/bin/chgrp audio /run/midi-daemon/control.sock
+```
+
+Users in the `audio` group can then run `--resync`, `--reload`, and
+`--status` without `sudo`. A non-root user attempting to connect to a
+root daemon without the necessary group membership will get a clear
+permission error rather than a confusing "daemon not found."
+
+### `--resync`
+
+Causes every route to re-apply its current OSC param values:
 
 1. For each param, call `get()` to read the current value.
 2. Call `set(value)` to push it through the set function again (re-runs any
    clamping, MIDI output, or side-effects).
 3. Notify all current OSC subscribers with the post-set value from `get()`.
 
-This is useful when a device reconnects and needs to be told the current
-state, or when the UI has gotten out of sync with the daemon's internal state.
+Useful when a device reconnects and needs to be told the current state, or
+when a UI panel has gotten out of sync with the daemon.
 
 ```bash
-# All equivalent:
+# Both equivalent:
 systemctl --user reload midi-daemon
 midi-daemon --resync
-kill -USR1 $(pidof midi-daemon)
 ```
 
-`midi-daemon --resync` locates the running daemon via its PID file
-(`~/.cache/midi-daemon/midi-daemon.pid` for user installs,
-`/var/cache/midi-daemon/midi-daemon.pid` for system installs) and sends
-SIGUSR1 to it.
+SIGUSR1 is still accepted for backward compatibility with existing scripts.
+
+### `--reload`
+
+Forces an immediate reload of `config.toml` and all route scripts without
+restarting the daemon. Equivalent to touching all watched files at once —
+useful when inotify misses a change, or when deploying new route files and
+wanting to force a clean reload in one step.
+
+```bash
+midi-daemon --reload
+```
+
+### `--status`
+
+Prints a brief status report from the running daemon:
+
+```
+pid: 12345
+routes: metronome, mixer
+osc_recv: 9000
+config: /home/user/.config/midi-daemon/config.toml
+cache: /home/user/.cache/midi-daemon
+socket: /run/user/1000/midi-daemon/control.sock
+```
 
 ## Lua API
 
@@ -567,10 +627,10 @@ persist_state = true   # default: false
 On **graceful shutdown** (SIGTERM / `systemctl stop`) the daemon calls each
 param's `get()` function and writes the values to a TOML file:
 
-| Config origin | State file location |
+| Running as | State file location |
 |---|---|
-| User (`~/.config/midi-daemon/`) | `~/.cache/midi-daemon/route-state/<name>.toml` |
-| System (`/etc/midi-daemon/`) | `/var/cache/midi-daemon/route-state/<name>.toml` |
+| non-root | `~/.cache/midi-daemon/route-state/<name>.toml` |
+| root | `/var/cache/midi-daemon/route-state/<name>.toml` |
 
 On startup, each saved value is restored by calling the param's `set()`
 function, exactly as if an OSC message had arrived. Param names that exist in
