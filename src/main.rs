@@ -316,6 +316,7 @@ async fn main() -> Result<()> {
     // Signal handlers
     use tokio::signal::unix::{signal, SignalKind};
     let mut sigterm = signal(SignalKind::terminate())?;
+    let mut sigint = signal(SignalKind::interrupt())?;
     let mut sigusr1 = signal(SignalKind::user_defined1())?;
 
     // Main event loop
@@ -324,6 +325,10 @@ async fn main() -> Result<()> {
             biased;
             _ = sigterm.recv() => {
                 info!("Received SIGTERM — shutting down");
+                break;
+            }
+            _ = sigint.recv() => {
+                info!("Received SIGINT — shutting down");
                 break;
             }
             _ = sigusr1.recv() => {
