@@ -7,10 +7,10 @@ mod osc_params;
 mod route;
 mod timer;
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use notify::{Event, EventKind, RecursiveMode, Watcher};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -18,6 +18,8 @@ use tracing::{debug, error, info, warn};
 use alsa_connect::ConnectionManager;
 use config::Config;
 use route::Route;
+
+// ── OSC dispatch ──────────────────────────────────────────────────────────────
 
 /// A map from route name to an OSC injector closure.
 ///
@@ -85,8 +87,6 @@ fn needed_osc_ports(config: &Config, routes: &HashMap<String, Route>) -> HashSet
 }
 
 /// Ensure exactly one receiver is running for each needed port.
-/// Starts receivers for ports not yet covered; drops receivers for ports
-/// no longer needed.
 fn sync_osc_receivers(
     config: &Config,
     routes: &Arc<Mutex<HashMap<String, Route>>>,
@@ -104,9 +104,78 @@ fn sync_osc_receivers(
     receivers.retain(|p, _| needed.contains(p));
 }
 
+// ── PID file ──────────────────────────────────────────────────────────────────
+
+/// RAII PID file: written on creation, removed on drop.
+struct PidFile(PathBuf);
+
+impl PidFile {
+    fn write(config: &Config) -> Result<Self> {
+        let path = pid_file_path(config);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create PID dir {}", parent.display()))?;
+        }
+        std::fs::write(&path, format!("{}\n", std::process::id()))
+            .with_context(|| format!("write PID file {}", path.display()))?;
+        info!("PID file: {}", path.display());
+        Ok(PidFile(path))
+    }
+}
+
+impl Drop for PidFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn pid_file_path(config: &Config) -> PathBuf {
+    config.cache_dir().join("midi-daemon.pid")
+}
+
+/// Try to locate the PID file of a running daemon (user cache first, then system).
+fn find_pid_file() -> Option<PathBuf> {
+    // User cache (most common)
+    if let Some(d) = dirs::cache_dir() {
+        let p = d.join("midi-daemon/midi-daemon.pid");
+        if p.exists() { return Some(p); }
+    }
+    // System cache
+    let p = PathBuf::from("/var/cache/midi-daemon/midi-daemon.pid");
+    if p.exists() { return Some(p); }
+    None
+}
+
+// ── Graceful shutdown ─────────────────────────────────────────────────────────
+
+/// Send a `Shutdown` command to every route and wait for their event-loop
+/// threads to finish (which includes saving persisted state).
+fn graceful_shutdown(routes: &Arc<Mutex<HashMap<String, Route>>>) {
+    let to_shutdown: Vec<Route> = {
+        let mut guard = routes.lock().unwrap();
+        guard.drain().map(|(_, r)| r).collect()
+    };
+    let handles: Vec<std::thread::JoinHandle<()>> = to_shutdown
+        .into_iter()
+        .filter_map(|r| r.shutdown())
+        .collect();
+    for h in handles {
+        let _ = h.join();
+    }
+    info!("All routes shut down");
+}
+
+// ── Entry point ───────────────────────────────────────────────────────────────
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
+
+    // --resync: send SIGUSR1 to the running daemon then exit.
+    if args.iter().any(|a| a == "--resync") {
+        return do_resync();
+    }
+
     let cli_level = args.windows(2)
         .find(|w| w[0] == "--log-level")
         .map(|w| w[1].clone());
@@ -129,7 +198,10 @@ async fn main() -> Result<()> {
     let routes_dir = config.routes_dir.clone();
     let mut config = Arc::new(config);
 
-    // Map of route name -> Route handle
+    // Write PID file (removed automatically on drop).
+    let _pid_file = PidFile::write(&config)?;
+
+    // Map of route name -> Route handle.
     let routes: Arc<Mutex<HashMap<String, Route>>> =
         Arc::new(Mutex::new(HashMap::new()));
 
@@ -138,7 +210,6 @@ async fn main() -> Result<()> {
 
     let osc_dispatch: OscDispatch = Arc::new(Mutex::new(HashMap::new()));
 
-    // Initial load of all .lua files
     load_all_routes(
         &routes_dir,
         Arc::clone(&config),
@@ -147,8 +218,6 @@ async fn main() -> Result<()> {
         Arc::clone(&osc_dispatch),
     ).await?;
 
-    // One shared OSC receiver per unique declared port.
-    // Dispatches /route-name/... to the matching route.
     let mut osc_receivers: HashMap<u16, osc::OscReceiver> = HashMap::new();
     sync_osc_receivers(&config, &routes, &mut osc_receivers, &osc_dispatch);
 
@@ -189,72 +258,136 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Hot-reload loop
-    while let Some(event) = rx.recv().await {
-        match event {
-            WatchEvent::RouteChanged(path) => {
-                let name = match path.file_stem().and_then(|s| s.to_str()) {
-                    Some(n) => n.to_string(),
-                    None => continue,
-                };
+    // Signal handlers
+    use tokio::signal::unix::{signal, SignalKind};
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let mut sigusr1 = signal(SignalKind::user_defined1())?;
 
-                if path.exists() {
-                    info!("Detected change in {}.lua — reloading", name);
-
-                    // Borrow the existing ports Arc without removing the old route so that
-                    // ALSA port IDs are preserved and the old route stays alive if the
-                    // reload fails (e.g. Lua syntax error or ALSA error).
-                    let old_ports = routes.lock().unwrap()
-                        .get(&name).map(|r| r.ports_arc());
-
-                    match Route::start(&path, Arc::clone(&config), old_ports) {
-                        Ok(route) => {
-                            conn_mgr.register_route(&name, route.port_decl(), &route.connect_decl);
-                            conn_mgr.apply_all();
-                            register_route_osc(&osc_dispatch, &name, &route);
-                            // Replacing the old entry drops it, which stops its timer and
-                            // detaches its event-loop thread (which will drain and exit).
-                            routes.lock().unwrap().insert(name.clone(), route);
-                            sync_osc_receivers(&config, &routes, &mut osc_receivers, &osc_dispatch);
-                            info!("Reloaded route: {}", name);
-                        }
-                        Err(e) => error!("Failed to reload route {}: {}", name, e),
-                    }
-                } else {
-                    routes.lock().unwrap().remove(&name);
-                    conn_mgr.unregister_route(&name);
-                    unregister_route_osc(&osc_dispatch, &name);
-                    sync_osc_receivers(&config, &routes, &mut osc_receivers, &osc_dispatch);
-                    info!("Removed route: {}", name);
+    // Main event loop
+    loop {
+        tokio::select! {
+            biased;
+            _ = sigterm.recv() => {
+                info!("Received SIGTERM — shutting down");
+                break;
+            }
+            _ = sigusr1.recv() => {
+                info!("Received SIGUSR1 — resyncing all route params");
+                let guard = routes.lock().unwrap();
+                for (name, route) in guard.iter() {
+                    route.send_resync();
+                    debug!("Queued resync for route '{}'", name);
                 }
             }
-            WatchEvent::ConfigChanged => {
-                info!("config.toml changed — reloading");
-                match config.reload() {
-                    Ok(new_cfg) => {
-                        if new_cfg.routes_dir != routes_dir {
-                            warn!(
-                                "routes_dir changed in config.toml — restart the daemon for this to take effect"
-                            );
-                        }
-                        config = Arc::new(new_cfg);
-                        reload_all_routes(
-                            &routes_dir,
-                            Arc::clone(&config),
-                            Arc::clone(&routes),
-                            Arc::clone(&conn_mgr),
-                            Arc::clone(&osc_dispatch),
+            event = rx.recv() => {
+                match event {
+                    Some(WatchEvent::RouteChanged(path)) => {
+                        handle_route_changed(
+                            &path, &config, &routes, &conn_mgr, &osc_dispatch, &mut osc_receivers,
                         );
-                        sync_osc_receivers(&config, &routes, &mut osc_receivers, &osc_dispatch);
-                        info!("Config reloaded");
                     }
-                    Err(e) => error!("Failed to reload config.toml: {}", e),
+                    Some(WatchEvent::ConfigChanged) => {
+                        handle_config_changed(
+                            &routes_dir, &mut config, &routes, &conn_mgr, &osc_dispatch,
+                            &mut osc_receivers,
+                        );
+                    }
+                    None => {
+                        info!("Watch channel closed — shutting down");
+                        break;
+                    }
                 }
             }
         }
     }
 
+    graceful_shutdown(&routes);
     Ok(())
+}
+
+// ── --resync subcommand ───────────────────────────────────────────────────────
+
+fn do_resync() -> Result<()> {
+    let pid_path = find_pid_file()
+        .context("No midi-daemon PID file found. Is the daemon running?")?;
+
+    let pid_str = std::fs::read_to_string(&pid_path)
+        .with_context(|| format!("read PID file {}", pid_path.display()))?;
+    let pid: libc::pid_t = pid_str.trim().parse()
+        .context("PID file contains invalid PID")?;
+
+    let rc = unsafe { libc::kill(pid, libc::SIGUSR1) };
+    if rc != 0 {
+        let errno = std::io::Error::last_os_error();
+        anyhow::bail!("Failed to send SIGUSR1 to PID {}: {}", pid, errno);
+    }
+
+    println!("Sent resync signal to midi-daemon (PID {})", pid);
+    Ok(())
+}
+
+// ── Hot-reload helpers ────────────────────────────────────────────────────────
+
+fn handle_route_changed(
+    path: &Path,
+    config: &Arc<Config>,
+    routes: &Arc<Mutex<HashMap<String, Route>>>,
+    conn_mgr: &Arc<ConnectionManager>,
+    osc_dispatch: &OscDispatch,
+    osc_receivers: &mut HashMap<u16, osc::OscReceiver>,
+) {
+    let name = match path.file_stem().and_then(|s| s.to_str()) {
+        Some(n) => n.to_string(),
+        None => return,
+    };
+
+    if path.exists() {
+        info!("Detected change in {}.lua — reloading", name);
+        let old_ports = routes.lock().unwrap().get(&name).map(|r| r.ports_arc());
+        match Route::start(path, Arc::clone(config), old_ports) {
+            Ok(route) => {
+                conn_mgr.register_route(&name, route.port_decl(), &route.connect_decl);
+                conn_mgr.apply_all();
+                register_route_osc(osc_dispatch, &name, &route);
+                routes.lock().unwrap().insert(name.clone(), route);
+                sync_osc_receivers(config, routes, osc_receivers, osc_dispatch);
+                info!("Reloaded route: {}", name);
+            }
+            Err(e) => error!("Failed to reload route {}: {}", name, e),
+        }
+    } else {
+        routes.lock().unwrap().remove(&name);
+        conn_mgr.unregister_route(&name);
+        unregister_route_osc(osc_dispatch, &name);
+        sync_osc_receivers(config, routes, osc_receivers, osc_dispatch);
+        info!("Removed route: {}", name);
+    }
+}
+
+fn handle_config_changed(
+    routes_dir: &PathBuf,
+    config: &mut Arc<Config>,
+    routes: &Arc<Mutex<HashMap<String, Route>>>,
+    conn_mgr: &Arc<ConnectionManager>,
+    osc_dispatch: &OscDispatch,
+    osc_receivers: &mut HashMap<u16, osc::OscReceiver>,
+) {
+    info!("config.toml changed — reloading");
+    match config.reload() {
+        Ok(new_cfg) => {
+            if new_cfg.routes_dir != *routes_dir {
+                warn!(
+                    "routes_dir changed in config.toml — restart the daemon for this to take effect"
+                );
+            }
+            *config = Arc::new(new_cfg);
+            reload_all_routes(routes_dir, Arc::clone(config), Arc::clone(routes),
+                               Arc::clone(conn_mgr), Arc::clone(osc_dispatch));
+            sync_osc_receivers(config, routes, osc_receivers, osc_dispatch);
+            info!("Config reloaded");
+        }
+        Err(e) => error!("Failed to reload config.toml: {}", e),
+    }
 }
 
 fn reload_all_routes(

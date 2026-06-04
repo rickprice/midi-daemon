@@ -28,6 +28,10 @@ enum RouteEvent {
     Midi { port: String, bytes: Vec<u8> },
     Timer(TimerEvent),
     Osc { from: SocketAddr, address: String, args: Vec<rosc::OscType> },
+    /// Re-apply all current param values through their `set()` functions.
+    ResyncState,
+    /// Save state (if persist_state is on) and exit the event loop cleanly.
+    Shutdown,
 }
 
 /// Named input and output ports declared by a route.
@@ -154,7 +158,7 @@ impl RoutePorts {
 pub struct Route {
     ports: Arc<RoutePorts>,
     _timer: Arc<Timer>,
-    _thread: std::thread::JoinHandle<()>,
+    thread: Option<std::thread::JoinHandle<()>>,
     /// Sender into the route's event channel, used by the global OSC dispatcher.
     osc_tx: mpsc::Sender<RouteEvent>,
     pub connect_decl: ConnectDecl,
@@ -164,6 +168,19 @@ pub struct Route {
 }
 
 impl Route {
+    /// Queue a resync command: the event loop will re-apply all current param
+    /// values through their `set()` functions and notify subscribers.
+    pub fn send_resync(&self) {
+        let _ = self.osc_tx.try_send(RouteEvent::ResyncState);
+    }
+
+    /// Send a graceful-shutdown command and return the event-loop thread handle
+    /// so the caller can join it (waiting for state to be saved).
+    pub fn shutdown(mut self) -> Option<std::thread::JoinHandle<()>> {
+        let _ = self.osc_tx.try_send(RouteEvent::Shutdown);
+        self.thread.take()
+    }
+
     /// Returns a `Send + 'static` closure that injects OSC events into this
     /// route's event loop. Used by the global listener in main.rs — avoids
     /// sharing the full Route (which is !Send due to ALSA raw pointers).
@@ -331,7 +348,7 @@ impl Route {
         Ok(Route {
             ports,
             _timer: timer,
-            _thread: thread,
+            thread: Some(thread),
             osc_tx,
             connect_decl,
             osc_receive_port,
@@ -1010,6 +1027,14 @@ fn run_lua_event_loop(
                     Err(e) => warn!("[{}] OSC message parse error: {}", name, e),
                 }
             }
+            RouteEvent::ResyncState => {
+                if let Some(ref ps) = osc_param_set {
+                    if let Err(e) = ps.resync(&lua) {
+                        warn!("[{}] resync error: {}", name, e);
+                    }
+                }
+            }
+            RouteEvent::Shutdown => break,
         }
     }
 

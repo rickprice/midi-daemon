@@ -413,6 +413,7 @@ dependencies = [
  "alsa",
  "anyhow",
  "dirs",
+ "libc",
  "midir",
  "mlua",
  "notify",

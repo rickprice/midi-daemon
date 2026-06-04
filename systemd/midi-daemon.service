@@ -6,8 +6,11 @@ After=sound.target pipewire.service pipewire-pulse.service
 [Service]
 Type=simple
 ExecStart=%h/.cargo/bin/midi-daemon
+ExecReload=/bin/kill -USR1 $MAINPID
 Restart=on-failure
 RestartSec=2
+KillSignal=SIGTERM
+TimeoutStopSec=30
 
 StandardOutput=journal
 StandardError=journal

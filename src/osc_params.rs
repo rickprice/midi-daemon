@@ -485,6 +485,53 @@ impl OscParamSet {
         Ok(())
     }
 
+    /// Re-apply every param's current value: calls `get()` then `set(value)`,
+    /// then notifies all subscribers with the post-set value from `get()`.
+    /// Skips params that lack either a `get` or `set` function.
+    pub fn resync(&self, lua: &Lua) -> LuaResult<()> {
+        let param_names: Vec<String> = self.params.keys().cloned().collect();
+        for name in &param_names {
+            let get_fn: Option<LuaFunction> = self.params.get(name)
+                .and_then(|p| p.get.as_ref())
+                .map(|k| lua.registry_value(k))
+                .transpose()?;
+            let set_fn: Option<LuaFunction> = self.params.get(name)
+                .and_then(|p| p.set.as_ref())
+                .map(|k| lua.registry_value(k))
+                .transpose()?;
+            let (get_fn, set_fn) = match (get_fn, set_fn) {
+                (Some(g), Some(s)) => (g, s),
+                _ => continue,
+            };
+            let current: LuaValue = match get_fn.call(()) {
+                Ok(v) => v,
+                Err(e) => { warn!("resync get '{}': {}", name, e); continue; }
+            };
+            if let Err(e) = set_fn.call::<()>(current) {
+                warn!("resync set '{}': {}", name, e);
+                continue;
+            }
+            // Notify subscribers with the post-set value.
+            let updated: LuaValue = match get_fn.call(()) {
+                Ok(v) => v,
+                Err(e) => { warn!("resync post-set get '{}': {}", name, e); continue; }
+            };
+            let subscribers: Vec<String> = self.subscribers.keys().cloned().collect();
+            if !subscribers.is_empty() {
+                let send_osc: LuaFunction = lua.globals().get("send_osc")?;
+                let param_addr = format!("{}{}", self.slash_prefix, name);
+                for sub in &subscribers {
+                    if let Err(e) = send_osc.call::<()>((
+                        sub.as_str(), param_addr.as_str(), updated.clone(),
+                    )) {
+                        warn!("resync notify '{}' → '{}': {}", name, sub, e);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Restore param values from `path` by calling each param's `set()`.
     /// Warns about unrecognized param names but skips them gracefully.
     /// Does nothing if the file does not exist yet.
