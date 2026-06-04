@@ -7,6 +7,7 @@ mod osc_params;
 mod route;
 mod timer;
 
+use clap::Parser;
 use anyhow::{Context as _, Result};
 use notify::{Event, EventKind, RecursiveMode, Watcher};
 use std::collections::{HashMap, HashSet};
@@ -212,19 +213,28 @@ fn graceful_shutdown(routes: &Arc<Mutex<HashMap<String, Route>>>) {
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
+#[derive(Parser)]
+#[command(about = "A Lua-scriptable MIDI routing daemon")]
+struct Cli {
+    /// Send a resync command to the running daemon
+    #[arg(long)] resync: bool,
+    /// Hot-reload routes in the running daemon
+    #[arg(long)] reload: bool,
+    /// Print status of the running daemon
+    #[arg(long)] status: bool,
+    /// Log level (e.g. debug, info, warn, error)
+    #[arg(long)] log_level: Option<String>,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args: Vec<String> = std::env::args().collect();
+    let cli = Cli::parse();
 
-    if args.iter().any(|a| a == "--resync")  { return do_control_cmd("resync").await; }
-    if args.iter().any(|a| a == "--reload")  { return do_control_cmd("reload").await; }
-    if args.iter().any(|a| a == "--status")  { return do_control_cmd("status").await; }
+    if cli.resync { return do_control_cmd("resync").await; }
+    if cli.reload { return do_control_cmd("reload").await; }
+    if cli.status { return do_control_cmd("status").await; }
 
-    let cli_level = args.windows(2)
-        .find(|w| w[0] == "--log-level")
-        .map(|w| w[1].clone());
-
-    let log_filter = if let Some(level) = cli_level {
+    let log_filter = if let Some(level) = cli.log_level {
         format!("midi_daemon={}", level)
     } else {
         std::env::var("RUST_LOG").unwrap_or_else(|_| "midi_daemon=info".to_string())

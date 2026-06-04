@@ -28,3 +28,4 @@ alsa = "0.9"
 regex = "1.12.3"
 rosc = "0.10"
 libc = "0.2"
+clap = { version = "4", features = ["derive"] }
