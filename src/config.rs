@@ -118,19 +118,36 @@ pub fn default_config_path() -> PathBuf {
 }
 
 /// Path to the Unix control socket.
-/// Root uses `/run/midi-daemon/control.sock`; non-root uses `$XDG_RUNTIME_DIR`.
+///
+/// Resolution order:
+///   1. `$RUNTIME_DIRECTORY` — set by systemd when `RuntimeDirectory=midi-daemon` is configured
+///   2. `/run/midi-daemon/control.sock` — root, or client connecting to a running system service
+///   3. `$XDG_RUNTIME_DIR/midi-daemon/control.sock` — user session
+///   4. `~/.cache/midi-daemon/control.sock` — user with no XDG runtime
+///   5. `/tmp/midi-daemon.sock` — last resort (e.g. system user with no usable home)
 pub fn control_socket_path() -> PathBuf {
-    if unsafe { libc::getuid() } == 0 {
-        PathBuf::from("/run/midi-daemon/control.sock")
-    } else {
-        std::env::var("XDG_RUNTIME_DIR")
-            .map(|d| PathBuf::from(d).join("midi-daemon/control.sock"))
-            .unwrap_or_else(|_| {
-                dirs::cache_dir()
-                    .map(|d| d.join("midi-daemon/control.sock"))
-                    .unwrap_or_else(|| PathBuf::from("/tmp/midi-daemon.sock"))
-            })
+    // Systemd sets $RUNTIME_DIRECTORY when RuntimeDirectory= is configured.
+    if let Ok(dir) = std::env::var("RUNTIME_DIRECTORY") {
+        return PathBuf::from(dir).join("control.sock");
     }
+    if unsafe { libc::getuid() } == 0 {
+        return PathBuf::from("/run/midi-daemon/control.sock");
+    }
+    // Non-root client: if the system service socket already exists, use it.
+    let system_sock = PathBuf::from("/run/midi-daemon/control.sock");
+    if system_sock.exists() {
+        return system_sock;
+    }
+    if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
+        return PathBuf::from(dir).join("midi-daemon/control.sock");
+    }
+    // Only use the cache dir if the home directory actually exists and is usable.
+    if let Some(cache) = dirs::cache_dir() {
+        if cache.parent().map_or(false, |p| p.exists()) {
+            return cache.join("midi-daemon/control.sock");
+        }
+    }
+    PathBuf::from("/tmp/midi-daemon.sock")
 }
 
 // ── Config impl ───────────────────────────────────────────────────────────────
