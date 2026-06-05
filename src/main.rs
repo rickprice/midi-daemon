@@ -500,15 +500,22 @@ async fn load_all_routes(
     conn_mgr: Arc<ConnectionManager>,
     osc_dispatch: OscDispatch,
 ) -> Result<()> {
-    if !dir.exists() {
-        std::fs::create_dir_all(dir)?;
-        info!("Created routes directory: {}", dir.display());
-        return Ok(());
-    }
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(dir)
+                .with_context(|| format!("create routes directory {}", dir.display()))?;
+            info!("Created routes directory: {}", dir.display());
+            return Ok(());
+        }
+        Err(e) => {
+            return Err(e).with_context(|| format!("open routes directory {}", dir.display()));
+        }
+    };
 
     {
         let mut map = routes.lock().unwrap();
-        for entry in std::fs::read_dir(dir)? {
+        for entry in entries {
             let entry = entry?;
             let path = entry.path();
             if path.extension().map(|e| e == "lua").unwrap_or(false) {
