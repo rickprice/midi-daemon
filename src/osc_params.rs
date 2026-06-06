@@ -156,14 +156,29 @@ fn lua_now(lua: &Lua) -> LuaResult<f64> {
 
 fn parse_feedback(from: &str, args: &LuaTable, default_timeout: f64) -> LuaResult<(String, f64)> {
     let fb = match args.get::<LuaValue>(1)? {
-        LuaValue::Integer(port) => match from.rsplit_once(':') {
-            Some((ip, _)) => format!("{}:{}", ip, port),
-            None => from.to_string(),
-        },
-        LuaValue::Number(port) => match from.rsplit_once(':') {
-            Some((ip, _)) => format!("{}:{}", ip, port as i64),
-            None => from.to_string(),
-        },
+        LuaValue::Integer(port) => {
+            if port <= 0 || port > 65535 {
+                warn!("OSC subscribe: invalid port {} from '{}'; using sender port", port, from);
+                from.to_string()
+            } else {
+                match from.rsplit_once(':') {
+                    Some((ip, _)) => format!("{}:{}", ip, port),
+                    None => from.to_string(),
+                }
+            }
+        }
+        LuaValue::Number(port) => {
+            let port_i = port as i64;
+            if port_i <= 0 || port_i > 65535 {
+                warn!("OSC subscribe: invalid port {} from '{}'; using sender port", port_i, from);
+                from.to_string()
+            } else {
+                match from.rsplit_once(':') {
+                    Some((ip, _)) => format!("{}:{}", ip, port_i),
+                    None => from.to_string(),
+                }
+            }
+        }
         _ => from.to_string(),
     };
     let timeout = match args.get::<LuaValue>(2)? {

@@ -850,7 +850,7 @@ fn run_lua_event_loop(
                     .map(|v| lua_val_to_osc_type(&v))
                     .collect::<LuaResult<Vec<_>>>()?;
                 if let Err(e) = sender.send_to_addr(dest, address, osc_args) {
-                    warn!("OSC send error: {}", e);
+                    warn!("OSC send error sending to {}: {}", dest, e);
                 }
                 return Ok(());
             }
@@ -870,7 +870,7 @@ fn run_lua_event_loop(
                         for sub_addr in &subs {
                             if let Ok(dest) = sub_addr.parse::<SocketAddr>() {
                                 if let Err(e) = sender.send_to_addr(dest, first.clone(), osc_args.clone()) {
-                                    warn!("OSC send error: {}", e);
+                                    warn!("OSC send error sending to {}: {}", dest, e);
                                 }
                             }
                         }
@@ -908,7 +908,7 @@ fn run_lua_event_loop(
                 .collect::<LuaResult<Vec<_>>>()?;
 
             if let Err(e) = sender.send(&target, address, osc_args) {
-                warn!("OSC send error: {}", e);
+                warn!("OSC send error sending to '{}': {}", target, e);
             }
 
             Ok(())
