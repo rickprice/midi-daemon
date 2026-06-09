@@ -153,18 +153,32 @@ pub fn control_socket_path() -> PathBuf {
 // ── Config impl ───────────────────────────────────────────────────────────────
 
 impl Config {
-    /// Returns the cache directory appropriate for this process:
-    /// `/var/cache/midi-daemon` when running as root, user cache otherwise.
+    /// Returns the cache directory appropriate for this process.
+    ///
+    /// Resolution order:
+    ///   1. `$CACHE_DIRECTORY` — set by systemd when `CacheDirectory=midi-daemon` is configured
+    ///   2. `/var/cache/midi-daemon` — root, or system user with no usable home
+    ///   3. `$XDG_CACHE_HOME/midi-daemon` / `~/.cache/midi-daemon` — interactive user session
     pub fn cache_dir(&self) -> PathBuf {
+        if let Ok(dir) = std::env::var("CACHE_DIRECTORY") {
+            return PathBuf::from(dir);
+        }
         if unsafe { libc::getuid() } == 0 {
+            return system_cache_dir();
+        }
+        // System service users (e.g. `midi-daemon`) often have a non-existent home.
+        // Fall back to the system cache dir rather than trying to write to /nonexistent.
+        let home = dirs::home_dir();
+        let home_usable = home
+            .as_deref()
+            .map_or(false, |h| h.exists() && h != std::path::Path::new("/var/empty"));
+        if !home_usable {
             return system_cache_dir();
         }
         dirs::cache_dir()
             .map(|d| d.join("midi-daemon"))
             .unwrap_or_else(|| {
-                dirs::home_dir()
-                    .map(|h| h.join(".cache/midi-daemon"))
-                    .unwrap_or_else(system_cache_dir)
+                home.unwrap().join(".cache/midi-daemon")
             })
     }
 

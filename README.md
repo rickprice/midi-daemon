@@ -629,8 +629,9 @@ param's `get()` function and writes the values to a TOML file:
 
 | Running as | State file location |
 |---|---|
-| non-root | `~/.cache/midi-daemon/route-state/<name>.toml` |
+| system service (via systemd `CacheDirectory=`) | `/var/cache/midi-daemon/route-state/<name>.toml` |
 | root | `/var/cache/midi-daemon/route-state/<name>.toml` |
+| interactive user (non-root) | `~/.cache/midi-daemon/route-state/<name>.toml` |
 
 On startup, each saved value is restored by calling the param's `set()`
 function, exactly as if an OSC message had arrived. Param names that exist in
