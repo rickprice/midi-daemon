@@ -224,6 +224,10 @@ struct Cli {
     #[arg(long)] status: bool,
     /// Log level (e.g. debug, info, warn, error)
     #[arg(long)] log_level: Option<String>,
+    /// Path to config file (overrides $MIDI_DAEMON_CONFIG and default search)
+    #[arg(long)] config: Option<PathBuf>,
+    /// Path to routes directory (overrides routes_dir in config file)
+    #[arg(long)] routes: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -244,7 +248,10 @@ async fn main() -> Result<()> {
         .with_env_filter(log_filter)
         .init();
 
-    let config = Config::find_and_load()?;
+    let config = Config::find_and_load_with_overrides(
+        cli.config.as_deref(),
+        cli.routes.as_deref(),
+    )?;
 
     info!("Starting midi-daemon");
     info!("Routes directory: {}", config.routes_dir.display());

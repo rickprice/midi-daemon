@@ -1,23 +1,27 @@
 [Unit]
-Description=MIDI Lua Routing Daemon (user)
+Description=MIDI Lua Routing Daemon
 Documentation=https://github.com/yourname/midi-daemon
 After=sound.target pipewire.service pipewire-pulse.service
 
 [Service]
 Type=simple
-# On NixOS: replace %h/.cargo/bin/midi-daemon with the Nix store path.
-# --config and --routes are optional; omit them to use the default search
-# (~/.config/midi-daemon/config.toml and ~/.config/midi-daemon/routes.d).
-ExecStart=%h/.cargo/bin/midi-daemon
+ExecStart=/usr/bin/midi-daemon \
+    --config /etc/midi-daemon/config.toml \
+    --routes /etc/midi-daemon/routes.d
 ExecReload=/bin/kill -USR1 $MAINPID
 Restart=on-failure
 RestartSec=2
+User=midi-daemon
+Group=midi-daemon
+SupplementaryGroups=audio
 KillSignal=SIGTERM
 TimeoutStopSec=30
+RuntimeDirectory=midi-daemon
+CacheDirectory=midi-daemon
 
 StandardOutput=journal
 StandardError=journal
 Environment=RUST_LOG=midi_daemon=info
 
 [Install]
-WantedBy=default.target
+WantedBy=multi-user.target

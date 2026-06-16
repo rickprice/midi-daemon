@@ -40,19 +40,19 @@ systemctl --user daemon-reload
 systemctl --user enable --now midi-daemon
 ```
 
-### System-wide install
+### System-wide install — Arch Linux
 
 Config and routes live in `/etc/midi-daemon/`. The daemon runs as a
-dedicated `midi-daemon` system user.
+dedicated `midi-daemon` system user created via `systemd-sysusers`.
 
 ```bash
 # Install binary
-sudo cargo install --path . --root /usr/local
+sudo cargo install --path . --root /usr
 
-# Create a dedicated system user
-sudo useradd --system --no-create-home --shell /usr/sbin/nologin midi-daemon
-# Add it to the audio group so it can access ALSA/PipeWire
-sudo usermod -aG audio midi-daemon
+# Create the system user and group via systemd-sysusers
+sudo install -Dm644 systemd/arch/sysusers.conf \
+    /usr/lib/sysusers.d/midi-daemon.conf
+sudo systemd-sysusers
 
 # Create config and routes directories
 sudo mkdir -p /etc/midi-daemon/routes.d
@@ -64,11 +64,82 @@ sudo cp routes.d/*.lua /etc/midi-daemon/routes.d/
 sudo chown midi-daemon:midi-daemon /etc/midi-daemon/config.toml \
     /etc/midi-daemon/routes.d/*.lua
 
-# Install and enable systemd system service
-sudo cp systemd/midi-daemon-system.service /etc/systemd/system/midi-daemon.service
+# Install and enable the systemd service
+sudo cp systemd/arch/midi-daemon.service /etc/systemd/system/midi-daemon.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now midi-daemon
 ```
+
+### System-wide install — NixOS
+
+The repo ships a `flake.nix` that both **compiles the binary** and exposes a
+**NixOS module** that creates the system user and wires up the systemd service.
+
+#### With flakes (recommended)
+
+Add the repo as a flake input, then import the module:
+
+```nix
+# flake.nix (your system config)
+{
+  inputs = {
+    nixpkgs.url      = "github:NixOS/nixpkgs/nixos-unstable";
+    midi-daemon.url  = "github:rickprice/midi-daemon";
+  };
+
+  outputs = { nixpkgs, midi-daemon, ... }: {
+    nixosConfigurations.mymachine = nixpkgs.lib.nixosSystem {
+      modules = [
+        midi-daemon.nixosModules.default
+        {
+          services.midi-daemon = {
+            enable    = true;
+            # package defaults to building from source — no further config needed.
+            # Supply configFile / routesDir if you want explicit paths:
+            configFile = /etc/midi-daemon/config.toml;
+            routesDir  = /etc/midi-daemon/routes.d;
+          };
+
+          # Generate the config file declaratively
+          environment.etc."midi-daemon/config.toml".text = ''
+            default_bpm  = 120.0
+            default_ppqn = 24
+          '';
+        }
+      ];
+    };
+  };
+}
+```
+
+#### Without flakes
+
+```nix
+# configuration.nix
+{ config, pkgs, ... }:
+{
+  imports = [ /path/to/midi-daemon/nix/module.nix ];
+
+  services.midi-daemon = {
+    enable    = true;
+    configFile = /etc/midi-daemon/config.toml;
+    routesDir  = /etc/midi-daemon/routes.d;
+  };
+
+  environment.etc."midi-daemon/config.toml".text = ''
+    default_bpm  = 120.0
+    default_ppqn = 24
+  '';
+}
+```
+
+In both cases the module:
+- Builds the binary from the Nix derivation in `nix/package.nix`
+- Creates the `midi-daemon` system user and group
+- Adds the user to the `audio` group for ALSA access
+- Registers and starts the systemd service
+
+Apply with `sudo nixos-rebuild switch`; the service starts automatically.
 
 ## Usage
 
@@ -145,6 +216,26 @@ midi-daemon --status            # show status report
 | Resync params | `systemctl --user reload midi-daemon` | `systemctl reload midi-daemon` | `midi-daemon --resync` |
 | Reload config + routes | — | — | `midi-daemon --reload` |
 | Show status | — | — | `midi-daemon --status` |
+
+### Startup flags
+
+These flags are passed when first launching the daemon (not to the running instance):
+
+| Flag | Description |
+|------|-------------|
+| `--config <PATH>` | Load config from this exact file. Errors if the file is absent. Overrides `$MIDI_DAEMON_CONFIG` and the default search. |
+| `--routes <PATH>` | Use this directory for routes. Overrides `routes_dir` in `config.toml` and survives hot-reloads. |
+| `--log-level <LEVEL>` | Set log verbosity: `error`, `warn`, `info` (default), `debug`. |
+
+Example — run with explicit paths (useful for testing or non-standard layouts):
+
+```bash
+midi-daemon --config /srv/midi/config.toml --routes /srv/midi/routes.d
+```
+
+The service file in `systemd/arch/` and the NixOS module in `nix/module.nix`
+pass `--config` and `--routes` explicitly so packagers can control the exact
+paths without relying on the environment variable or the default search order.
 
 ### Graceful shutdown (SIGTERM)
 
@@ -560,14 +651,16 @@ global defaults  <  per-route [section] values  <  init() return value
 
 The daemon searches for a config file in this order:
 
-1. `$MIDI_DAEMON_CONFIG` — explicit path via environment variable
-2. `~/.config/midi-daemon/config.toml` — per-user
-3. `/etc/midi-daemon/config.toml` — system-wide
-4. Built-in defaults (routes dir inferred from whichever scope applies)
+1. `--config <PATH>` — command-line flag (errors if the file is absent)
+2. `$MIDI_DAEMON_CONFIG` — explicit path via environment variable
+3. `~/.config/midi-daemon/config.toml` — per-user
+4. `/etc/midi-daemon/config.toml` — system-wide
+5. Built-in defaults (routes dir inferred from whichever scope applies)
 
 ```toml
 # Path to routes directory.
 # Default: <config-dir>/routes.d  (user or system, whichever was loaded)
+# Overridden at startup by the --routes flag (survives hot-reload).
 # routes_dir = "/custom/path"
 
 default_bpm  = 120.0

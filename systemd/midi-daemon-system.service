@@ -5,12 +5,22 @@ After=sound.target pipewire.service pipewire-pulse.service
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/midi-daemon
+# Adjust the binary path for your distro:
+#   - Arch/Debian/Ubuntu: /usr/local/bin/midi-daemon
+#   - NixOS: use the Nix store path, e.g.
+#       ${pkgs.midi-daemon}/bin/midi-daemon
+#     or add midi-daemon to environment.systemPackages and use:
+#       /run/current-system/sw/bin/midi-daemon
+ExecStart=/usr/local/bin/midi-daemon \
+    --config /etc/midi-daemon/config.toml \
+    --routes /etc/midi-daemon/routes.d
 ExecReload=/bin/kill -USR1 $MAINPID
 Restart=on-failure
 RestartSec=2
+# NixOS: declare this user via users.users.midi-daemon in your configuration.nix,
+# or replace with DynamicUser=yes (removes need for a pre-created user).
 User=midi-daemon
-Group=midi-daemon
+Group=audio
 KillSignal=SIGTERM
 TimeoutStopSec=30
 RuntimeDirectory=midi-daemon

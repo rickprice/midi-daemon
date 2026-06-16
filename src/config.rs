@@ -26,6 +26,8 @@ pub struct Config {
     pub osc_send_addr: Option<String>,
     /// How often (in seconds) the daemon sends `/route/heartbeat` to OSC subscribers.
     pub osc_heartbeat_interval: f64,
+    /// CLI --routes override; re-applied on reload so it always wins over config file.
+    pub routes_dir_override: Option<PathBuf>,
 }
 
 /// Internal deserialization target. `routes_dir` is optional so the caller
@@ -60,6 +62,7 @@ impl RawConfig {
             osc_receive_port: self.osc_receive_port,
             osc_send_addr: self.osc_send_addr,
             osc_heartbeat_interval: self.osc_heartbeat_interval,
+            routes_dir_override: None,
         }
     }
 }
@@ -90,6 +93,7 @@ fn default_config(routes_dir: PathBuf) -> Config {
         osc_receive_port: None,
         osc_send_addr: None,
         osc_heartbeat_interval: default_osc_heartbeat_interval(),
+        routes_dir_override: None,
     }
 }
 
@@ -187,6 +191,32 @@ impl Config {
         self.route_configs.get(name)?.as_table()
     }
 
+    /// Like [`find_and_load`] but accepts explicit CLI overrides.
+    ///
+    /// - `config_override`: if Some, load this exact file (error if absent).
+    /// - `routes_override`: if Some, replace `routes_dir` regardless of the config file.
+    ///   The override is stored and re-applied on every hot-reload.
+    pub fn find_and_load_with_overrides(
+        config_override: Option<&Path>,
+        routes_override: Option<&Path>,
+    ) -> Result<Self> {
+        let mut cfg = if let Some(path) = config_override {
+            let default_routes = path.parent().unwrap_or(path).join("routes.d");
+            tracing::info!("Loading config from --config: {}", path.display());
+            Self::load_file(path, default_routes)?
+        } else {
+            Self::find_and_load()?
+        };
+
+        if let Some(dir) = routes_override {
+            tracing::info!("Routes directory overridden by --routes: {}", dir.display());
+            cfg.routes_dir = dir.to_path_buf();
+            cfg.routes_dir_override = Some(dir.to_path_buf());
+        }
+
+        Ok(cfg)
+    }
+
     /// Search for a config file and load it. Lookup order:
     ///   1. `$MIDI_DAEMON_CONFIG` environment variable
     ///   2. `~/.config/midi-daemon/config.toml`  (user)
@@ -251,11 +281,20 @@ impl Config {
 
     /// Re-read config from the same file it was originally loaded from.
     /// Falls back to returning a clone of self if no file path is known.
+    /// CLI overrides (`--routes`) are re-applied after the file is re-read.
     pub fn reload(&self) -> Result<Self> {
-        match &self.config_path {
-            Some(path) => Self::load_file(path, self.routes_dir.clone()),
-            None => Ok(self.clone()),
+        let default_routes = self.routes_dir_override
+            .clone()
+            .unwrap_or_else(|| self.routes_dir.clone());
+        let mut new_cfg = match &self.config_path {
+            Some(path) => Self::load_file(path, default_routes)?,
+            None => return Ok(self.clone()),
+        };
+        if let Some(ref override_dir) = self.routes_dir_override {
+            new_cfg.routes_dir = override_dir.clone();
+            new_cfg.routes_dir_override = Some(override_dir.clone());
         }
+        Ok(new_cfg)
     }
 
     fn load_file(path: &Path, default_routes_dir: PathBuf) -> Result<Self> {
@@ -358,6 +397,69 @@ mod tests {
     fn default_config_path_ends_with_config_toml() {
         let p = default_config_path();
         assert_eq!(p.file_name().unwrap(), "config.toml");
+    }
+
+    // ── find_and_load_with_overrides ──────────────────────────────────────────
+
+    #[test]
+    fn explicit_config_path_loads_correctly() {
+        let path = write_tmp("midi_daemon_test_explicit_config.toml", "default_bpm = 99.0\n");
+        let cfg = Config::find_and_load_with_overrides(Some(&path), None).unwrap();
+        assert!((cfg.default_bpm - 99.0).abs() < 1e-9);
+        assert_eq!(cfg.config_path, Some(path.clone()));
+        assert!(cfg.routes_dir_override.is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn explicit_config_path_missing_returns_error() {
+        let path = PathBuf::from("/tmp/midi_daemon_nonexistent_explicit_xyz.toml");
+        let _ = std::fs::remove_file(&path);
+        let result = Config::find_and_load_with_overrides(Some(&path), None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn routes_override_wins_over_config_file() {
+        let path = write_tmp(
+            "midi_daemon_test_routes_override.toml",
+            "routes_dir = \"/config/routes\"\n",
+        );
+        let override_dir = PathBuf::from("/override/routes");
+        let cfg = Config::find_and_load_with_overrides(Some(&path), Some(&override_dir)).unwrap();
+        assert_eq!(cfg.routes_dir, override_dir);
+        assert_eq!(cfg.routes_dir_override, Some(override_dir));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn routes_override_survives_reload() {
+        let path = write_tmp(
+            "midi_daemon_test_routes_reload.toml",
+            "routes_dir = \"/config/routes\"\n",
+        );
+        let override_dir = PathBuf::from("/override/routes");
+        let cfg = Config::find_and_load_with_overrides(Some(&path), Some(&override_dir)).unwrap();
+        let reloaded = cfg.reload().unwrap();
+        assert_eq!(reloaded.routes_dir, override_dir);
+        assert_eq!(reloaded.routes_dir_override, Some(override_dir));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn no_overrides_leaves_routes_dir_override_none() {
+        // find_and_load_with_overrides(None, None) should behave like find_and_load
+        // and not set routes_dir_override.
+        let cfg = Config::find_and_load_with_overrides(None, None).unwrap();
+        assert!(cfg.routes_dir_override.is_none());
+    }
+
+    #[test]
+    fn routes_only_override_with_no_config_override() {
+        let override_dir = PathBuf::from("/cli/routes");
+        let cfg = Config::find_and_load_with_overrides(None, Some(&override_dir)).unwrap();
+        assert_eq!(cfg.routes_dir, override_dir);
+        assert_eq!(cfg.routes_dir_override, Some(override_dir));
     }
 
     // ── default_connect_input / default_connect_output ────────────────────────
