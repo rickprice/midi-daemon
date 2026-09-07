@@ -213,30 +213,39 @@ fn graceful_shutdown(routes: &Arc<Mutex<HashMap<String, Route>>>) {
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
+#[derive(clap::Subcommand)]
+enum Cmd {
+    /// Re-apply all current param values to connected OSC clients
+    Resync,
+    /// Hot-reload all route scripts in the running daemon
+    Reload,
+    /// Print status of the running daemon
+    Status,
+}
+
 #[derive(Parser)]
 #[command(about = "A Lua-scriptable MIDI routing daemon")]
 struct Cli {
-    /// Send a resync command to the running daemon
-    #[arg(long)] resync: bool,
-    /// Hot-reload routes in the running daemon
-    #[arg(long)] reload: bool,
-    /// Print status of the running daemon
-    #[arg(long)] status: bool,
     /// Log level (e.g. debug, info, warn, error)
     #[arg(long)] log_level: Option<String>,
     /// Path to config file (overrides $MIDI_DAEMON_CONFIG and default search)
     #[arg(long)] config: Option<PathBuf>,
     /// Path to routes directory (overrides routes_dir in config file)
     #[arg(long)] routes: Option<PathBuf>,
+    /// Control command to send to a running daemon (omit to start the daemon)
+    #[command(subcommand)] command: Option<Cmd>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    if cli.resync { return do_control_cmd("resync").await; }
-    if cli.reload { return do_control_cmd("reload").await; }
-    if cli.status { return do_control_cmd("status").await; }
+    match cli.command {
+        Some(Cmd::Resync) => return do_control_cmd("resync").await,
+        Some(Cmd::Reload) => return do_control_cmd("reload").await,
+        Some(Cmd::Status) => return do_control_cmd("status").await,
+        None => {}
+    }
 
     let log_filter = if let Some(level) = cli.log_level {
         format!("midi_daemon={}", level)
