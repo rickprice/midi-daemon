@@ -123,10 +123,12 @@ impl RoutePorts {
                     move |_stamp, message, _| {
                         let guard = fwd_ref.lock().unwrap();
                         if let Some(tx) = guard.as_ref() {
-                            let _ = tx.blocking_send(RouteEvent::Midi {
+                            if tx.try_send(RouteEvent::Midi {
                                 port: port_name_owned.clone(),
                                 bytes: message.to_vec(),
-                            });
+                            }).is_err() {
+                                warn!("MIDI message dropped: route event channel full or closed");
+                            }
                         }
                     },
                     (),

@@ -263,9 +263,9 @@ impl Config {
 
     /// Load from an explicit path. Useful for testing or when the caller
     /// already knows which file to use.
-    #[allow(dead_code)]
     /// Falls back to built-in defaults with `default_routes_dir` if the file
     /// is absent.
+    #[allow(dead_code)]
     pub fn load(path: &Path) -> Result<Self> {
         let default_routes = path.parent().unwrap_or(path).join("routes.d");
         if path.exists() {
