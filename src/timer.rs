@@ -18,9 +18,11 @@ pub struct Timer {
 
 impl Timer {
     pub fn new(default_bpm: f64, default_ppqn: u32) -> Self {
+        let bpm = default_bpm.clamp(20.0, 200.0);
+        let ppqn = default_ppqn.max(1);
         Timer {
-            bpm: Arc::new(AtomicU32::new((default_bpm * 100.0) as u32)),
-            ppqn: Arc::new(AtomicU32::new(default_ppqn)),
+            bpm: Arc::new(AtomicU32::new((bpm * 100.0) as u32)),
+            ppqn: Arc::new(AtomicU32::new(ppqn)),
             running: Arc::new(AtomicBool::new(true)),
         }
     }
@@ -39,7 +41,7 @@ impl Timer {
     }
 
     pub fn set_ppqn(&self, ppqn: u32) {
-        self.ppqn.store(ppqn, Ordering::Relaxed);
+        self.ppqn.store(ppqn.max(1), Ordering::Relaxed);
     }
 
     /// Spawn the timer loop in a dedicated thread.
@@ -66,6 +68,13 @@ impl Timer {
 
                 let bpm = bpm_atomic.load(Ordering::Relaxed) as f64 / 100.0;
                 let ppqn = ppqn_atomic.load(Ordering::Relaxed);
+                // Both are clamped at write time, but guard here to avoid
+                // a Division-by-zero / inf panic if atomics are ever written
+                // directly in tests or future code.
+                if bpm <= 0.0 || ppqn == 0 {
+                    std::thread::sleep(Duration::from_millis(100));
+                    continue;
+                }
 
                 let tick_secs = 60.0 / (bpm * ppqn as f64);
                 let duration = Duration::from_secs_f64(tick_secs);
