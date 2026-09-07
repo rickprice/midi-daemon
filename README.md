@@ -171,17 +171,17 @@ or recovering from a UI desync):
 ```bash
 systemctl --user reload midi-daemon
 # or equivalently:
-midi-daemon --resync
+midi-daemon resync
 ```
 
 Force an immediate reload of `config.toml` and all route scripts (without restarting):
 ```bash
-midi-daemon --reload
+midi-daemon reload
 ```
 
 Show a brief status report from the running daemon:
 ```bash
-midi-daemon --status
+midi-daemon status
 ```
 
 ### System-wide
@@ -203,9 +203,9 @@ with the updated configuration automatically (no restart needed).
 systemctl stop    midi-daemon   # graceful stop (saves persisted state)
 systemctl restart midi-daemon
 systemctl reload  midi-daemon   # resync all route params
-midi-daemon --resync            # equivalent to the above
-midi-daemon --reload            # force reload config + all routes
-midi-daemon --status            # show status report
+midi-daemon resync              # equivalent to the above
+midi-daemon reload              # force reload config + all routes
+midi-daemon status              # show status report
 ```
 
 ## Daemon control
@@ -213,9 +213,9 @@ midi-daemon --status            # show status report
 | Action | systemd (user) | systemd (system) | CLI |
 |--------|---------------|-----------------|-----|
 | Graceful stop | `systemctl --user stop midi-daemon` | `systemctl stop midi-daemon` | *(SIGTERM)* |
-| Resync params | `systemctl --user reload midi-daemon` | `systemctl reload midi-daemon` | `midi-daemon --resync` |
-| Reload config + routes | — | — | `midi-daemon --reload` |
-| Show status | — | — | `midi-daemon --status` |
+| Resync params | `systemctl --user reload midi-daemon` | `systemctl reload midi-daemon` | `midi-daemon resync` |
+| Reload config + routes | — | — | `midi-daemon reload` |
+| Show status | — | — | `midi-daemon status` |
 
 ### Startup flags
 
@@ -273,12 +273,12 @@ systemd system service unit add:
 ExecStartPost=/bin/chgrp audio /run/midi-daemon/control.sock
 ```
 
-Users in the `audio` group can then run `--resync`, `--reload`, and
-`--status` without `sudo`. A non-root user attempting to connect to a
+Users in the `audio` group can then run `midi-daemon resync`, `reload`, and
+`status` without `sudo`. A non-root user attempting to connect to a
 root daemon without the necessary group membership will get a clear
 permission error rather than a confusing "daemon not found."
 
-### `--resync`
+### `resync`
 
 Causes every route to re-apply its current OSC param values:
 
@@ -293,12 +293,12 @@ when a UI panel has gotten out of sync with the daemon.
 ```bash
 # Both equivalent:
 systemctl --user reload midi-daemon
-midi-daemon --resync
+midi-daemon resync
 ```
 
 SIGUSR1 is still accepted for backward compatibility with existing scripts.
 
-### `--reload`
+### `reload`
 
 Forces an immediate reload of `config.toml` and all route scripts without
 restarting the daemon. Equivalent to touching all watched files at once —
@@ -306,10 +306,10 @@ useful when inotify misses a change, or when deploying new route files and
 wanting to force a clean reload in one step.
 
 ```bash
-midi-daemon --reload
+midi-daemon reload
 ```
 
-### `--status`
+### `status`
 
 Prints a brief status report from the running daemon:
 
