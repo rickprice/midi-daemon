@@ -451,7 +451,7 @@ fn handle_route_changed(
 }
 
 fn handle_config_changed(
-    routes_dir: &PathBuf,
+    routes_dir: &Path,
     config: &mut Arc<Config>,
     routes: &Arc<Mutex<HashMap<String, Route>>>,
     conn_mgr: &Arc<ConnectionManager>,
@@ -461,7 +461,7 @@ fn handle_config_changed(
     info!("config.toml changed — reloading");
     match config.reload() {
         Ok(new_cfg) => {
-            if new_cfg.routes_dir != *routes_dir {
+            if new_cfg.routes_dir != routes_dir {
                 warn!(
                     "routes_dir changed in config.toml — restart the daemon for this to take effect"
                 );
@@ -477,7 +477,7 @@ fn handle_config_changed(
 }
 
 fn reload_all_routes(
-    dir: &PathBuf,
+    dir: &Path,
     config: Arc<Config>,
     routes: Arc<Mutex<HashMap<String, Route>>>,
     conn_mgr: Arc<ConnectionManager>,
@@ -501,7 +501,7 @@ fn reload_all_routes(
 }
 
 async fn load_all_routes(
-    dir: &PathBuf,
+    dir: &Path,
     config: Arc<Config>,
     routes: Arc<Mutex<HashMap<String, Route>>>,
     conn_mgr: Arc<ConnectionManager>,
