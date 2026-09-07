@@ -189,7 +189,9 @@ impl Route {
     ) -> impl Fn(SocketAddr, String, Vec<rosc::OscType>) + Send + 'static {
         let tx = self.osc_tx.clone();
         move |from: SocketAddr, address: String, args: Vec<rosc::OscType>| {
-            let _ = tx.blocking_send(RouteEvent::Osc { from, address, args });
+            if tx.try_send(RouteEvent::Osc { from, address, args }).is_err() {
+                warn!("OSC message dropped: route event channel full or closed");
+            }
         }
     }
 }
