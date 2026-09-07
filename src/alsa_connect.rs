@@ -23,6 +23,12 @@ pub struct ConnectionManager {
     specs: Arc<Mutex<Vec<PortSpec>>>,
 }
 
+impl Default for ConnectionManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ConnectionManager {
     pub fn new() -> Self {
         ConnectionManager { specs: Arc::new(Mutex::new(Vec::new())) }
