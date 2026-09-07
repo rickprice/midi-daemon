@@ -97,14 +97,16 @@ impl ConnectionManager {
 
     /// Spawn a background thread that watches for new ALSA ports and connects them.
     pub fn spawn_watcher(self: Arc<Self>) {
-        std::thread::Builder::new()
+        if let Err(e) = std::thread::Builder::new()
             .name("alsa-port-watcher".into())
             .spawn(move || {
                 if let Err(e) = watch_loop(&self) {
                     warn!("ALSA port watcher stopped: {}", e);
                 }
             })
-            .ok();
+        {
+            warn!("Failed to spawn ALSA port watcher thread: {}", e);
+        }
     }
 }
 
