@@ -1411,4 +1411,94 @@ mod tests {
         ps.dispatch_midi(&lua, &msg).unwrap();
         assert_lua(&lua, r#"assert(vel == 100, "expected velocity 100, got " .. tostring(vel))"#);
     }
+
+    // ── resync ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn resync_calls_set_with_current_get_value() {
+        let lua = make_lua();
+        lua.globals().set("v", 42i64).unwrap();
+        lua.globals().set("set_count", 0i64).unwrap();
+        let mut ps = make_ps(&lua, "/p");
+        let get_fn: LuaFunction = lua.load("function() return v end").eval().unwrap();
+        let set_fn: LuaFunction = lua.load("function(x) v = x; set_count = set_count + 1 end").eval().unwrap();
+        ps.add_param(&lua, "x".to_string(), Some(get_fn), Some(set_fn)).unwrap();
+
+        ps.resync(&lua).unwrap();
+
+        assert_lua(&lua, r#"assert(v == 42, "resync should preserve current value")"#);
+        assert_lua(&lua, r#"assert(set_count == 1, "set should be called once")"#);
+    }
+
+    #[test]
+    fn resync_notifies_subscribers_with_post_set_value() {
+        let lua = make_lua();
+        lua.globals().set("bpm", 150i64).unwrap();
+        let mut ps = make_ps(&lua, "/p");
+        let get_fn: LuaFunction = lua.load("function() return bpm end").eval().unwrap();
+        let set_fn: LuaFunction = lua.load("function(v) bpm = math.max(20, math.min(200, v)) end").eval().unwrap();
+        ps.add_param(&lua, "bpm".to_string(), Some(get_fn), Some(set_fn)).unwrap();
+
+        let sub = make_msg(&lua, "/p/subscribe", "1.2.3.4:9001", "");
+        ps.dispatch(&lua, &sub).unwrap();
+        assert_lua(&lua, "clear()");
+
+        ps.resync(&lua).unwrap();
+
+        assert_lua(
+            &lua,
+            r#"
+            local notified = false
+            for _, s in ipairs(_sent) do
+                if s[1] == "1.2.3.4:9001" and s[2] == "/p/bpm" and s[3] == 150 then
+                    notified = true
+                end
+            end
+            assert(notified, "subscriber should receive current value on resync")
+            "#,
+        );
+    }
+
+    #[test]
+    fn resync_skips_params_without_get() {
+        let lua = make_lua();
+        lua.globals().set("called", false).unwrap();
+        let mut ps = make_ps(&lua, "/p");
+        let set_fn: LuaFunction = lua.load("function() called = true end").eval().unwrap();
+        ps.add_param(&lua, "cmd".to_string(), None, Some(set_fn)).unwrap();
+
+        ps.resync(&lua).unwrap();
+
+        assert_lua(&lua, r#"assert(not called, "set-only param must not be called by resync")"#);
+    }
+
+    #[test]
+    fn resync_skips_params_without_set() {
+        let lua = make_lua();
+        let mut ps = make_ps(&lua, "/p");
+        let get_fn: LuaFunction = lua.load("function() return 1 end").eval().unwrap();
+        ps.add_param(&lua, "ro".to_string(), Some(get_fn), None).unwrap();
+
+        let sub = make_msg(&lua, "/p/subscribe", "1.2.3.4:9001", "");
+        ps.dispatch(&lua, &sub).unwrap();
+        assert_lua(&lua, "clear()");
+
+        ps.resync(&lua).unwrap();
+
+        assert_lua(&lua, r#"assert(#_sent == 0, "read-only param must not trigger notification on resync")"#);
+    }
+
+    #[test]
+    fn resync_no_subscribers_does_not_send() {
+        let lua = make_lua();
+        lua.globals().set("v", 10i64).unwrap();
+        let mut ps = make_ps(&lua, "/p");
+        let get_fn: LuaFunction = lua.load("function() return v end").eval().unwrap();
+        let set_fn: LuaFunction = lua.load("function(x) v = x end").eval().unwrap();
+        ps.add_param(&lua, "x".to_string(), Some(get_fn), Some(set_fn)).unwrap();
+
+        ps.resync(&lua).unwrap();
+
+        assert_lua(&lua, r#"assert(#_sent == 0, "no sends when no subscribers")"#);
+    }
 }

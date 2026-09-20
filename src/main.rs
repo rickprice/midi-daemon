@@ -37,7 +37,7 @@ type OscDispatch =
 fn register_route_osc(dispatch: &OscDispatch, name: &str, route: &Route) {
     dispatch
         .lock()
-        .unwrap()
+        .unwrap_or_else(|p| p.into_inner())
         .insert(name.to_string(), Box::new(route.make_osc_injector()));
 }
 

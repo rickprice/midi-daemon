@@ -799,8 +799,8 @@ fn run_lua_event_loop(
 
     // Subscriber address cache: updated after every osc_param_set dispatch/tick so the
     // send_osc closure can fan out to subscribers when no named target is configured.
-    let subs_cache: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
-        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let subs_cache: Arc<Mutex<Vec<String>>> =
+        Arc::new(Mutex::new(Vec::new()));
 
     // --- Expose `send_osc` ---
     //
@@ -809,7 +809,7 @@ fn run_lua_event_loop(
     //   send_osc("name", "/addr", v…)  named target
     //   send_osc("ip:port", "/addr", v…)  ad-hoc address (subscriber replies, notifications)
     {
-        let subs_cache_for_send = std::sync::Arc::clone(&subs_cache);
+        let subs_cache_for_send = Arc::clone(&subs_cache);
         let f = lua.create_function(move |_, args: LuaMultiValue| -> LuaResult<()> {
             let sender = match &osc_sender {
                 Some(s) => s,
