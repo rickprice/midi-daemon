@@ -6,13 +6,25 @@ Drop in or edit a `.lua` file and the daemon hot-reloads it automatically.
 
 ## Requirements
 
-- Rust (stable)
+- Rust 1.85 or later (the crate uses the Rust 2024 edition)
 - ALSA development headers: `sudo pacman -S alsa-lib`
 
 ## Build
 
 ```bash
 cargo build --release
+```
+
+### Nix dev shell
+
+The repo ships a `flake.nix` dev shell with the correct Rust toolchain,
+`clippy`, `rustfmt`, and the ALSA headers pre-configured:
+
+```bash
+nix develop          # enter the shell
+cargo build          # build inside it
+cargo clippy         # lint
+cargo test           # run tests
 ```
 
 ## Install
@@ -536,6 +548,10 @@ reflected on connected TouchOSC / Lemur panels.
 
 `on_midi` and `on_osc` are still called after param dispatch and can coexist
 with params for any logic that doesn't map cleanly to a single parameter.
+
+The UDP receive loop retries automatically on transient socket errors (with a
+1-second back-off), so a temporary network hiccup does not permanently stop
+the listener.
 
 **Automatically handled OSC addresses** (no entries needed in `params`):
 
