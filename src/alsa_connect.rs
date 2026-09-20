@@ -40,7 +40,7 @@ impl ConnectionManager {
         let is_default = decl.is_default();
         let base = prefix.clone();
 
-        let mut specs = self.specs.lock().unwrap();
+        let mut specs = self.specs.lock().unwrap_or_else(|p| p.into_inner());
         specs.retain(|s| !s.our_client_name.starts_with(&prefix));
 
         for port_name in &decl.inputs {
@@ -87,14 +87,14 @@ impl ConnectionManager {
     /// Remove all specs for a route (called when it is deleted).
     pub fn unregister_route(&self, route_name: &str) {
         let prefix = format!("midi-daemon:{}", route_name);
-        self.specs.lock().unwrap().retain(|s| !s.our_client_name.starts_with(&prefix));
+        self.specs.lock().unwrap_or_else(|p| p.into_inner()).retain(|s| !s.our_client_name.starts_with(&prefix));
     }
 
     /// Scan all current ALSA ports and apply matching connections.
     pub fn apply_all(&self) {
         match open_seq() {
             Ok(seq) => {
-                let specs = self.specs.lock().unwrap();
+                let specs = self.specs.lock().unwrap_or_else(|p| p.into_inner());
                 apply_connections(&seq, &specs);
             }
             Err(e) => warn!("auto-connect: failed to open ALSA seq: {}", e),
@@ -271,7 +271,7 @@ fn watch_loop(mgr: &Arc<ConnectionManager>) -> Result<()> {
             debug!("new ALSA port: {}:{}", addr.client, addr.port);
             // Small delay so the port is fully registered before we query it.
             std::thread::sleep(std::time::Duration::from_millis(100));
-            let specs = mgr.specs.lock().unwrap();
+            let specs = mgr.specs.lock().unwrap_or_else(|p| p.into_inner());
             connect_new_port(&conn_seq, &specs, addr);
         }
     }
@@ -282,11 +282,11 @@ fn watch_loop(mgr: &Arc<ConnectionManager>) -> Result<()> {
 #[cfg(test)]
 impl ConnectionManager {
     fn spec_count(&self) -> usize {
-        self.specs.lock().unwrap().len()
+        self.specs.lock().unwrap_or_else(|p| p.into_inner()).len()
     }
 
     fn spec_client_names(&self) -> Vec<String> {
-        let mut names: Vec<String> = self.specs.lock().unwrap()
+        let mut names: Vec<String> = self.specs.lock().unwrap_or_else(|p| p.into_inner())
             .iter().map(|s| s.our_client_name.clone()).collect();
         names.sort();
         names
@@ -294,13 +294,13 @@ impl ConnectionManager {
 
     /// Returns `Some(true)` if the spec is an Input direction, `Some(false)` for Output.
     fn spec_dir_is_input(&self, client_name: &str) -> Option<bool> {
-        self.specs.lock().unwrap().iter()
+        self.specs.lock().unwrap_or_else(|p| p.into_inner()).iter()
             .find(|s| s.our_client_name == client_name)
             .map(|s| s.dir == ConnDir::Input)
     }
 
     fn spec_pattern(&self, client_name: &str) -> Option<String> {
-        self.specs.lock().unwrap().iter()
+        self.specs.lock().unwrap_or_else(|p| p.into_inner()).iter()
             .find(|s| s.our_client_name == client_name)
             .map(|s| s.pattern.as_str().to_string())
     }

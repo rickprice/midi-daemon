@@ -80,8 +80,8 @@ impl OscReceiver {
                         continue;
                     }
                     Err(e) => {
-                        warn!("OSC receive error: {}", e);
-                        break;
+                        warn!("OSC receive error: {}; retrying in 1s", e);
+                        std::thread::sleep(Duration::from_secs(1));
                     }
                 }
             }

@@ -42,7 +42,7 @@ fn register_route_osc(dispatch: &OscDispatch, name: &str, route: &Route) {
 }
 
 fn unregister_route_osc(dispatch: &OscDispatch, name: &str) {
-    dispatch.lock().unwrap().remove(name);
+    dispatch.lock().unwrap_or_else(|p| p.into_inner()).remove(name);
 }
 
 /// Bind a UDP port and dispatch incoming packets to routes by address prefix
@@ -58,7 +58,7 @@ fn start_osc_receiver(port: u16, dispatch: OscDispatch) -> Option<osc::OscReceiv
             warn!("OSC: ignoring message with empty route prefix: '{}'", address);
             return;
         }
-        let guard = dispatch.lock().unwrap();
+        let guard = dispatch.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(inject) = guard.get(route_name) {
             inject(from, address, args);
         } else {
@@ -203,7 +203,12 @@ fn graceful_shutdown(routes: &Rc<RefCell<HashMap<String, Route>>>) {
         .filter_map(|r| r.shutdown())
         .collect();
     for h in handles {
-        let _ = h.join();
+        if let Err(e) = h.join() {
+            let msg = e.downcast_ref::<&str>().copied()
+                .or_else(|| e.downcast_ref::<String>().map(String::as_str))
+                .unwrap_or("(unknown panic payload)");
+            warn!("Route thread panicked during shutdown: {}", msg);
+        }
     }
     info!("All routes shut down");
 }

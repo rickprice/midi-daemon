@@ -122,7 +122,7 @@ impl RoutePorts {
                 .create_virtual(
                     &alsa_name,
                     move |_stamp, message, _| {
-                        let guard = fwd_ref.lock().unwrap();
+                        let guard = fwd_ref.lock().unwrap_or_else(|p| p.into_inner());
                         if let Some(tx) = guard.as_ref()
                             && tx.try_send(RouteEvent::Midi {
                                 port: port_name_owned.clone(),
@@ -150,7 +150,7 @@ impl RoutePorts {
     /// Point all input callbacks at a new event channel (used on hot-reload).
     fn redirect_inputs(&self, new_tx: &mpsc::Sender<RouteEvent>) {
         for fwd in self.midi_fwds.values() {
-            *fwd.lock().unwrap() = Some(new_tx.clone());
+            *fwd.lock().unwrap_or_else(|p| p.into_inner()) = Some(new_tx.clone());
         }
     }
 }
@@ -731,7 +731,7 @@ fn run_lua_event_loop(
             match out_conns.get(&port_name) {
                 Some(conn) => match lua_to_midi_bytes(&msg_table) {
                     Ok(bytes) => {
-                        if let Err(e) = conn.lock().unwrap().send(&bytes) {
+                        if let Err(e) = conn.lock().unwrap_or_else(|p| p.into_inner()).send(&bytes) {
                             warn!("MIDI send error on port '{}': {}", port_name, e);
                         }
                     }
@@ -861,7 +861,7 @@ fn run_lua_event_loop(
                     (t, first, 1usize)
                 } else if sender.targets.is_empty() {
                     // No named target: send to all live subscribers instead.
-                    let subs: Vec<String> = subs_cache_for_send.lock().unwrap().clone();
+                    let subs: Vec<String> = subs_cache_for_send.lock().unwrap_or_else(|p| p.into_inner()).clone();
                     if !subs.is_empty() {
                         let osc_args = args.into_iter().skip(1)
                             .map(|v| lua_val_to_osc_type(&v))
@@ -989,7 +989,7 @@ fn run_lua_event_loop(
                     if let Err(e) = ps.tick(&lua) {
                         warn!("[{}] osc_params tick error: {}", name, e);
                     }
-                    *subs_cache.lock().unwrap() = ps.subscriber_addrs();
+                    *subs_cache.lock().unwrap_or_else(|p| p.into_inner()) = ps.subscriber_addrs();
                 }
                 if let Some(ref on_tick) = on_tick_fn
                     && let Err(e) = on_tick.call::<()>((tick, bpm, ppqn)) {
@@ -1004,7 +1004,7 @@ fn run_lua_event_loop(
                             if let Err(e) = ps.dispatch(&lua, &msg) {
                                 warn!("[{}] osc_params dispatch error: {}", name, e);
                             }
-                            *subs_cache.lock().unwrap() = ps.subscriber_addrs();
+                            *subs_cache.lock().unwrap_or_else(|p| p.into_inner()) = ps.subscriber_addrs();
                         }
                         if let Some(ref on_osc) = on_osc_fn {
                             if let Err(e) = on_osc.call::<()>(msg) {
