@@ -959,7 +959,7 @@ fn run_lua_event_loop(
             });
 
     // --- Restore persisted state ---
-    if let (Some(ref ps), Some(ref path)) = (&osc_param_set, &state_file) {
+    if let (Some(ps), Some(path)) = (&osc_param_set, &state_file) {
         ps.load_state(&lua, path);
     }
 
@@ -1043,7 +1043,7 @@ fn run_lua_event_loop(
     }
 
     // --- Persist state on shutdown ---
-    if let (Some(ref ps), Some(ref path)) = (&osc_param_set, &state_file) {
+    if let (Some(ps), Some(path)) = (&osc_param_set, &state_file) {
         if let Err(e) = ps.save_state(&lua, path) {
             warn!("[{}] Failed to save route state: {}", name, e);
         }
