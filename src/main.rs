@@ -10,9 +10,11 @@ mod timer;
 use clap::Parser;
 use anyhow::{Context as _, Result};
 use notify::{Event, EventKind, RecursiveMode, Watcher};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
@@ -92,11 +94,11 @@ fn needed_osc_ports(config: &Config, routes: &HashMap<String, Route>) -> HashSet
 /// Ensure exactly one receiver is running for each needed port.
 fn sync_osc_receivers(
     config: &Config,
-    routes: &Arc<Mutex<HashMap<String, Route>>>,
+    routes: &Rc<RefCell<HashMap<String, Route>>>,
     receivers: &mut HashMap<u16, osc::OscReceiver>,
     dispatch: &OscDispatch,
 ) {
-    let needed = needed_osc_ports(config, &routes.lock().unwrap());
+    let needed = needed_osc_ports(config, &routes.borrow());
     for &port in &needed {
         if let std::collections::hash_map::Entry::Vacant(e) = receivers.entry(port)
             && let Some(rx) = start_osc_receiver(port, Arc::clone(dispatch)) {
@@ -194,11 +196,8 @@ async fn do_control_cmd(cmd: &str) -> Result<()> {
 
 /// Send a `Shutdown` command to every route and wait for their event-loop
 /// threads to finish (which includes saving persisted state).
-fn graceful_shutdown(routes: &Arc<Mutex<HashMap<String, Route>>>) {
-    let to_shutdown: Vec<Route> = {
-        let mut guard = routes.lock().unwrap();
-        guard.drain().map(|(_, r)| r).collect()
-    };
+fn graceful_shutdown(routes: &Rc<RefCell<HashMap<String, Route>>>) {
+    let to_shutdown: Vec<Route> = routes.borrow_mut().drain().map(|(_, r)| r).collect();
     let handles: Vec<std::thread::JoinHandle<()>> = to_shutdown
         .into_iter()
         .filter_map(|r| r.shutdown())
@@ -271,8 +270,8 @@ async fn main() -> Result<()> {
     let _ctrl_socket = start_control_socket(&config::control_socket_path(), ctrl_tx)?;
 
     // Map of route name -> Route handle.
-    let routes: Arc<Mutex<HashMap<String, Route>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    let routes: Rc<RefCell<HashMap<String, Route>>> =
+        Rc::new(RefCell::new(HashMap::new()));
 
     let conn_mgr = Arc::new(ConnectionManager::new());
     Arc::clone(&conn_mgr).spawn_watcher();
@@ -282,7 +281,7 @@ async fn main() -> Result<()> {
     load_all_routes(
         &routes_dir,
         Arc::clone(&config),
-        Arc::clone(&routes),
+        Rc::clone(&routes),
         Arc::clone(&conn_mgr),
         Arc::clone(&osc_dispatch),
     ).await?;
@@ -347,8 +346,7 @@ async fn main() -> Result<()> {
             }
             _ = sigusr1.recv() => {
                 info!("Received SIGUSR1 — resyncing all route params");
-                let guard = routes.lock().unwrap();
-                for (name, route) in guard.iter() {
+                for (name, route) in routes.borrow().iter() {
                     route.send_resync();
                     debug!("Queued resync for route '{}'", name);
                 }
@@ -357,8 +355,7 @@ async fn main() -> Result<()> {
                 match cmd {
                     ControlCmd::Resync { reply } => {
                         info!("Control: resync");
-                        let guard = routes.lock().unwrap();
-                        for (name, route) in guard.iter() {
+                        for (name, route) in routes.borrow().iter() {
                             route.send_resync();
                             debug!("Queued resync for route '{}'", name);
                         }
@@ -374,7 +371,7 @@ async fn main() -> Result<()> {
                     }
                     ControlCmd::Status { reply } => {
                         let mut route_names: Vec<String> =
-                            routes.lock().unwrap().keys().cloned().collect();
+                            routes.borrow().keys().cloned().collect();
                         route_names.sort();
                         let mut ports: Vec<u16> = osc_receivers.keys().copied().collect();
                         ports.sort_unstable();
@@ -424,7 +421,7 @@ async fn main() -> Result<()> {
 fn handle_route_changed(
     path: &Path,
     config: &Arc<Config>,
-    routes: &Arc<Mutex<HashMap<String, Route>>>,
+    routes: &Rc<RefCell<HashMap<String, Route>>>,
     conn_mgr: &Arc<ConnectionManager>,
     osc_dispatch: &OscDispatch,
     osc_receivers: &mut HashMap<u16, osc::OscReceiver>,
@@ -436,20 +433,20 @@ fn handle_route_changed(
 
     if path.exists() {
         info!("Detected change in {}.lua — reloading", name);
-        let old_ports = routes.lock().unwrap().get(&name).map(|r| r.ports_arc());
+        let old_ports = routes.borrow().get(&name).map(|r| r.ports_rc());
         match Route::start(path, Arc::clone(config), old_ports) {
             Ok(route) => {
                 conn_mgr.register_route(&name, route.port_decl(), &route.connect_decl);
                 conn_mgr.apply_all();
                 register_route_osc(osc_dispatch, &name, &route);
-                routes.lock().unwrap().insert(name.clone(), route);
+                routes.borrow_mut().insert(name.clone(), route);
                 sync_osc_receivers(config, routes, osc_receivers, osc_dispatch);
                 info!("Reloaded route: {}", name);
             }
             Err(e) => error!("Failed to reload route {}: {}", name, e),
         }
     } else {
-        routes.lock().unwrap().remove(&name);
+        routes.borrow_mut().remove(&name);
         conn_mgr.unregister_route(&name);
         unregister_route_osc(osc_dispatch, &name);
         sync_osc_receivers(config, routes, osc_receivers, osc_dispatch);
@@ -460,7 +457,7 @@ fn handle_route_changed(
 fn handle_config_changed(
     routes_dir: &Path,
     config: &mut Arc<Config>,
-    routes: &Arc<Mutex<HashMap<String, Route>>>,
+    routes: &Rc<RefCell<HashMap<String, Route>>>,
     conn_mgr: &Arc<ConnectionManager>,
     osc_dispatch: &OscDispatch,
     osc_receivers: &mut HashMap<u16, osc::OscReceiver>,
@@ -474,7 +471,7 @@ fn handle_config_changed(
                 );
             }
             *config = Arc::new(new_cfg);
-            reload_all_routes(routes_dir, Arc::clone(config), Arc::clone(routes),
+            reload_all_routes(routes_dir, Arc::clone(config), Rc::clone(routes),
                                Arc::clone(conn_mgr), Arc::clone(osc_dispatch));
             sync_osc_receivers(config, routes, osc_receivers, osc_dispatch);
             info!("Config reloaded");
@@ -486,19 +483,19 @@ fn handle_config_changed(
 fn reload_all_routes(
     dir: &Path,
     config: Arc<Config>,
-    routes: Arc<Mutex<HashMap<String, Route>>>,
+    routes: Rc<RefCell<HashMap<String, Route>>>,
     conn_mgr: Arc<ConnectionManager>,
     osc_dispatch: OscDispatch,
 ) {
-    let names: Vec<String> = routes.lock().unwrap().keys().cloned().collect();
+    let names: Vec<String> = routes.borrow().keys().cloned().collect();
     for name in names {
         let path = dir.join(format!("{}.lua", name));
-        let old_ports = routes.lock().unwrap().get(&name).map(|r| r.ports_arc());
+        let old_ports = routes.borrow().get(&name).map(|r| r.ports_rc());
         match Route::start(&path, Arc::clone(&config), old_ports) {
             Ok(route) => {
                 conn_mgr.register_route(&name, route.port_decl(), &route.connect_decl);
                 register_route_osc(&osc_dispatch, &name, &route);
-                routes.lock().unwrap().insert(name.clone(), route);
+                routes.borrow_mut().insert(name.clone(), route);
                 info!("Reloaded route '{}' with new config", name);
             }
             Err(e) => error!("Failed to reload route '{}': {}", name, e),
@@ -510,7 +507,7 @@ fn reload_all_routes(
 async fn load_all_routes(
     dir: &Path,
     config: Arc<Config>,
-    routes: Arc<Mutex<HashMap<String, Route>>>,
+    routes: Rc<RefCell<HashMap<String, Route>>>,
     conn_mgr: Arc<ConnectionManager>,
     osc_dispatch: OscDispatch,
 ) -> Result<()> {
@@ -528,7 +525,7 @@ async fn load_all_routes(
     };
 
     {
-        let mut map = routes.lock().unwrap();
+        let mut map = routes.borrow_mut();
         for entry in entries {
             let entry = entry?;
             let path = entry.path();

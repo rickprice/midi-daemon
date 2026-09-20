@@ -5,6 +5,7 @@ use mlua::prelude::*;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::Path;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
@@ -77,7 +78,7 @@ impl RoutePorts {
         route_name: &str,
         decl: &PortDecl,
         initial_tx: mpsc::Sender<RouteEvent>,
-    ) -> Result<Arc<Self>> {
+    ) -> Result<Rc<Self>> {
         let base = format!("midi-daemon:{}", route_name);
         let is_default = decl.is_default();
 
@@ -138,7 +139,7 @@ impl RoutePorts {
             in_conns.push(in_conn);
         }
 
-        Ok(Arc::new(RoutePorts {
+        Ok(Rc::new(RoutePorts {
             out_conns,
             midi_fwds,
             _in_conns: in_conns,
@@ -157,7 +158,7 @@ impl RoutePorts {
 /// A running route: owns its MIDI ports, Lua VM, timer, and OSC sockets.
 /// Dropping this stops everything cleanly.
 pub struct Route {
-    ports: Arc<RoutePorts>,
+    ports: Rc<RoutePorts>,
     _timer: Arc<Timer>,
     thread: Option<std::thread::JoinHandle<()>>,
     /// Sender into the route's event channel, used by the global OSC dispatcher.
@@ -200,8 +201,8 @@ impl Route {
 impl Route {
     /// Return a clone of the ports Arc so the caller can pass them to a new Route::start
     /// without consuming (and stopping) this route first.
-    pub fn ports_arc(&self) -> Arc<RoutePorts> {
-        Arc::clone(&self.ports)
+    pub fn ports_rc(&self) -> Rc<RoutePorts> {
+        Rc::clone(&self.ports)
     }
 
     pub fn port_decl(&self) -> &PortDecl {
@@ -211,7 +212,7 @@ impl Route {
     pub fn start(
         lua_path: &Path,
         config: Arc<Config>,
-        existing_ports: Option<Arc<RoutePorts>>,
+        existing_ports: Option<Rc<RoutePorts>>,
     ) -> Result<Self> {
         let name = lua_path
             .file_stem()
@@ -332,10 +333,7 @@ impl Route {
                 out_conns_for_thread,
                 default_out,
                 timer_for_thread,
-                route_cfg,
-                osc_sender,
-                osc_heartbeat_interval,
-                state_file,
+                RouteThreadArgs { route_cfg, osc_sender, osc_heartbeat_interval, state_file },
             ) {
                 error!("Route '{}' event loop error: {}", name_for_thread, e);
             }
@@ -663,6 +661,13 @@ fn parse_port_decl_from_toml(cfg: &toml::Table) -> Option<PortDecl> {
 
 // ── Lua event loop ────────────────────────────────────────────────────────────
 
+struct RouteThreadArgs {
+    route_cfg: Option<toml::Table>,
+    osc_sender: Option<OscSender>,
+    osc_heartbeat_interval: f64,
+    state_file: Option<std::path::PathBuf>,
+}
+
 fn run_lua_event_loop(
     name: &str,
     script: &str,
@@ -670,11 +675,9 @@ fn run_lua_event_loop(
     out_conns: HashMap<String, Arc<Mutex<MidiOutputConnection>>>,
     default_out: String,
     timer: Arc<Timer>,
-    route_cfg: Option<toml::Table>,
-    osc_sender: Option<OscSender>,
-    osc_heartbeat_interval: f64,
-    state_file: Option<std::path::PathBuf>,
+    args: RouteThreadArgs,
 ) -> Result<()> {
+    let RouteThreadArgs { route_cfg, osc_sender, osc_heartbeat_interval, state_file } = args;
     let lua = Lua::new();
 
     // --- Expose `send(msg)` or `send(port_name, msg)` ---
