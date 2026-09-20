@@ -23,7 +23,7 @@ fn toml_value_to_lua(lua: &Lua, value: &toml::Value) -> LuaResult<LuaValue> {
             Ok(LuaValue::Table(t))
         }
         toml::Value::Table(tbl) => Ok(LuaValue::Table(toml_table_to_lua(lua, tbl)?)),
-        toml::Value::Datetime(dt) => Ok(LuaValue::String(lua.create_string(&dt.to_string())?)),
+        toml::Value::Datetime(dt) => Ok(LuaValue::String(lua.create_string(dt.to_string())?)),
     }
 }
 

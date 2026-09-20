@@ -266,14 +266,13 @@ fn watch_loop(mgr: &Arc<ConnectionManager>) -> Result<()> {
             (ev.get_type(), ev.get_data::<Addr>())
         };
 
-        if ev_type == EventType::PortStart {
-            if let Some(addr) = addr {
-                debug!("new ALSA port: {}:{}", addr.client, addr.port);
-                // Small delay so the port is fully registered before we query it.
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                let specs = mgr.specs.lock().unwrap();
-                connect_new_port(&conn_seq, &specs, addr);
-            }
+        if ev_type == EventType::PortStart
+            && let Some(addr) = addr {
+            debug!("new ALSA port: {}:{}", addr.client, addr.port);
+            // Small delay so the port is fully registered before we query it.
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let specs = mgr.specs.lock().unwrap();
+            connect_new_port(&conn_seq, &specs, addr);
         }
     }
 }

@@ -2,7 +2,6 @@ use anyhow::Result;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use libc;
 
 /// Public config — fully resolved (no Option fields).
 #[derive(Debug, Clone)]
@@ -146,10 +145,9 @@ pub fn control_socket_path() -> PathBuf {
         return PathBuf::from(dir).join("midi-daemon/control.sock");
     }
     // Only use the cache dir if the home directory actually exists and is usable.
-    if let Some(cache) = dirs::cache_dir() {
-        if cache.parent().map_or(false, |p| p.exists()) {
-            return cache.join("midi-daemon/control.sock");
-        }
+    if let Some(cache) = dirs::cache_dir()
+        && cache.parent().is_some_and(|p| p.exists()) {
+        return cache.join("midi-daemon/control.sock");
     }
     PathBuf::from("/tmp/midi-daemon.sock")
 }
@@ -175,7 +173,7 @@ impl Config {
         let home = dirs::home_dir();
         let home_usable = home
             .as_deref()
-            .map_or(false, |h| h.exists() && h != std::path::Path::new("/var/empty"));
+            .is_some_and(|h| h.exists() && h != std::path::Path::new("/var/empty"));
         if !home_usable {
             return system_cache_dir();
         }

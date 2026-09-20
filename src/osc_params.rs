@@ -370,10 +370,9 @@ impl OscParamSet {
                 if let Err(e) = send_osc.call::<()>((from.as_str(), addr.as_str(), value)) {
                     warn!("OscParamSet query reply: {}", e);
                 }
-            } else if let Some(f) = set_fn {
-                if let Err(e) = f.call::<()>(()) {
-                    warn!("OscParamSet no-arg trigger: {}", e);
-                }
+            } else if let Some(f) = set_fn
+                && let Err(e) = f.call::<()>(()) {
+                warn!("OscParamSet no-arg trigger: {}", e);
             }
         } else {
             // Args present: set(args...), then notify all subscribers via get().
@@ -568,10 +567,9 @@ impl OscParamSet {
                     if let Some(set_key) = &param.set {
                         match lua.registry_value::<LuaFunction>(set_key) {
                             Ok(set_fn) => {
-                                if let Some(lua_val) = toml_to_lua_val(lua, value) {
-                                    if let Err(e) = set_fn.call::<()>(lua_val) {
-                                        warn!("load_state set '{}': {}", name, e);
-                                    }
+                                if let Some(lua_val) = toml_to_lua_val(lua, value)
+                                    && let Err(e) = set_fn.call::<()>(lua_val) {
+                                    warn!("load_state set '{}': {}", name, e);
                                 }
                             }
                             Err(e) => warn!("load_state registry '{}': {}", name, e),

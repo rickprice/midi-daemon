@@ -98,10 +98,9 @@ fn sync_osc_receivers(
 ) {
     let needed = needed_osc_ports(config, &routes.lock().unwrap());
     for &port in &needed {
-        if !receivers.contains_key(&port) {
-            if let Some(rx) = start_osc_receiver(port, Arc::clone(dispatch)) {
-                receivers.insert(port, rx);
-            }
+        if let std::collections::hash_map::Entry::Vacant(e) = receivers.entry(port)
+            && let Some(rx) = start_osc_receiver(port, Arc::clone(dispatch)) {
+            e.insert(rx);
         }
     }
     receivers.retain(|p, _| needed.contains(p));
@@ -171,10 +170,9 @@ async fn handle_control_conn(stream: tokio::net::UnixStream, tx: mpsc::Sender<Co
             return;
         }
     };
-    if tx.send(cmd).await.is_ok() {
-        if let Ok(response) = reply_rx.await {
-            let _ = write_half.write_all(response.as_bytes()).await;
-        }
+    if tx.send(cmd).await.is_ok()
+        && let Ok(response) = reply_rx.await {
+        let _ = write_half.write_all(response.as_bytes()).await;
     }
 }
 

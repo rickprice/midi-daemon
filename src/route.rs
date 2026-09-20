@@ -122,13 +122,12 @@ impl RoutePorts {
                     &alsa_name,
                     move |_stamp, message, _| {
                         let guard = fwd_ref.lock().unwrap();
-                        if let Some(tx) = guard.as_ref() {
-                            if tx.try_send(RouteEvent::Midi {
+                        if let Some(tx) = guard.as_ref()
+                            && tx.try_send(RouteEvent::Midi {
                                 port: port_name_owned.clone(),
                                 bytes: message.to_vec(),
                             }).is_err() {
-                                warn!("MIDI message dropped: route event channel full or closed");
-                            }
+                            warn!("MIDI message dropped: route event channel full or closed");
                         }
                     },
                     (),
@@ -414,19 +413,15 @@ fn connect_from_lua_table(tbl: &LuaTable) -> ConnectDecl {
         _ => return decl,
     };
     if let Ok(LuaValue::Table(t)) = connect_tbl.get::<LuaValue>("inputs") {
-        for pair in t.pairs::<String, LuaValue>() {
-            if let Ok((k, v)) = pair {
-                let pats = lua_val_to_patterns(v);
-                if !pats.is_empty() { decl.inputs.insert(k, pats); }
-            }
+        for (k, v) in t.pairs::<String, LuaValue>().flatten() {
+            let pats = lua_val_to_patterns(v);
+            if !pats.is_empty() { decl.inputs.insert(k, pats); }
         }
     }
     if let Ok(LuaValue::Table(t)) = connect_tbl.get::<LuaValue>("outputs") {
-        for pair in t.pairs::<String, LuaValue>() {
-            if let Ok((k, v)) = pair {
-                let pats = lua_val_to_patterns(v);
-                if !pats.is_empty() { decl.outputs.insert(k, pats); }
-            }
+        for (k, v) in t.pairs::<String, LuaValue>().flatten() {
+            let pats = lua_val_to_patterns(v);
+            if !pats.is_empty() { decl.outputs.insert(k, pats); }
         }
     }
     // Singular patterns stored under "" sentinel so apply_connect_defaults can expand them.
@@ -565,14 +560,13 @@ fn osc_from_lua_table(tbl: &LuaTable) -> OscDecl {
 
     if let Ok(LuaValue::Table(send_tbl)) = osc_tbl.get::<LuaValue>("send") {
         for pair in send_tbl.pairs::<String, LuaValue>() {
-            if let Ok((target_name, LuaValue::String(addr_str))) = pair {
-                if let Ok(s) = addr_str.to_str() {
-                    match parse_socket_addr(&s) {
-                        Some(addr) => {
-                            decl.send_targets.insert(target_name, addr);
-                        }
-                        None => warn!("OSC send target '{}': invalid address '{}'", target_name, s),
+            if let Ok((target_name, LuaValue::String(addr_str))) = pair
+                && let Ok(s) = addr_str.to_str() {
+                match parse_socket_addr(&s) {
+                    Some(addr) => {
+                        decl.send_targets.insert(target_name, addr);
                     }
+                    None => warn!("OSC send target '{}': invalid address '{}'", target_name, s),
                 }
             }
         }
@@ -607,17 +601,15 @@ fn apply_connect_defaults(
     let all_in  = raw.inputs.remove("").or_else(|| if has_in  { None } else { global_input.map(|s| vec![s.to_string()]) });
     let all_out = raw.outputs.remove("").or_else(|| if has_out { None } else { global_output.map(|s| vec![s.to_string()]) });
     for port in port_inputs {
-        if !raw.inputs.contains_key(port) {
-            if let Some(ref pats) = all_in {
-                raw.inputs.insert(port.clone(), pats.clone());
-            }
+        if !raw.inputs.contains_key(port)
+            && let Some(ref pats) = all_in {
+            raw.inputs.insert(port.clone(), pats.clone());
         }
     }
     for port in port_outputs {
-        if !raw.outputs.contains_key(port) {
-            if let Some(ref pats) = all_out {
-                raw.outputs.insert(port.clone(), pats.clone());
-            }
+        if !raw.outputs.contains_key(port)
+            && let Some(ref pats) = all_out {
+            raw.outputs.insert(port.clone(), pats.clone());
         }
     }
     raw
@@ -872,10 +864,9 @@ fn run_lua_event_loop(
                             .map(|v| lua_val_to_osc_type(&v))
                             .collect::<LuaResult<Vec<_>>>()?;
                         for sub_addr in &subs {
-                            if let Ok(dest) = sub_addr.parse::<SocketAddr>() {
-                                if let Err(e) = sender.send_to_addr(dest, first.clone(), osc_args.clone()) {
-                                    warn!("OSC send error sending to {}: {}", dest, e);
-                                }
+                            if let Ok(dest) = sub_addr.parse::<SocketAddr>()
+                                && let Err(e) = sender.send_to_addr(dest, first.clone(), osc_args.clone()) {
+                                warn!("OSC send error sending to {}: {}", dest, e);
                             }
                         }
                     }
@@ -969,12 +960,7 @@ fn run_lua_event_loop(
     let on_osc_fn: Option<LuaFunction> = lua.globals().get("on_osc").ok();
 
     // --- Event loop ---
-    loop {
-        let event = match rx.blocking_recv() {
-            Some(e) => e,
-            None => break,
-        };
-
+    while let Some(event) = rx.blocking_recv() {
         match event {
             RouteEvent::Midi { port, bytes } => {
                 let needs_parse = on_midi_fn.is_some() || osc_param_set.is_some();
@@ -982,15 +968,13 @@ fn run_lua_event_loop(
                     match midi_bytes_to_lua(&lua, &bytes) {
                         Ok(msg) => {
                             let _ = msg.set("port", port.as_str());
-                            if let Some(ref mut ps) = osc_param_set {
-                                if let Err(e) = ps.dispatch_midi(&lua, &msg) {
-                                    warn!("[{}] midi param dispatch error: {}", name, e);
-                                }
+                            if let Some(ref mut ps) = osc_param_set
+                                && let Err(e) = ps.dispatch_midi(&lua, &msg) {
+                                warn!("[{}] midi param dispatch error: {}", name, e);
                             }
-                            if let Some(ref on_midi) = on_midi_fn {
-                                if let Err(e) = on_midi.call::<()>(msg) {
-                                    warn!("[{}] on_midi error: {}", name, e);
-                                }
+                            if let Some(ref on_midi) = on_midi_fn
+                                && let Err(e) = on_midi.call::<()>(msg) {
+                                warn!("[{}] on_midi error: {}", name, e);
                             }
                         }
                         Err(e) => warn!("[{}] MIDI parse error: {}", name, e),
@@ -1004,10 +988,9 @@ fn run_lua_event_loop(
                     }
                     *subs_cache.lock().unwrap() = ps.subscriber_addrs();
                 }
-                if let Some(ref on_tick) = on_tick_fn {
-                    if let Err(e) = on_tick.call::<()>((tick, bpm, ppqn)) {
-                        warn!("[{}] on_tick error: {}", name, e);
-                    }
+                if let Some(ref on_tick) = on_tick_fn
+                    && let Err(e) = on_tick.call::<()>((tick, bpm, ppqn)) {
+                    warn!("[{}] on_tick error: {}", name, e);
                 }
             }
             RouteEvent::Osc { from, address, args } => {
@@ -1032,10 +1015,9 @@ fn run_lua_event_loop(
                 }
             }
             RouteEvent::ResyncState => {
-                if let Some(ref ps) = osc_param_set {
-                    if let Err(e) = ps.resync(&lua) {
-                        warn!("[{}] resync error: {}", name, e);
-                    }
+                if let Some(ref ps) = osc_param_set
+                    && let Err(e) = ps.resync(&lua) {
+                    warn!("[{}] resync error: {}", name, e);
                 }
             }
             RouteEvent::Shutdown => break,
@@ -1043,10 +1025,9 @@ fn run_lua_event_loop(
     }
 
     // --- Persist state on shutdown ---
-    if let (Some(ps), Some(path)) = (&osc_param_set, &state_file) {
-        if let Err(e) = ps.save_state(&lua, path) {
-            warn!("[{}] Failed to save route state: {}", name, e);
-        }
+    if let (Some(ps), Some(path)) = (&osc_param_set, &state_file)
+        && let Err(e) = ps.save_state(&lua, path) {
+        warn!("[{}] Failed to save route state: {}", name, e);
     }
 
     Ok(())
