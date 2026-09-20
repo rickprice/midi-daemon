@@ -18,7 +18,7 @@ pub struct Timer {
 
 impl Timer {
     pub fn new(default_bpm: f64, default_ppqn: u32) -> Self {
-        let bpm = default_bpm.clamp(20.0, 200.0);
+        let bpm = default_bpm.max(0.01);
         let ppqn = default_ppqn.max(1);
         Timer {
             bpm: Arc::new(AtomicU32::new((bpm * 100.0) as u32)),
