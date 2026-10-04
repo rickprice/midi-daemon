@@ -661,12 +661,9 @@ struct RouteThreadArgs {
     lua_state_file: std::path::PathBuf,
 }
 
-// Owns the route's Lua VM for its whole lifetime: registers all the Lua-facing
-// globals (send, send_osc, save_state, ...), loads the script, then runs the
-// event loop until shutdown. Splitting the setup from the loop would mean
-// threading a dozen captured closures/variables across a function boundary
-// for no real gain.
-#[allow(clippy::too_many_lines)]
+// Owns the route's Lua VM for its whole lifetime: registers the Lua-facing
+// globals via the register_* helpers above, loads the script, then runs the
+// event loop until shutdown.
 fn run_lua_event_loop(
     name: &str,
     script: &str,
@@ -679,222 +676,18 @@ fn run_lua_event_loop(
     let RouteThreadArgs { route_cfg, osc_sender, osc_heartbeat_interval, lua_state_file } = args;
     let lua = Lua::new();
 
-    // --- Expose `send(msg)` or `send(port_name, msg)` ---
-    //
-    // One-arg form sends to the first/only output (backward-compatible).
-    // Two-arg form selects a named output declared in init().
-    {
-        let send_fn = lua.create_function(move |_lua, args: LuaMultiValue| -> LuaResult<()> {
-            let (port_name, msg_table) = match args.len() {
-                1 => {
-                    let Some(LuaValue::Table(msg)) = args.into_iter().next() else {
-                        return Err(LuaError::RuntimeError(
-                            "send: expected a message table".into(),
-                        ));
-                    };
-                    (default_out.clone(), msg)
-                }
-                2 => {
-                    let mut iter = args.into_iter();
-                    let Some(LuaValue::String(s)) = iter.next() else {
-                        return Err(LuaError::RuntimeError(
-                            "send: first argument must be a port name string".into(),
-                        ));
-                    };
-                    let port = s.to_str().map_err(LuaError::external)?.to_string();
-                    let Some(LuaValue::Table(msg)) = iter.next() else {
-                        return Err(LuaError::RuntimeError(
-                            "send: second argument must be a message table".into(),
-                        ));
-                    };
-                    (port, msg)
-                }
-                n => {
-                    return Err(LuaError::RuntimeError(format!(
-                        "send: expected 1 or 2 arguments, got {n}"
-                    )))
-                }
-            };
+    register_send(&lua, out_conns, default_out)?;
+    register_timer_fns(&lua, timer)?;
+    register_log(&lua, name)?;
 
-            if let Some(conn) = out_conns.get(&port_name) { match lua_to_midi_bytes(&msg_table) {
-                Ok(bytes) => {
-                    if let Err(e) = conn.lock().unwrap_or_else(std::sync::PoisonError::into_inner).send(&bytes) {
-                        warn!("MIDI send error on port '{}': {}", port_name, e);
-                    }
-                }
-                Err(e) => warn!("lua_to_midi_bytes error: {}", e),
-            } } else { warn!("send: unknown output port '{}'", port_name) }
-
-            Ok(())
-        })?;
-        lua.globals().set("send", send_fn)?;
-    }
-
-    // --- Expose `set_bpm(bpm)` ---
-    {
-        let t = Arc::clone(timer);
-        let f = lua.create_function(move |_, bpm: f64| {
-            t.set_bpm(bpm);
-            Ok(())
-        })?;
-        lua.globals().set("set_bpm", f)?;
-    }
-
-    // --- Expose `get_bpm()` ---
-    {
-        let t = Arc::clone(timer);
-        let f = lua.create_function(move |_, ()| Ok(t.get_bpm()))?;
-        lua.globals().set("get_bpm", f)?;
-    }
-
-    // --- Expose `set_ppqn(ppqn)` ---
-    {
-        let t = Arc::clone(timer);
-        let f = lua.create_function(move |_, ppqn: u32| {
-            t.set_ppqn(ppqn);
-            Ok(())
-        })?;
-        lua.globals().set("set_ppqn", f)?;
-    }
-
-    // --- Expose `get_ppqn()` ---
-    {
-        let t = Arc::clone(timer);
-        let f = lua.create_function(move |_, ()| Ok(t.get_ppqn()))?;
-        lua.globals().set("get_ppqn", f)?;
-    }
-
-    // --- Expose `log(msg)` ---
-    {
-        let route_name = name.to_string();
-        let f = lua.create_function(move |_, msg: String| {
-            info!("[{}] {}", route_name, msg);
-            Ok(())
-        })?;
-        lua.globals().set("log", f)?;
-    }
-
-    // --- Expose `ROUTE_NAME` and `OSC_SEND_ENABLED` ---
-    // Must be set before the send_osc closure captures osc_sender.
+    // Must be set before register_send_osc, since OSC_SEND_ENABLED reflects
+    // whether a send socket was available at route-start time.
     lua.globals().set("ROUTE_NAME", name)?;
-    // OSC_SEND_ENABLED: true when the OSC send socket is available — either a named target
-    // was declared or a receive port is active (enabling dynamic subscriber sends).
-    // Routes can use this to suppress proactive sends when no OSC infrastructure is wired up.
     lua.globals().set("OSC_SEND_ENABLED", osc_sender.is_some())?;
 
-    // Subscriber address cache: updated after every osc_param_set dispatch/tick so the
-    // send_osc closure can fan out to subscribers when no named target is configured.
-    let subs_cache: Arc<Mutex<Vec<String>>> =
-        Arc::new(Mutex::new(Vec::new()));
-
-    // --- Expose `send_osc` ---
-    //
-    // Three calling forms:
-    //   send_osc("/addr", v…)          address-first → named target, or fans out to subscribers
-    //   send_osc("name", "/addr", v…)  named target
-    //   send_osc("ip:port", "/addr", v…)  ad-hoc address (subscriber replies, notifications)
-    {
-        let subs_cache_for_send = Arc::clone(&subs_cache);
-        let f = lua.create_function(move |_, args: LuaMultiValue| -> LuaResult<()> {
-            let Some(sender) = &osc_sender else {
-                warn!("send_osc: no OSC socket available");
-                return Ok(());
-            };
-
-            if args.is_empty() {
-                return Err(LuaError::RuntimeError(
-                    "send_osc: expected at least an OSC address argument".into(),
-                ));
-            }
-
-            let first = match &args[0] {
-                LuaValue::String(s) => s.to_str().map_err(LuaError::external)?.to_string(),
-                _ => return Err(LuaError::RuntimeError(
-                    "send_osc: first argument must be a string".into(),
-                )),
-            };
-
-            // Ad-hoc address form: first arg parses as SocketAddr ("ip:port")
-            if let Ok(dest) = first.parse::<SocketAddr>() {
-                let address = match args.get(1) {
-                    Some(LuaValue::String(s)) => s.to_str().map_err(LuaError::external)?.to_string(),
-                    _ => return Err(LuaError::RuntimeError(
-                        "send_osc: OSC address (second argument) must be a string".into(),
-                    )),
-                };
-                if !address.starts_with('/') {
-                    return Err(LuaError::RuntimeError(format!(
-                        "send_osc: OSC address must start with '/', got '{address}'"
-                    )));
-                }
-                let osc_args = args.into_iter().skip(2)
-                    .map(|v| lua_val_to_osc_type(&v))
-                    .collect::<LuaResult<Vec<_>>>()?;
-                if let Err(e) = sender.send_to_addr(dest, address, osc_args) {
-                    warn!("OSC send error sending to {}: {}", dest, e);
-                }
-                return Ok(());
-            }
-
-            let (target, address, arg_start) = if first.starts_with('/') {
-                // Address-first: pick the sole named target, fan out to subscribers, or error.
-                if sender.targets.len() == 1 {
-                    let t = sender.targets.keys().next().unwrap().clone();
-                    (t, first, 1usize)
-                } else if sender.targets.is_empty() {
-                    // No named target: send to all live subscribers instead.
-                    let subs: Vec<String> = subs_cache_for_send.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
-                    if !subs.is_empty() {
-                        let osc_args = args.into_iter().skip(1)
-                            .map(|v| lua_val_to_osc_type(&v))
-                            .collect::<LuaResult<Vec<_>>>()?;
-                        for sub_addr in &subs {
-                            if let Ok(dest) = sub_addr.parse::<SocketAddr>()
-                                && let Err(e) = sender.send_to_addr(dest, first.clone(), osc_args.clone()) {
-                                warn!("OSC send error sending to {}: {}", dest, e);
-                            }
-                        }
-                    }
-                    return Ok(());
-                } else {
-                    return Err(LuaError::RuntimeError(
-                        "send_osc: multiple targets configured — specify target name as first argument".into(),
-                    ));
-                }
-            } else {
-                // Named-target form.
-                if !sender.targets.contains_key(&first) {
-                    return Err(LuaError::RuntimeError(format!(
-                        "send_osc: unknown target '{first}'"
-                    )));
-                }
-                let address = match args.get(1) {
-                    Some(LuaValue::String(s)) => s.to_str().map_err(LuaError::external)?.to_string(),
-                    _ => return Err(LuaError::RuntimeError(
-                        "send_osc: OSC address (second argument) must be a string".into(),
-                    )),
-                };
-                if !address.starts_with('/') {
-                    return Err(LuaError::RuntimeError(format!(
-                        "send_osc: OSC address must start with '/', got '{address}'"
-                    )));
-                }
-                (first, address, 2usize)
-            };
-
-            let osc_args = args.into_iter()
-                .skip(arg_start)
-                .map(|v| lua_val_to_osc_type(&v))
-                .collect::<LuaResult<Vec<_>>>()?;
-
-            if let Err(e) = sender.send(&target, address, osc_args) {
-                warn!("OSC send error sending to '{}': {}", target, e);
-            }
-
-            Ok(())
-        })?;
-        lua.globals().set("send_osc", f)?;
-    }
+    // Subscriber address cache: updated after every osc_param_set dispatch/tick so
+    // register_send_osc's closure can fan out to subscribers when no named target is configured.
+    let subs_cache = register_send_osc(&lua, osc_sender)?;
 
     // --- Expose `config` table ---
     {
@@ -1027,6 +820,219 @@ fn run_lua_event_loop(
     call_optional_hook(&lua, "on_shutdown", name);
 
     Ok(())
+}
+
+/// Register `send(msg)` / `send(port_name, msg)`.
+///
+/// One-arg form sends to the first/only output (backward-compatible).
+/// Two-arg form selects a named output declared in init().
+fn register_send(
+    lua: &Lua,
+    out_conns: HashMap<String, Arc<Mutex<MidiOutputConnection>>>,
+    default_out: String,
+) -> LuaResult<()> {
+    let send_fn = lua.create_function(move |_lua, args: LuaMultiValue| -> LuaResult<()> {
+        let (port_name, msg_table) = match args.len() {
+            1 => {
+                let Some(LuaValue::Table(msg)) = args.into_iter().next() else {
+                    return Err(LuaError::RuntimeError(
+                        "send: expected a message table".into(),
+                    ));
+                };
+                (default_out.clone(), msg)
+            }
+            2 => {
+                let mut iter = args.into_iter();
+                let Some(LuaValue::String(s)) = iter.next() else {
+                    return Err(LuaError::RuntimeError(
+                        "send: first argument must be a port name string".into(),
+                    ));
+                };
+                let port = s.to_str().map_err(LuaError::external)?.to_string();
+                let Some(LuaValue::Table(msg)) = iter.next() else {
+                    return Err(LuaError::RuntimeError(
+                        "send: second argument must be a message table".into(),
+                    ));
+                };
+                (port, msg)
+            }
+            n => {
+                return Err(LuaError::RuntimeError(format!(
+                    "send: expected 1 or 2 arguments, got {n}"
+                )))
+            }
+        };
+
+        if let Some(conn) = out_conns.get(&port_name) { match lua_to_midi_bytes(&msg_table) {
+            Ok(bytes) => {
+                if let Err(e) = conn.lock().unwrap_or_else(std::sync::PoisonError::into_inner).send(&bytes) {
+                    warn!("MIDI send error on port '{}': {}", port_name, e);
+                }
+            }
+            Err(e) => warn!("lua_to_midi_bytes error: {}", e),
+        } } else { warn!("send: unknown output port '{}'", port_name) }
+
+        Ok(())
+    })?;
+    lua.globals().set("send", send_fn)
+}
+
+/// Register `set_bpm(bpm)` / `get_bpm()` / `set_ppqn(ppqn)` / `get_ppqn()`.
+fn register_timer_fns(lua: &Lua, timer: &Arc<Timer>) -> LuaResult<()> {
+    {
+        let t = Arc::clone(timer);
+        let f = lua.create_function(move |_, bpm: f64| {
+            t.set_bpm(bpm);
+            Ok(())
+        })?;
+        lua.globals().set("set_bpm", f)?;
+    }
+    {
+        let t = Arc::clone(timer);
+        let f = lua.create_function(move |_, ()| Ok(t.get_bpm()))?;
+        lua.globals().set("get_bpm", f)?;
+    }
+    {
+        let t = Arc::clone(timer);
+        let f = lua.create_function(move |_, ppqn: u32| {
+            t.set_ppqn(ppqn);
+            Ok(())
+        })?;
+        lua.globals().set("set_ppqn", f)?;
+    }
+    {
+        let t = Arc::clone(timer);
+        let f = lua.create_function(move |_, ()| Ok(t.get_ppqn()))?;
+        lua.globals().set("get_ppqn", f)?;
+    }
+    Ok(())
+}
+
+/// Register `log(msg)`.
+fn register_log(lua: &Lua, route_name: &str) -> LuaResult<()> {
+    let route_name = route_name.to_string();
+    let f = lua.create_function(move |_, msg: String| {
+        info!("[{}] {}", route_name, msg);
+        Ok(())
+    })?;
+    lua.globals().set("log", f)
+}
+
+/// Register `send_osc` and return the subscriber-address cache it reads from.
+///
+/// Three calling forms:
+///   send_osc("/addr", v…)             address-first → named target, or fans out to subscribers
+///   send_osc("name", "/addr", v…)      named target
+///   send_osc("ip:port", "/addr", v…)   ad-hoc address (subscriber replies, notifications)
+///
+/// The returned cache starts empty; the caller updates it after every
+/// `osc_param_set` dispatch/tick so fan-out to subscribers stays current.
+fn register_send_osc(
+    lua: &Lua,
+    osc_sender: Option<OscSender>,
+) -> LuaResult<Arc<Mutex<Vec<String>>>> {
+    let subs_cache: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let subs_cache_for_send = Arc::clone(&subs_cache);
+    let f = lua.create_function(move |_, args: LuaMultiValue| -> LuaResult<()> {
+        let Some(sender) = &osc_sender else {
+            warn!("send_osc: no OSC socket available");
+            return Ok(());
+        };
+
+        if args.is_empty() {
+            return Err(LuaError::RuntimeError(
+                "send_osc: expected at least an OSC address argument".into(),
+            ));
+        }
+
+        let first = match &args[0] {
+            LuaValue::String(s) => s.to_str().map_err(LuaError::external)?.to_string(),
+            _ => return Err(LuaError::RuntimeError(
+                "send_osc: first argument must be a string".into(),
+            )),
+        };
+
+        // Ad-hoc address form: first arg parses as SocketAddr ("ip:port")
+        if let Ok(dest) = first.parse::<SocketAddr>() {
+            let address = match args.get(1) {
+                Some(LuaValue::String(s)) => s.to_str().map_err(LuaError::external)?.to_string(),
+                _ => return Err(LuaError::RuntimeError(
+                    "send_osc: OSC address (second argument) must be a string".into(),
+                )),
+            };
+            if !address.starts_with('/') {
+                return Err(LuaError::RuntimeError(format!(
+                    "send_osc: OSC address must start with '/', got '{address}'"
+                )));
+            }
+            let osc_args = args.into_iter().skip(2)
+                .map(|v| lua_val_to_osc_type(&v))
+                .collect::<LuaResult<Vec<_>>>()?;
+            if let Err(e) = sender.send_to_addr(dest, address, osc_args) {
+                warn!("OSC send error sending to {}: {}", dest, e);
+            }
+            return Ok(());
+        }
+
+        let (target, address, arg_start) = if first.starts_with('/') {
+            // Address-first: pick the sole named target, fan out to subscribers, or error.
+            if sender.targets.len() == 1 {
+                let t = sender.targets.keys().next().unwrap().clone();
+                (t, first, 1usize)
+            } else if sender.targets.is_empty() {
+                // No named target: send to all live subscribers instead.
+                let subs: Vec<String> = subs_cache_for_send.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+                if !subs.is_empty() {
+                    let osc_args = args.into_iter().skip(1)
+                        .map(|v| lua_val_to_osc_type(&v))
+                        .collect::<LuaResult<Vec<_>>>()?;
+                    for sub_addr in &subs {
+                        if let Ok(dest) = sub_addr.parse::<SocketAddr>()
+                            && let Err(e) = sender.send_to_addr(dest, first.clone(), osc_args.clone()) {
+                            warn!("OSC send error sending to {}: {}", dest, e);
+                        }
+                    }
+                }
+                return Ok(());
+            } else {
+                return Err(LuaError::RuntimeError(
+                    "send_osc: multiple targets configured — specify target name as first argument".into(),
+                ));
+            }
+        } else {
+            // Named-target form.
+            if !sender.targets.contains_key(&first) {
+                return Err(LuaError::RuntimeError(format!(
+                    "send_osc: unknown target '{first}'"
+                )));
+            }
+            let address = match args.get(1) {
+                Some(LuaValue::String(s)) => s.to_str().map_err(LuaError::external)?.to_string(),
+                _ => return Err(LuaError::RuntimeError(
+                    "send_osc: OSC address (second argument) must be a string".into(),
+                )),
+            };
+            if !address.starts_with('/') {
+                return Err(LuaError::RuntimeError(format!(
+                    "send_osc: OSC address must start with '/', got '{address}'"
+                )));
+            }
+            (first, address, 2usize)
+        };
+
+        let osc_args = args.into_iter()
+            .skip(arg_start)
+            .map(|v| lua_val_to_osc_type(&v))
+            .collect::<LuaResult<Vec<_>>>()?;
+
+        if let Err(e) = sender.send(&target, address, osc_args) {
+            warn!("OSC send error sending to '{}': {}", target, e);
+        }
+
+        Ok(())
+    })?;
+    lua.globals().set("send_osc", f)?;
+    Ok(subs_cache)
 }
 
 /// Register the `save_state(table)` / `load_state()` Lua globals, which read

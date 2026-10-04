@@ -10,11 +10,9 @@ mod timer;
 use clap::Parser;
 use anyhow::{Context as _, Result};
 use notify::{Event, EventKind, RecursiveMode, Watcher};
-use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
@@ -33,17 +31,6 @@ use route::Route;
 /// `Send + 'static` closure that forwards events into its event channel.
 type OscDispatch =
     Arc<Mutex<HashMap<String, Box<dyn Fn(std::net::SocketAddr, String, Vec<rosc::OscType>) + Send>>>>;
-
-fn register_route_osc(dispatch: &OscDispatch, name: &str, route: &Route) {
-    dispatch
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(name.to_string(), Box::new(route.make_osc_injector()));
-}
-
-fn unregister_route_osc(dispatch: &OscDispatch, name: &str) {
-    dispatch.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(name);
-}
 
 /// Bind a UDP port and dispatch incoming packets to routes by address prefix
 /// (`/route-name/rest` → the route named `route-name`).
@@ -76,36 +63,224 @@ fn start_osc_receiver(port: u16, dispatch: OscDispatch) -> Option<osc::OscReceiv
     }
 }
 
-/// Collect the set of UDP ports that need a running receiver: the global
-/// config port (if set) plus every per-route declared receive port.
-fn needed_osc_ports(config: &Config, routes: &HashMap<String, Route>) -> HashSet<u16> {
-    let mut ports = HashSet::new();
-    if let Some(p) = config.osc_receive_port {
-        ports.insert(p);
-    }
-    for route in routes.values() {
-        if let Some(p) = route.osc_receive_port {
-            ports.insert(p);
-        }
-    }
-    ports
+// ── Daemon state ──────────────────────────────────────────────────────────────
+
+/// All mutable daemon state: config, loaded routes, ALSA connection manager,
+/// and the OSC receive side (dispatch table + one UDP socket per needed port).
+/// Owned entirely by the main event loop, so plain fields (no `Rc<RefCell<_>>`)
+/// suffice — nothing else holds a reference to this state.
+struct Daemon {
+    routes_dir: PathBuf,
+    config: Arc<Config>,
+    routes: HashMap<String, Route>,
+    conn_mgr: Arc<ConnectionManager>,
+    osc_dispatch: OscDispatch,
+    osc_receivers: HashMap<u16, osc::OscReceiver>,
 }
 
-/// Ensure exactly one receiver is running for each needed port.
-fn sync_osc_receivers(
-    config: &Config,
-    routes: &Rc<RefCell<HashMap<String, Route>>>,
-    receivers: &mut HashMap<u16, osc::OscReceiver>,
-    dispatch: &OscDispatch,
-) {
-    let needed = needed_osc_ports(config, &routes.borrow());
-    for &port in &needed {
-        if let std::collections::hash_map::Entry::Vacant(e) = receivers.entry(port)
-            && let Some(rx) = start_osc_receiver(port, Arc::clone(dispatch)) {
-            e.insert(rx);
+impl Daemon {
+    fn new(routes_dir: PathBuf, config: Arc<Config>, conn_mgr: Arc<ConnectionManager>) -> Self {
+        Daemon {
+            routes_dir,
+            config,
+            routes: HashMap::new(),
+            conn_mgr,
+            osc_dispatch: Arc::new(Mutex::new(HashMap::new())),
+            osc_receivers: HashMap::new(),
         }
     }
-    receivers.retain(|p, _| needed.contains(p));
+
+    fn register_route_osc(&self, name: &str, route: &Route) {
+        self.osc_dispatch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(name.to_string(), Box::new(route.make_osc_injector()));
+    }
+
+    fn unregister_route_osc(&self, name: &str) {
+        self.osc_dispatch
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(name);
+    }
+
+    /// Collect the set of UDP ports that need a running receiver: the global
+    /// config port (if set) plus every per-route declared receive port.
+    fn needed_osc_ports(&self) -> HashSet<u16> {
+        let mut ports = HashSet::new();
+        if let Some(p) = self.config.osc_receive_port {
+            ports.insert(p);
+        }
+        for route in self.routes.values() {
+            if let Some(p) = route.osc_receive_port {
+                ports.insert(p);
+            }
+        }
+        ports
+    }
+
+    /// Ensure exactly one receiver is running for each needed port.
+    fn sync_osc_receivers(&mut self) {
+        let needed = self.needed_osc_ports();
+        for &port in &needed {
+            if let std::collections::hash_map::Entry::Vacant(e) = self.osc_receivers.entry(port)
+                && let Some(rx) = start_osc_receiver(port, Arc::clone(&self.osc_dispatch)) {
+                e.insert(rx);
+            }
+        }
+        self.osc_receivers.retain(|p, _| needed.contains(p));
+    }
+
+    fn load_all_routes(&mut self) -> Result<()> {
+        let entries = match std::fs::read_dir(&self.routes_dir) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir_all(&self.routes_dir)
+                    .with_context(|| format!("create routes directory {}", self.routes_dir.display()))?;
+                info!("Created routes directory: {}", self.routes_dir.display());
+                return Ok(());
+            }
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("open routes directory {}", self.routes_dir.display()));
+            }
+        };
+
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "lua") {
+                let name = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+
+                match Route::start(&path, &self.config, None) {
+                    Ok(route) => {
+                        self.conn_mgr.register_route(&name, route.port_decl(), &route.connect_decl);
+                        self.register_route_osc(&name, &route);
+                        info!("Loaded route: {}", name);
+                        self.routes.insert(name, route);
+                    }
+                    Err(e) => error!("Failed to load route {}: {}", name, e),
+                }
+            }
+        }
+        self.conn_mgr.apply_all();
+        Ok(())
+    }
+
+    fn reload_all_routes(&mut self) {
+        let names: Vec<String> = self.routes.keys().cloned().collect();
+        for name in names {
+            let path = self.routes_dir.join(format!("{name}.lua"));
+            let old_ports = self.routes.get(&name).map(route::Route::ports_rc);
+            match Route::start(&path, &self.config, old_ports) {
+                Ok(route) => {
+                    self.conn_mgr.register_route(&name, route.port_decl(), &route.connect_decl);
+                    self.register_route_osc(&name, &route);
+                    self.routes.insert(name.clone(), route);
+                    info!("Reloaded route '{}' with new config", name);
+                }
+                Err(e) => error!("Failed to reload route '{}': {}", name, e),
+            }
+        }
+        self.conn_mgr.apply_all();
+    }
+
+    fn handle_route_changed(&mut self, path: &Path) {
+        let name = match path.file_stem().and_then(|s| s.to_str()) {
+            Some(n) => n.to_string(),
+            None => return,
+        };
+
+        if path.exists() {
+            info!("Detected change in {}.lua — reloading", name);
+            let old_ports = self.routes.get(&name).map(route::Route::ports_rc);
+            match Route::start(path, &self.config, old_ports) {
+                Ok(route) => {
+                    self.conn_mgr.register_route(&name, route.port_decl(), &route.connect_decl);
+                    self.conn_mgr.apply_all();
+                    self.register_route_osc(&name, &route);
+                    self.routes.insert(name.clone(), route);
+                    self.sync_osc_receivers();
+                    info!("Reloaded route: {}", name);
+                }
+                Err(e) => error!("Failed to reload route {}: {}", name, e),
+            }
+        } else {
+            self.routes.remove(&name);
+            self.conn_mgr.unregister_route(&name);
+            self.unregister_route_osc(&name);
+            self.sync_osc_receivers();
+            info!("Removed route: {}", name);
+        }
+    }
+
+    fn handle_config_changed(&mut self) {
+        info!("config.toml changed — reloading");
+        match self.config.reload() {
+            Ok(new_cfg) => {
+                if new_cfg.routes_dir != self.routes_dir {
+                    warn!(
+                        "routes_dir changed in config.toml — restart the daemon for this to take effect"
+                    );
+                }
+                self.config = Arc::new(new_cfg);
+                self.reload_all_routes();
+                self.sync_osc_receivers();
+                info!("Config reloaded");
+            }
+            Err(e) => error!("Failed to reload config.toml: {}", e),
+        }
+    }
+
+    fn send_resync_all(&self) {
+        for (name, route) in &self.routes {
+            route.send_resync();
+            debug!("Queued resync for route '{}'", name);
+        }
+    }
+
+    fn status_text(&self) -> String {
+        let mut route_names: Vec<&String> = self.routes.keys().collect();
+        route_names.sort();
+        let mut ports: Vec<u16> = self.osc_receivers.keys().copied().collect();
+        ports.sort_unstable();
+        format!(
+            "pid: {}\nroutes: {}\nosc_recv: {}\nconfig: {}\ncache: {}\nsocket: {}\n",
+            std::process::id(),
+            if route_names.is_empty() {
+                "(none)".into()
+            } else {
+                route_names.into_iter().cloned().collect::<Vec<_>>().join(", ")
+            },
+            if ports.is_empty() { "(none)".into() } else { ports.iter().map(std::string::ToString::to_string).collect::<Vec<_>>().join(", ") },
+            self.config.config_path.as_deref().map_or_else(|| "(defaults)".into(), |p| p.display().to_string()),
+            self.config.cache_dir().display(),
+            config::control_socket_path().display(),
+        )
+    }
+
+    /// Send a `Shutdown` command to every route and wait for their event-loop
+    /// threads to finish (which includes saving persisted state).
+    fn graceful_shutdown(&mut self) {
+        let to_shutdown: Vec<Route> = std::mem::take(&mut self.routes).into_values().collect();
+        let handles: Vec<std::thread::JoinHandle<()>> = to_shutdown
+            .into_iter()
+            .filter_map(route::Route::shutdown)
+            .collect();
+        for h in handles {
+            if let Err(e) = h.join() {
+                let msg = e.downcast_ref::<&str>().copied()
+                    .or_else(|| e.downcast_ref::<String>().map(String::as_str))
+                    .unwrap_or("(unknown panic payload)");
+                warn!("Route thread panicked during shutdown: {}", msg);
+            }
+        }
+        info!("All routes shut down");
+    }
 }
 
 // ── Control socket ────────────────────────────────────────────────────────────
@@ -191,27 +366,6 @@ async fn do_control_cmd(cmd: &str) -> Result<()> {
     Ok(())
 }
 
-// ── Graceful shutdown ─────────────────────────────────────────────────────────
-
-/// Send a `Shutdown` command to every route and wait for their event-loop
-/// threads to finish (which includes saving persisted state).
-fn graceful_shutdown(routes: &Rc<RefCell<HashMap<String, Route>>>) {
-    let to_shutdown: Vec<Route> = routes.borrow_mut().drain().map(|(_, r)| r).collect();
-    let handles: Vec<std::thread::JoinHandle<()>> = to_shutdown
-        .into_iter()
-        .filter_map(route::Route::shutdown)
-        .collect();
-    for h in handles {
-        if let Err(e) = h.join() {
-            let msg = e.downcast_ref::<&str>().copied()
-                .or_else(|| e.downcast_ref::<String>().map(String::as_str))
-                .unwrap_or("(unknown panic payload)");
-            warn!("Route thread panicked during shutdown: {}", msg);
-        }
-    }
-    info!("All routes shut down");
-}
-
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 #[derive(clap::Subcommand)]
@@ -239,7 +393,6 @@ struct Cli {
 
 // Top-level daemon wiring (config, control socket, routes, watchers, signal
 // handlers, main select loop) — inherently a flat sequence of one-time setup.
-#[allow(clippy::too_many_lines)]
 #[tokio::main]
 async fn main() -> Result<()> {
     enum WatchEvent {
@@ -276,30 +429,23 @@ async fn main() -> Result<()> {
     info!("Routes directory: {}", config.routes_dir.display());
 
     let routes_dir = config.routes_dir.clone();
-    let mut config = Arc::new(config);
+    let config = Arc::new(config);
 
     // Bind control socket (removed automatically on drop).
     let (ctrl_tx, mut ctrl_rx) = mpsc::channel::<ControlCmd>(8);
     let _ctrl_socket = start_control_socket(&config::control_socket_path(), ctrl_tx)?;
 
-    // Map of route name -> Route handle.
-    let routes: Rc<RefCell<HashMap<String, Route>>> =
-        Rc::new(RefCell::new(HashMap::new()));
-
     let conn_mgr = Arc::new(ConnectionManager::new());
     Arc::clone(&conn_mgr).spawn_watcher();
 
-    let osc_dispatch: OscDispatch = Arc::new(Mutex::new(HashMap::new()));
-
-    load_all_routes(&routes_dir, &config, &routes, &conn_mgr, &osc_dispatch)?;
-
-    let mut osc_receivers: HashMap<u16, osc::OscReceiver> = HashMap::new();
-    sync_osc_receivers(&config, &routes, &mut osc_receivers, &osc_dispatch);
+    let mut daemon = Daemon::new(routes_dir.clone(), config, conn_mgr);
+    daemon.load_all_routes()?;
+    daemon.sync_osc_receivers();
 
     // inotify watcher for hot-reload
     let (tx, mut rx) = mpsc::channel::<WatchEvent>(32);
 
-    let config_path = config.config_path.clone();
+    let config_path = daemon.config.config_path.clone();
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
         if let Ok(event) = res {
             match event.kind {
@@ -320,7 +466,7 @@ async fn main() -> Result<()> {
     watcher.watch(&routes_dir, RecursiveMode::NonRecursive)?;
     info!("Watching {} for changes", routes_dir.display());
 
-    if let Some(ref cfg_path) = config.config_path {
+    if let Some(ref cfg_path) = daemon.config.config_path {
         let cfg_dir = cfg_path.parent().unwrap_or(cfg_path.as_path());
         if cfg_dir != routes_dir.as_path() {
             watcher.watch(cfg_dir, RecursiveMode::NonRecursive)?;
@@ -347,60 +493,32 @@ async fn main() -> Result<()> {
             }
             _ = sigusr1.recv() => {
                 info!("Received SIGUSR1 — resyncing all route params");
-                for (name, route) in routes.borrow().iter() {
-                    route.send_resync();
-                    debug!("Queued resync for route '{}'", name);
-                }
+                daemon.send_resync_all();
             }
             Some(cmd) = ctrl_rx.recv() => {
                 match cmd {
                     ControlCmd::Resync { reply } => {
                         info!("Control: resync");
-                        for (name, route) in routes.borrow().iter() {
-                            route.send_resync();
-                            debug!("Queued resync for route '{}'", name);
-                        }
+                        daemon.send_resync_all();
                         let _ = reply.send("ok\n".to_string());
                     }
                     ControlCmd::Reload { reply } => {
                         info!("Control: reload");
-                        handle_config_changed(
-                            &routes_dir, &mut config, &routes, &conn_mgr,
-                            &osc_dispatch, &mut osc_receivers,
-                        );
+                        daemon.handle_config_changed();
                         let _ = reply.send("ok\n".to_string());
                     }
                     ControlCmd::Status { reply } => {
-                        let mut route_names: Vec<String> =
-                            routes.borrow().keys().cloned().collect();
-                        route_names.sort();
-                        let mut ports: Vec<u16> = osc_receivers.keys().copied().collect();
-                        ports.sort_unstable();
-                        let text = format!(
-                            "pid: {}\nroutes: {}\nosc_recv: {}\nconfig: {}\ncache: {}\nsocket: {}\n",
-                            std::process::id(),
-                            if route_names.is_empty() { "(none)".into() } else { route_names.join(", ") },
-                            if ports.is_empty() { "(none)".into() } else { ports.iter().map(std::string::ToString::to_string).collect::<Vec<_>>().join(", ") },
-                            config.config_path.as_deref().map_or_else(|| "(defaults)".into(), |p| p.display().to_string()),
-                            config.cache_dir().display(),
-                            config::control_socket_path().display(),
-                        );
-                        let _ = reply.send(text);
+                        let _ = reply.send(daemon.status_text());
                     }
                 }
             }
             event = rx.recv() => {
                 match event {
                     Some(WatchEvent::RouteChanged(path)) => {
-                        handle_route_changed(
-                            &path, &config, &routes, &conn_mgr, &osc_dispatch, &mut osc_receivers,
-                        );
+                        daemon.handle_route_changed(&path);
                     }
                     Some(WatchEvent::ConfigChanged) => {
-                        handle_config_changed(
-                            &routes_dir, &mut config, &routes, &conn_mgr, &osc_dispatch,
-                            &mut osc_receivers,
-                        );
+                        daemon.handle_config_changed();
                     }
                     None => {
                         info!("Watch channel closed — shutting down");
@@ -411,141 +529,6 @@ async fn main() -> Result<()> {
         }
     }
 
-    graceful_shutdown(&routes);
-    Ok(())
-}
-
-// ── Hot-reload helpers ────────────────────────────────────────────────────────
-
-fn handle_route_changed(
-    path: &Path,
-    config: &Arc<Config>,
-    routes: &Rc<RefCell<HashMap<String, Route>>>,
-    conn_mgr: &Arc<ConnectionManager>,
-    osc_dispatch: &OscDispatch,
-    osc_receivers: &mut HashMap<u16, osc::OscReceiver>,
-) {
-    let name = match path.file_stem().and_then(|s| s.to_str()) {
-        Some(n) => n.to_string(),
-        None => return,
-    };
-
-    if path.exists() {
-        info!("Detected change in {}.lua — reloading", name);
-        let old_ports = routes.borrow().get(&name).map(route::Route::ports_rc);
-        match Route::start(path, config, old_ports) {
-            Ok(route) => {
-                conn_mgr.register_route(&name, route.port_decl(), &route.connect_decl);
-                conn_mgr.apply_all();
-                register_route_osc(osc_dispatch, &name, &route);
-                routes.borrow_mut().insert(name.clone(), route);
-                sync_osc_receivers(config, routes, osc_receivers, osc_dispatch);
-                info!("Reloaded route: {}", name);
-            }
-            Err(e) => error!("Failed to reload route {}: {}", name, e),
-        }
-    } else {
-        routes.borrow_mut().remove(&name);
-        conn_mgr.unregister_route(&name);
-        unregister_route_osc(osc_dispatch, &name);
-        sync_osc_receivers(config, routes, osc_receivers, osc_dispatch);
-        info!("Removed route: {}", name);
-    }
-}
-
-fn handle_config_changed(
-    routes_dir: &Path,
-    config: &mut Arc<Config>,
-    routes: &Rc<RefCell<HashMap<String, Route>>>,
-    conn_mgr: &Arc<ConnectionManager>,
-    osc_dispatch: &OscDispatch,
-    osc_receivers: &mut HashMap<u16, osc::OscReceiver>,
-) {
-    info!("config.toml changed — reloading");
-    match config.reload() {
-        Ok(new_cfg) => {
-            if new_cfg.routes_dir != routes_dir {
-                warn!(
-                    "routes_dir changed in config.toml — restart the daemon for this to take effect"
-                );
-            }
-            *config = Arc::new(new_cfg);
-            reload_all_routes(routes_dir, config, routes, conn_mgr, osc_dispatch);
-            sync_osc_receivers(config, routes, osc_receivers, osc_dispatch);
-            info!("Config reloaded");
-        }
-        Err(e) => error!("Failed to reload config.toml: {}", e),
-    }
-}
-
-fn reload_all_routes(
-    dir: &Path,
-    config: &Arc<Config>,
-    routes: &Rc<RefCell<HashMap<String, Route>>>,
-    conn_mgr: &Arc<ConnectionManager>,
-    osc_dispatch: &OscDispatch,
-) {
-    let names: Vec<String> = routes.borrow().keys().cloned().collect();
-    for name in names {
-        let path = dir.join(format!("{name}.lua"));
-        let old_ports = routes.borrow().get(&name).map(route::Route::ports_rc);
-        match Route::start(&path, config, old_ports) {
-            Ok(route) => {
-                conn_mgr.register_route(&name, route.port_decl(), &route.connect_decl);
-                register_route_osc(osc_dispatch, &name, &route);
-                routes.borrow_mut().insert(name.clone(), route);
-                info!("Reloaded route '{}' with new config", name);
-            }
-            Err(e) => error!("Failed to reload route '{}': {}", name, e),
-        }
-    }
-    conn_mgr.apply_all();
-}
-
-fn load_all_routes(
-    dir: &Path,
-    config: &Arc<Config>,
-    routes: &Rc<RefCell<HashMap<String, Route>>>,
-    conn_mgr: &Arc<ConnectionManager>,
-    osc_dispatch: &OscDispatch,
-) -> Result<()> {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::create_dir_all(dir)
-                .with_context(|| format!("create routes directory {}", dir.display()))?;
-            info!("Created routes directory: {}", dir.display());
-            return Ok(());
-        }
-        Err(e) => {
-            return Err(e).with_context(|| format!("open routes directory {}", dir.display()));
-        }
-    };
-
-    {
-        let mut map = routes.borrow_mut();
-        for entry in entries {
-            let entry = entry?;
-            let path = entry.path();
-            if path.extension().is_some_and(|e| e == "lua") {
-                let name = path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("unknown")
-                    .to_string();
-
-                match Route::start(&path, config, None) {
-                    Ok(route) => {
-                        conn_mgr.register_route(&name, route.port_decl(), &route.connect_decl);
-                        register_route_osc(osc_dispatch, &name, &route);
-                        info!("Loaded route: {}", name);
-                        map.insert(name, route);
-                    }
-                    Err(e) => error!("Failed to load route {}: {}", name, e),
-                }
-            }
-        }
-    }
-    conn_mgr.apply_all();
+    daemon.graceful_shutdown();
     Ok(())
 }
