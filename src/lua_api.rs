@@ -1,4 +1,53 @@
+use anyhow::Context;
 use mlua::prelude::*;
+use mlua::LuaSerdeExt;
+use std::path::Path;
+
+/// Load a route's persisted state from a JSON file into a Lua table.
+///
+/// Returns an empty table if the file does not exist, or if it fails to
+/// read/parse (the error is swallowed since corrupt/missing state should not
+/// stop a route from starting — it just starts with a blank slate).
+pub fn load_json_state(lua: &Lua, path: &Path) -> LuaResult<LuaTable> {
+    let empty = || lua.create_table();
+
+    if !path.exists() {
+        return empty();
+    }
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!("load_json_state: read {}: {}", path.display(), e);
+            return empty();
+        }
+    };
+    let json: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("load_json_state: parse {}: {}", path.display(), e);
+            return empty();
+        }
+    };
+    match lua.to_value(&json)? {
+        LuaValue::Table(t) => Ok(t),
+        _ => empty(),
+    }
+}
+
+/// Serialize a Lua table to `path` as pretty-printed JSON, creating the
+/// parent directory (named after the route) if it doesn't exist yet.
+pub fn save_json_state(lua: &Lua, path: &Path, table: &LuaTable) -> anyhow::Result<()> {
+    let json: serde_json::Value = lua
+        .from_value(LuaValue::Table(table.clone()))
+        .map_err(|e| anyhow::anyhow!("serialize Lua state table: {}", e))?;
+    let text = serde_json::to_string_pretty(&json).context("serialize JSON state")?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create state dir {}", parent.display()))?;
+    }
+    std::fs::write(path, text).with_context(|| format!("write state {}", path.display()))?;
+    Ok(())
+}
 
 /// Convert a TOML table into a Lua table, recursively.
 pub fn toml_table_to_lua(lua: &Lua, table: &toml::Table) -> LuaResult<LuaTable> {
@@ -620,5 +669,67 @@ mod tests {
         assert_eq!(roundtrip(&[0xFA]), vec![0xFA]);
         assert_eq!(roundtrip(&[0xFC]), vec![0xFC]);
         assert_eq!(roundtrip(&[0xFB]), vec![0xFB]);
+    }
+
+    // ── load_json_state / save_json_state ────────────────────────────────────
+
+    #[test]
+    fn load_json_state_missing_file_returns_empty_table() {
+        let lua = lua();
+        let path = std::path::PathBuf::from("/tmp/midi_daemon_test_state_nonexistent_xyz/state.json");
+        let t = load_json_state(&lua, &path).unwrap();
+        assert_eq!(t.len().unwrap(), 0);
+    }
+
+    #[test]
+    fn save_then_load_json_state_roundtrips() {
+        let lua = lua();
+        let dir = std::env::temp_dir().join("midi_daemon_test_state_roundtrip");
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("state.json");
+
+        let table = lua.create_table().unwrap();
+        table.set("bpm", 128.5).unwrap();
+        table.set("running", true).unwrap();
+        table.set("label", "hello").unwrap();
+
+        save_json_state(&lua, &path, &table).unwrap();
+        let loaded = load_json_state(&lua, &path).unwrap();
+
+        assert_eq!(loaded.get::<f64>("bpm").unwrap(), 128.5);
+        assert!(loaded.get::<bool>("running").unwrap());
+        assert_eq!(loaded.get::<String>("label").unwrap(), "hello");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_json_state_creates_parent_directory() {
+        let lua = lua();
+        let dir = std::env::temp_dir().join("midi_daemon_test_state_mkdir_parent");
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("state.json");
+
+        let table = lua.create_table().unwrap();
+        table.set("x", 1).unwrap();
+        save_json_state(&lua, &path, &table).unwrap();
+
+        assert!(path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_json_state_corrupt_file_returns_empty_table() {
+        let lua = lua();
+        let dir = std::env::temp_dir().join("midi_daemon_test_state_corrupt");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        std::fs::write(&path, "not valid json {{{").unwrap();
+
+        let t = load_json_state(&lua, &path).unwrap();
+        assert_eq!(t.len().unwrap(), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

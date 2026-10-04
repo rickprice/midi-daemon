@@ -27,6 +27,10 @@ pub struct Config {
     pub osc_heartbeat_interval: f64,
     /// CLI --routes override; re-applied on reload so it always wins over config file.
     pub routes_dir_override: Option<PathBuf>,
+    /// Server-wide root directory for Lua `on_startup`/`on_shutdown` JSON state files.
+    /// Each route gets its own subdirectory named after the route. Defaults to
+    /// `<cache_dir>/lua-state` when unset.
+    pub state_dir: Option<PathBuf>,
 }
 
 /// Internal deserialization target. `routes_dir` is optional so the caller
@@ -44,6 +48,7 @@ struct RawConfig {
     osc_send_addr: Option<String>,
     #[serde(default = "default_osc_heartbeat_interval")]
     osc_heartbeat_interval: f64,
+    state_dir: Option<PathBuf>,
     #[serde(flatten)]
     route_configs: HashMap<String, toml::Value>,
 }
@@ -62,6 +67,7 @@ impl RawConfig {
             osc_send_addr: self.osc_send_addr,
             osc_heartbeat_interval: self.osc_heartbeat_interval,
             routes_dir_override: None,
+            state_dir: self.state_dir,
         }
     }
 }
@@ -93,6 +99,7 @@ fn default_config(routes_dir: PathBuf) -> Config {
         osc_send_addr: None,
         osc_heartbeat_interval: default_osc_heartbeat_interval(),
         routes_dir_override: None,
+        state_dir: None,
     }
 }
 
@@ -182,6 +189,20 @@ impl Config {
             .unwrap_or_else(|| {
                 home.unwrap().join(".cache/midi-daemon")
             })
+    }
+
+    /// Returns the root directory for Lua `on_startup`/`on_shutdown` JSON state.
+    ///
+    /// Resolution order:
+    ///   1. `state_dir` in config.toml, if set
+    ///   2. `<cache_dir>/lua-state`
+    ///
+    /// Each route gets its own subdirectory named after the route, e.g.
+    /// `<state_dir>/<route-name>/state.json`.
+    pub fn lua_state_dir(&self) -> PathBuf {
+        self.state_dir
+            .clone()
+            .unwrap_or_else(|| self.cache_dir().join("lua-state"))
     }
 
     /// Returns the `[route_name]` section from config.toml, if present.
@@ -514,5 +535,27 @@ mod tests {
         let cfg = Config::load(&path).unwrap();
         assert!(cfg.default_connect_input.is_none());
         assert!(cfg.default_connect_output.is_none());
+    }
+
+    // ── state_dir / lua_state_dir ──────────────────────────────────────────────
+
+    #[test]
+    fn state_dir_absent_falls_back_to_cache_dir() {
+        let path = write_tmp("midi_daemon_test_no_state_dir.toml", "default_bpm = 120.0\n");
+        let cfg = Config::load(&path).unwrap();
+        assert!(cfg.state_dir.is_none());
+        assert_eq!(cfg.lua_state_dir(), cfg.cache_dir().join("lua-state"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn state_dir_configured_wins_over_cache_dir() {
+        let path = write_tmp(
+            "midi_daemon_test_state_dir.toml",
+            "state_dir = \"/custom/lua-state\"\n",
+        );
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.lua_state_dir(), PathBuf::from("/custom/lua-state"));
+        let _ = std::fs::remove_file(&path);
     }
 }

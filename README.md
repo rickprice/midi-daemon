@@ -255,8 +255,9 @@ When the daemon receives SIGTERM — whether from `systemctl stop`, `kill`, or
 the system shutting down — it:
 
 1. Sends a shutdown command to every running route's event loop.
-2. Waits for each event loop thread to finish (which includes saving any
-   persisted param state for routes with `persist_state = true`).
+2. Waits for each event loop thread to finish (which includes calling
+   `on_shutdown()`, where a route can call `save_state()` — see
+   [Route state persistence](#route-state-persistence)).
 3. Exits cleanly.
 
 `systemctl stop` will wait up to 30 seconds for this to complete before
@@ -353,6 +354,13 @@ function on_tick(tick, bpm, ppqn) end
 -- msg.port holds the input port name when the route has multiple inputs.
 -- Other msg fields vary by type (see below).
 function on_midi(msg) end
+
+-- Optional lifecycle hooks: called once right after init(), and once on
+-- graceful shutdown, respectively. Commonly used with load_state()/
+-- save_state() to persist state across restarts (see "Route state
+-- persistence" below), but take no implicit arguments of their own.
+function on_startup() end
+function on_shutdown() end
 ```
 
 ### Named ports via `init()`
@@ -725,27 +733,59 @@ nested tables.
 
 ### Route state persistence
 
-Routes that expose `osc.params` in `init()` can save their param values on
-shutdown and restore them on the next startup. Enable per-route:
+Any route can call `save_state(table)` and `load_state()` to persist
+arbitrary runtime state across restarts — no `osc.params` required. These are
+the only two state primitives; the script never touches the filesystem
+directly, and nothing is persisted unless the script explicitly calls one of
+them.
 
-```toml
-[my-route]
-persist_state = true   # default: false
+```lua
+local volume = 1.0
+
+-- on_startup/on_shutdown are plain lifecycle hooks — they don't receive or
+-- expect a state argument. Call load_state()/save_state() yourself.
+function on_startup()
+    local state = load_state()
+    if state.volume ~= nil then volume = state.volume end
+end
+
+function on_shutdown()
+    save_state({ volume = volume })
+end
 ```
 
-On **graceful shutdown** (SIGTERM / `systemctl stop`) the daemon calls each
-param's `get()` function and writes the values to a TOML file:
+- `load_state()` returns a plain Lua table ("hash") read from
+  `<state_dir>/<route-name>/state.json` — an empty table if the file doesn't
+  exist yet.
+- `save_state(table)` writes a table to that same file immediately.
+- Both can be called from anywhere, not just `on_startup`/`on_shutdown` — a
+  route can checkpoint periodically (e.g. from `on_tick`) or right after a
+  change (e.g. from `on_midi`) instead of, or in addition to, relying on a
+  clean shutdown:
 
-| Running as | State file location |
+```lua
+function on_midi(msg)
+    if msg.type == "cc" and msg.controller == 7 then
+        save_state({ volume = msg.value })   -- persisted right away
+    end
+end
+```
+
+State is only saved when the script calls `save_state()` — a graceful
+shutdown does **not** implicitly persist anything on its own (though calling
+`save_state()` from `on_shutdown()`, as above, is the common pattern).
+
+The state root directory is configurable server-wide in `config.toml`:
+
+```toml
+state_dir = "/var/lib/midi-daemon/state"   # default: <cache_dir>/lua-state
+```
+
+| Running as | Default state directory |
 |---|---|
-| system service (via systemd `CacheDirectory=`) | `/var/cache/midi-daemon/route-state/<name>.toml` |
-| root | `/var/cache/midi-daemon/route-state/<name>.toml` |
-| interactive user (non-root) | `~/.cache/midi-daemon/route-state/<name>.toml` |
-
-On startup, each saved value is restored by calling the param's `set()`
-function, exactly as if an OSC message had arrived. Param names that exist in
-the file but are no longer declared by the route are logged as warnings and
-skipped. Params with no saved value start at their Lua-script default.
+| system service (via systemd `CacheDirectory=`) | `$CACHE_DIRECTORY/lua-state/<name>/state.json` |
+| root | `/var/cache/midi-daemon/lua-state/<name>/state.json` |
+| interactive user (non-root) | `~/.cache/midi-daemon/lua-state/<name>/state.json` |
 
 State is **not** saved on SIGKILL or a crash — always use `systemctl stop`
 (or `kill -TERM`) to preserve state.

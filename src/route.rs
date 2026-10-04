@@ -31,7 +31,7 @@ enum RouteEvent {
     Osc { from: SocketAddr, address: String, args: Vec<rosc::OscType> },
     /// Re-apply all current param values through their `set()` functions.
     ResyncState,
-    /// Save state (if persist_state is on) and exit the event loop cleanly.
+    /// Call `on_shutdown()` and exit the event loop cleanly.
     Shutdown,
 }
 
@@ -225,16 +225,8 @@ impl Route {
 
         let route_cfg = config.route_config(&name).cloned();
 
-        let persist_state = route_cfg.as_ref()
-            .and_then(|c| c.get("persist_state"))
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-
-        let state_file: Option<std::path::PathBuf> = if persist_state {
-            Some(config.cache_dir().join("route-state").join(format!("{}.toml", name)))
-        } else {
-            None
-        };
+        // JSON state file backing the route's save_state()/load_state() calls.
+        let lua_state_file = config.lua_state_dir().join(&name).join("state.json");
 
         // Run the script once to extract port layout, connect patterns, and OSC declarations.
         let (decl, raw_connect, osc_decl) =
@@ -333,7 +325,7 @@ impl Route {
                 out_conns_for_thread,
                 default_out,
                 timer_for_thread,
-                RouteThreadArgs { route_cfg, osc_sender, osc_heartbeat_interval, state_file },
+                RouteThreadArgs { route_cfg, osc_sender, osc_heartbeat_interval, lua_state_file },
             ) {
                 error!("Route '{}' event loop error: {}", name_for_thread, e);
             }
@@ -371,6 +363,8 @@ fn setup_extract_lua(lua: &Lua, name: &str, route_cfg: Option<&toml::Table>) -> 
     lua.globals().set("set_ppqn", lua.create_function(|_, _: u32| Ok(()))?)?;
     lua.globals().set("get_ppqn", lua.create_function(|_, ()| -> LuaResult<u32> { Ok(24) })?)?;
     lua.globals().set("log", lua.create_function(|_, _: String| Ok(()))?)?;
+    lua.globals().set("save_state", lua.create_function(|_, _: LuaTable| Ok(()))?)?;
+    lua.globals().set("load_state", lua.create_function(|lua, ()| lua.create_table())?)?;
     lua.globals().set("ROUTE_NAME", name)?;
     lua.globals().set("OSC_SEND_ENABLED", false)?;
     let cfg_table = match route_cfg {
@@ -665,7 +659,7 @@ struct RouteThreadArgs {
     route_cfg: Option<toml::Table>,
     osc_sender: Option<OscSender>,
     osc_heartbeat_interval: f64,
-    state_file: Option<std::path::PathBuf>,
+    lua_state_file: std::path::PathBuf,
 }
 
 fn run_lua_event_loop(
@@ -677,7 +671,7 @@ fn run_lua_event_loop(
     timer: Arc<Timer>,
     args: RouteThreadArgs,
 ) -> Result<()> {
-    let RouteThreadArgs { route_cfg, osc_sender, osc_heartbeat_interval, state_file } = args;
+    let RouteThreadArgs { route_cfg, osc_sender, osc_heartbeat_interval, lua_state_file } = args;
     let lua = Lua::new();
 
     // --- Expose `send(msg)` or `send(port_name, msg)` ---
@@ -924,6 +918,37 @@ fn run_lua_event_loop(
         lua.globals().set("config", cfg_table)?;
     }
 
+    // --- Expose `save_state(table)` / `load_state()` ---
+    //
+    // The only state persistence primitives — on_startup()/on_shutdown() are
+    // plain lifecycle hooks with no implicit state argument. A route that
+    // wants to persist state calls these explicitly (typically inside
+    // on_startup/on_shutdown, but they work anywhere, e.g. a periodic
+    // checkpoint from on_tick). Reads/writes
+    // <state_dir>/<route-name>/state.json.
+    {
+        let path = lua_state_file.clone();
+        let name_for_fn = name.to_string();
+        let f = lua.create_function(move |lua, table: LuaTable| -> LuaResult<()> {
+            if let Err(e) = crate::lua_api::save_json_state(lua, &path, &table) {
+                warn!("[{}] save_state error: {}", name_for_fn, e);
+            }
+            Ok(())
+        })?;
+        lua.globals().set("save_state", f)?;
+    }
+    {
+        let path = lua_state_file.clone();
+        let name_for_fn = name.to_string();
+        let f = lua.create_function(move |lua, ()| -> LuaResult<LuaTable> {
+            Ok(crate::lua_api::load_json_state(lua, &path).unwrap_or_else(|e| {
+                warn!("[{}] load_state error: {}", name_for_fn, e);
+                lua.create_table().expect("create empty Lua state table")
+            }))
+        })?;
+        lua.globals().set("load_state", f)?;
+    }
+
     // --- Load the stdlib ---
     lua.load(LUA_STDLIB).set_name("stdlib").exec()
         .map_err(|e| anyhow::anyhow!("Failed to load Lua stdlib: {}", e))?;
@@ -952,15 +977,21 @@ fn run_lua_event_loop(
                 }
             });
 
-    // --- Restore persisted state ---
-    if let (Some(ps), Some(path)) = (&osc_param_set, &state_file) {
-        ps.load_state(&lua, path);
-    }
-
     // Cache callbacks once — avoids a global-table lookup on every event.
     let on_midi_fn: Option<LuaFunction> = lua.globals().get("on_midi").ok();
     let on_tick_fn: Option<LuaFunction> = lua.globals().get("on_tick").ok();
     let on_osc_fn: Option<LuaFunction> = lua.globals().get("on_osc").ok();
+    let on_startup_fn: Option<LuaFunction> = lua.globals().get("on_startup").ok();
+    let on_shutdown_fn: Option<LuaFunction> = lua.globals().get("on_shutdown").ok();
+
+    // --- Call on_startup() ---
+    //
+    // A plain lifecycle hook with no implicit argument — a route that wants
+    // to restore state calls load_state() itself inside it.
+    if let Some(ref on_startup) = on_startup_fn
+        && let Err(e) = on_startup.call::<()>(()) {
+        warn!("[{}] on_startup error: {}", name, e);
+    }
 
     // --- Event loop ---
     while let Some(event) = rx.blocking_recv() {
@@ -1027,10 +1058,13 @@ fn run_lua_event_loop(
         }
     }
 
-    // --- Persist state on shutdown ---
-    if let (Some(ps), Some(path)) = (&osc_param_set, &state_file)
-        && let Err(e) = ps.save_state(&lua, path) {
-        warn!("[{}] Failed to save route state: {}", name, e);
+    // --- Call on_shutdown() ---
+    //
+    // A plain lifecycle hook with no implicit argument — a route that wants
+    // to persist state calls save_state() itself inside it.
+    if let Some(ref on_shutdown) = on_shutdown_fn
+        && let Err(e) = on_shutdown.call::<()>(()) {
+        warn!("[{}] on_shutdown error: {}", name, e);
     }
 
     Ok(())

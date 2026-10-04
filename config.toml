@@ -76,20 +76,22 @@ default_ppqn = 24
 # [osc-bridge]
 # osc_port = 9000
 
-# ── Per-route state persistence ───────────────────────────────────────────────
-# Each route that declares osc.params in init() can optionally save its param
-# values on shutdown and restore them on the next startup.
+# ── Lua process state (save_state / load_state) ───────────────────────────────
+# Any route can call save_state(table) and load_state() in its .lua file to
+# persist/restore arbitrary state across restarts. These are the only state
+# primitives — on_startup()/on_shutdown() are plain lifecycle hooks with no
+# implicit state argument, so a route calls load_state() inside on_startup()
+# and save_state(...) inside on_shutdown() itself if it wants persistence.
+# Both can also be called from anywhere else (e.g. on_tick, on_midi) to
+# checkpoint state proactively instead of waiting for shutdown.
 #
-# Add to any [route-name] section to enable:
-#   persist_state = true
+# State is stored as a JSON file at <state_dir>/<route-name>/state.json.
+# Routes never touch the filesystem directly — all I/O happens in the daemon.
 #
-# Saved to:
-#   User config  → ~/.cache/midi-daemon/route-state/<name>.toml
-#   System config → /var/cache/midi-daemon/route-state/<name>.toml
+# state_dir = "/var/lib/midi-daemon/state"   # default: <cache_dir>/lua-state
 #
-# On load, each saved param is restored via its set() function.
-# Unknown param names in the file are logged and skipped.
-# Default: false (disabled).
+# Saved only on graceful shutdown (SIGTERM / systemctl stop / kill -TERM);
+# not on SIGKILL or a crash.
 
 # ── Per-route sections ────────────────────────────────────────────────────────
 # Each [section-name] below corresponds to routes.d/<section-name>.lua.
