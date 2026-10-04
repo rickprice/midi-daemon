@@ -570,7 +570,7 @@ mod tests {
     }
 
     fn make_msg(lua: &Lua, addr: &str, from: &str, args_lua: &str) -> LuaTable {
-        lua.load(&format!(
+        lua.load(format!(
             r#"{{ address = "{}", from = "{}", args = {{{}}} }}"#,
             addr, from, args_lua
         ))
@@ -1154,7 +1154,7 @@ mod tests {
     // ── dispatch_midi ─────────────────────────────────────────────────────────
 
     fn make_midi_msg(lua: &Lua, fields: &str) -> LuaTable {
-        lua.load(&format!("{{ {} }}", fields)).eval().unwrap()
+        lua.load(format!("{{ {} }}", fields)).eval().unwrap()
     }
 
     fn ps_with_bpm(lua: &Lua) -> OscParamSet {

@@ -169,7 +169,7 @@ mod tests {
 
         let mut count = 0u32;
         let deadline = tokio::time::timeout(Duration::from_millis(500), async {
-            while let Some(_) = rx.recv().await {
+            while rx.recv().await.is_some() {
                 count += 1;
                 if count >= 3 {
                     break;
