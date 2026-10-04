@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
-/// Connect patterns for a route's ports: port_name → list of regex strings.
+/// Connect patterns for a route's ports: `port_name` → list of regex strings.
 #[derive(Debug, Clone, Default)]
 pub struct ConnectDecl {
     pub inputs: HashMap<String, Vec<String>>,
@@ -77,9 +77,9 @@ impl RoutePorts {
     fn create(
         route_name: &str,
         decl: &PortDecl,
-        initial_tx: mpsc::Sender<RouteEvent>,
+        initial_tx: &mpsc::Sender<RouteEvent>,
     ) -> Result<Rc<Self>> {
-        let base = format!("midi-daemon:{}", route_name);
+        let base = format!("midi-daemon:{route_name}");
         let is_default = decl.is_default();
 
         let mut out_conns = HashMap::new();
@@ -89,18 +89,18 @@ impl RoutePorts {
         for port_name in &decl.outputs {
             // Backward-compat: single default port keeps the old ALSA names.
             let (client_name, alsa_port) = if is_default {
-                (format!("{}-out", base), base.clone())
+                (format!("{base}-out"), base.clone())
             } else {
                 (
-                    format!("{}/{}-out", base, port_name),
-                    format!("{}/{}", base, port_name),
+                    format!("{base}/{port_name}-out"),
+                    format!("{base}/{port_name}"),
                 )
             };
             let midi_out =
                 MidiOutput::new(&client_name).context("Failed to create MIDI output")?;
             let conn = midi_out
                 .create_virtual(&alsa_port)
-                .map_err(|e| anyhow::anyhow!("Failed to create virtual MIDI output '{}': {}", alsa_port, e))?;
+                .map_err(|e| anyhow::anyhow!("Failed to create virtual MIDI output '{alsa_port}': {e}"))?;
             out_conns.insert(port_name.clone(), Arc::new(Mutex::new(conn)));
         }
 
@@ -109,9 +109,9 @@ impl RoutePorts {
                 Arc::new(Mutex::new(Some(initial_tx.clone())));
 
             let alsa_name = if is_default {
-                format!("{}-in", base)
+                format!("{base}-in")
             } else {
-                format!("{}/{}-in", base, port_name)
+                format!("{base}/{port_name}-in")
             };
 
             let midi_in = MidiInput::new(&alsa_name).context("Failed to create MIDI input")?;
@@ -121,8 +121,8 @@ impl RoutePorts {
             let in_conn = midi_in
                 .create_virtual(
                     &alsa_name,
-                    move |_stamp, message, _| {
-                        let guard = fwd_ref.lock().unwrap_or_else(|p| p.into_inner());
+                    move |_stamp, message, ()| {
+                        let guard = fwd_ref.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                         if let Some(tx) = guard.as_ref()
                             && tx.try_send(RouteEvent::Midi {
                                 port: port_name_owned.clone(),
@@ -133,7 +133,7 @@ impl RoutePorts {
                     },
                     (),
                 )
-                .map_err(|e| anyhow::anyhow!("Failed to create virtual MIDI input '{}': {}", alsa_name, e))?;
+                .map_err(|e| anyhow::anyhow!("Failed to create virtual MIDI input '{alsa_name}': {e}"))?;
 
             midi_fwds.insert(port_name.clone(), fwd);
             in_conns.push(in_conn);
@@ -150,7 +150,7 @@ impl RoutePorts {
     /// Point all input callbacks at a new event channel (used on hot-reload).
     fn redirect_inputs(&self, new_tx: &mpsc::Sender<RouteEvent>) {
         for fwd in self.midi_fwds.values() {
-            *fwd.lock().unwrap_or_else(|p| p.into_inner()) = Some(new_tx.clone());
+            *fwd.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(new_tx.clone());
         }
     }
 }
@@ -164,7 +164,7 @@ pub struct Route {
     /// Sender into the route's event channel, used by the global OSC dispatcher.
     osc_tx: mpsc::Sender<RouteEvent>,
     pub connect_decl: ConnectDecl,
-    /// OSC receive port declared by this route's init(). The daemon starts exactly
+    /// OSC receive port declared by this route's `init()`. The daemon starts exactly
     /// one shared receiver per unique port and dispatches by /route-name/ prefix.
     pub osc_receive_port: Option<u16>,
 }
@@ -199,7 +199,7 @@ impl Route {
 }
 
 impl Route {
-    /// Return a clone of the ports Arc so the caller can pass them to a new Route::start
+    /// Return a clone of the ports Arc so the caller can pass them to a new `Route::start`
     /// without consuming (and stopping) this route first.
     pub fn ports_rc(&self) -> Rc<RoutePorts> {
         Rc::clone(&self.ports)
@@ -209,9 +209,14 @@ impl Route {
         &self.ports.decl
     }
 
+    // Sequential one-time setup (extract decls, open ports, set up OSC sender,
+    // spawn the event-loop thread) — each step depends on the previous one's
+    // result, so splitting it up would just thread the same local state through
+    // several helper functions.
+    #[allow(clippy::too_many_lines)]
     pub fn start(
         lua_path: &Path,
-        config: Arc<Config>,
+        config: &Arc<Config>,
         existing_ports: Option<Rc<RoutePorts>>,
     ) -> Result<Self> {
         let name = lua_path
@@ -255,7 +260,7 @@ impl Route {
                         name
                     );
                 }
-                RoutePorts::create(&name, &decl, tx.clone())?
+                RoutePorts::create(&name, &decl, &tx)?
             }
         };
 
@@ -324,7 +329,7 @@ impl Route {
                 rx,
                 out_conns_for_thread,
                 default_out,
-                timer_for_thread,
+                &timer_for_thread,
                 RouteThreadArgs { route_cfg, osc_sender, osc_heartbeat_interval, lua_state_file },
             ) {
                 error!("Route '{}' event loop error: {}", name_for_thread, e);
@@ -353,7 +358,7 @@ impl Route {
 
 const LUA_STDLIB: &str = include_str!("lua/stdlib.lua");
 
-/// Install no-op stubs, the config table, and the stdlib so init() can safely
+/// Install no-op stubs, the config table, and the stdlib so `init()` can safely
 /// call any global the live event loop exposes.
 fn setup_extract_lua(lua: &Lua, name: &str, route_cfg: Option<&toml::Table>) -> Result<()> {
     lua.globals().set("send", lua.create_function(|_, _: LuaMultiValue| Ok(()))?)?;
@@ -369,12 +374,12 @@ fn setup_extract_lua(lua: &Lua, name: &str, route_cfg: Option<&toml::Table>) -> 
     lua.globals().set("OSC_SEND_ENABLED", false)?;
     let cfg_table = match route_cfg {
         Some(tbl) => toml_table_to_lua(lua, tbl)
-            .map_err(|e| anyhow::anyhow!("Failed to convert config to Lua: {}", e))?,
+            .map_err(|e| anyhow::anyhow!("Failed to convert config to Lua: {e}"))?,
         None => lua.create_table()?,
     };
     lua.globals().set("config", cfg_table)?;
     lua.load(LUA_STDLIB).set_name("stdlib").exec()
-        .map_err(|e| anyhow::anyhow!("Failed to load Lua stdlib: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to load Lua stdlib: {e}"))?;
     Ok(())
 }
 
@@ -400,10 +405,7 @@ fn lua_val_to_patterns(val: LuaValue) -> Vec<String> {
 /// Extract `connect` patterns from the table returned by `init()`.
 fn connect_from_lua_table(tbl: &LuaTable) -> ConnectDecl {
     let mut decl = ConnectDecl::default();
-    let connect_tbl = match tbl.get::<LuaValue>("connect") {
-        Ok(LuaValue::Table(t)) => t,
-        _ => return decl,
-    };
+    let Ok(LuaValue::Table(connect_tbl)) = tbl.get::<LuaValue>("connect") else { return decl };
     if let Ok(LuaValue::Table(t)) = connect_tbl.get::<LuaValue>("inputs") {
         for (k, v) in t.pairs::<String, LuaValue>().flatten() {
             let pats = lua_val_to_patterns(v);
@@ -419,11 +421,11 @@ fn connect_from_lua_table(tbl: &LuaTable) -> ConnectDecl {
     // Singular patterns stored under "" sentinel so apply_connect_defaults can expand them.
     if let Ok(v) = connect_tbl.get::<LuaValue>("input") {
         let pats = lua_val_to_patterns(v);
-        if !pats.is_empty() { decl.inputs.insert("".into(), pats); }
+        if !pats.is_empty() { decl.inputs.insert(String::new(), pats); }
     }
     if let Ok(v) = connect_tbl.get::<LuaValue>("output") {
         let pats = lua_val_to_patterns(v);
-        if !pats.is_empty() { decl.outputs.insert("".into(), pats); }
+        if !pats.is_empty() { decl.outputs.insert(String::new(), pats); }
     }
     decl
 }
@@ -449,9 +451,9 @@ fn connect_from_toml(mut decl: ConnectDecl, route_cfg: Option<&toml::Table>) -> 
             };
             if pats.is_empty() { continue; }
             if key == "connect_input" {
-                decl.inputs.entry("".into()).or_insert_with(|| pats);
+                decl.inputs.entry(String::new()).or_insert_with(|| pats);
             } else if key == "connect_output" {
-                decl.outputs.entry("".into()).or_insert_with(|| pats);
+                decl.outputs.entry(String::new()).or_insert_with(|| pats);
             } else if let Some(port) = key
                 .strip_prefix("connect_")
                 .and_then(|s| s.strip_suffix("-in"))
@@ -495,7 +497,7 @@ fn extract_all_decls(
     if let Ok(Some(f)) = lua.globals().get::<Option<LuaFunction>>("init") {
         match f.call::<LuaValue>(()) {
             Ok(LuaValue::Table(ref tbl)) => {
-                let port_decl = parse_port_decl_from_lua(tbl)?;
+                let port_decl = parse_port_decl_from_lua(tbl);
                 let connect_decl = connect_from_toml(connect_from_lua_table(tbl), route_cfg);
                 let osc_decl = osc_from_lua_table(tbl);
                 return Ok((port_decl, connect_decl, osc_decl));
@@ -524,13 +526,13 @@ fn extract_all_decls(
 fn osc_from_lua_table(tbl: &LuaTable) -> OscDecl {
     let mut decl = OscDecl::default();
 
-    let osc_tbl = match tbl.get::<LuaValue>("osc") {
-        Ok(LuaValue::Table(t)) => t,
-        _ => return decl,
-    };
+    let Ok(LuaValue::Table(osc_tbl)) = tbl.get::<LuaValue>("osc") else { return decl };
 
     let port_num: Option<i64> = match osc_tbl.get::<LuaValue>("receive").unwrap_or(LuaValue::Nil) {
         LuaValue::Integer(n) => Some(n),
+        // Saturating float->int cast (Rust's `as` never invokes UB here); the
+        // range check below rejects anything outside 1..=65535 regardless.
+        #[allow(clippy::cast_possible_truncation)]
         LuaValue::Number(f) if f.fract() == 0.0 => Some(f as i64),
         LuaValue::Number(f) => {
             warn!("OSC receive port must be an integer, got {}", f);
@@ -544,7 +546,7 @@ fn osc_from_lua_table(tbl: &LuaTable) -> OscDecl {
     };
     if let Some(n) = port_num {
         if n > 0 && n <= 65535 {
-            decl.receive_port = Some(n as u16);
+            decl.receive_port = Some(u16::try_from(n).expect("just checked n is in 1..=65535"));
         } else {
             warn!("OSC receive port {} is out of range (1–65535)", n);
         }
@@ -554,12 +556,9 @@ fn osc_from_lua_table(tbl: &LuaTable) -> OscDecl {
         for pair in send_tbl.pairs::<String, LuaValue>() {
             if let Ok((target_name, LuaValue::String(addr_str))) = pair
                 && let Ok(s) = addr_str.to_str() {
-                match parse_socket_addr(&s) {
-                    Some(addr) => {
-                        decl.send_targets.insert(target_name, addr);
-                    }
-                    None => warn!("OSC send target '{}': invalid address '{}'", target_name, s),
-                }
+                if let Some(addr) = parse_socket_addr(&s) {
+                    decl.send_targets.insert(target_name, addr);
+                } else { warn!("OSC send target '{}': invalid address '{}'", target_name, s) }
             }
         }
     }
@@ -607,7 +606,7 @@ fn apply_connect_defaults(
     raw
 }
 
-fn parse_port_decl_from_lua(tbl: &LuaTable) -> Result<PortDecl> {
+fn parse_port_decl_from_lua(tbl: &LuaTable) -> PortDecl {
     fn extract_names(val: LuaValue) -> Vec<String> {
         match val {
             LuaValue::String(s) => vec![s.to_str().map(|b| b.to_string()).unwrap_or_default()],
@@ -616,7 +615,7 @@ fn parse_port_decl_from_lua(tbl: &LuaTable) -> Result<PortDecl> {
                 for i in 1u32.. {
                     match t.get::<LuaValue>(i) {
                         Ok(LuaValue::String(s)) => {
-                            names.push(s.to_str().map(|b| b.to_string()).unwrap_or_default())
+                            names.push(s.to_str().map(|b| b.to_string()).unwrap_or_default());
                         }
                         _ => break,
                     }
@@ -631,10 +630,10 @@ fn parse_port_decl_from_lua(tbl: &LuaTable) -> Result<PortDecl> {
     let outputs = extract_names(tbl.get::<LuaValue>("outputs").unwrap_or(LuaValue::Nil));
 
     if inputs.is_empty() || outputs.is_empty() {
-        return Ok(PortDecl::default());
+        return PortDecl::default();
     }
 
-    Ok(PortDecl { inputs, outputs })
+    PortDecl { inputs, outputs }
 }
 
 fn parse_port_decl_from_toml(cfg: &toml::Table) -> Option<PortDecl> {
@@ -662,13 +661,19 @@ struct RouteThreadArgs {
     lua_state_file: std::path::PathBuf,
 }
 
+// Owns the route's Lua VM for its whole lifetime: registers all the Lua-facing
+// globals (send, send_osc, save_state, ...), loads the script, then runs the
+// event loop until shutdown. Splitting the setup from the loop would mean
+// threading a dozen captured closures/variables across a function boundary
+// for no real gain.
+#[allow(clippy::too_many_lines)]
 fn run_lua_event_loop(
     name: &str,
     script: &str,
     mut rx: mpsc::Receiver<RouteEvent>,
     out_conns: HashMap<String, Arc<Mutex<MidiOutputConnection>>>,
     default_out: String,
-    timer: Arc<Timer>,
+    timer: &Arc<Timer>,
     args: RouteThreadArgs,
 ) -> Result<()> {
     let RouteThreadArgs { route_cfg, osc_sender, osc_heartbeat_interval, lua_state_file } = args;
@@ -682,57 +687,43 @@ fn run_lua_event_loop(
         let send_fn = lua.create_function(move |_lua, args: LuaMultiValue| -> LuaResult<()> {
             let (port_name, msg_table) = match args.len() {
                 1 => {
-                    let msg = match args.into_iter().next() {
-                        Some(LuaValue::Table(t)) => t,
-                        _ => {
-                            return Err(LuaError::RuntimeError(
-                                "send: expected a message table".into(),
-                            ))
-                        }
+                    let Some(LuaValue::Table(msg)) = args.into_iter().next() else {
+                        return Err(LuaError::RuntimeError(
+                            "send: expected a message table".into(),
+                        ));
                     };
                     (default_out.clone(), msg)
                 }
                 2 => {
                     let mut iter = args.into_iter();
-                    let port = match iter.next() {
-                        Some(LuaValue::String(s)) => {
-                            s.to_str().map_err(LuaError::external)?.to_string()
-                        }
-                        _ => {
-                            return Err(LuaError::RuntimeError(
-                                "send: first argument must be a port name string".into(),
-                            ))
-                        }
+                    let Some(LuaValue::String(s)) = iter.next() else {
+                        return Err(LuaError::RuntimeError(
+                            "send: first argument must be a port name string".into(),
+                        ));
                     };
-                    let msg = match iter.next() {
-                        Some(LuaValue::Table(t)) => t,
-                        _ => {
-                            return Err(LuaError::RuntimeError(
-                                "send: second argument must be a message table".into(),
-                            ))
-                        }
+                    let port = s.to_str().map_err(LuaError::external)?.to_string();
+                    let Some(LuaValue::Table(msg)) = iter.next() else {
+                        return Err(LuaError::RuntimeError(
+                            "send: second argument must be a message table".into(),
+                        ));
                     };
                     (port, msg)
                 }
                 n => {
                     return Err(LuaError::RuntimeError(format!(
-                        "send: expected 1 or 2 arguments, got {}",
-                        n
+                        "send: expected 1 or 2 arguments, got {n}"
                     )))
                 }
             };
 
-            match out_conns.get(&port_name) {
-                Some(conn) => match lua_to_midi_bytes(&msg_table) {
-                    Ok(bytes) => {
-                        if let Err(e) = conn.lock().unwrap_or_else(|p| p.into_inner()).send(&bytes) {
-                            warn!("MIDI send error on port '{}': {}", port_name, e);
-                        }
+            if let Some(conn) = out_conns.get(&port_name) { match lua_to_midi_bytes(&msg_table) {
+                Ok(bytes) => {
+                    if let Err(e) = conn.lock().unwrap_or_else(std::sync::PoisonError::into_inner).send(&bytes) {
+                        warn!("MIDI send error on port '{}': {}", port_name, e);
                     }
-                    Err(e) => warn!("lua_to_midi_bytes error: {}", e),
-                },
-                None => warn!("send: unknown output port '{}'", port_name),
-            }
+                }
+                Err(e) => warn!("lua_to_midi_bytes error: {}", e),
+            } } else { warn!("send: unknown output port '{}'", port_name) }
 
             Ok(())
         })?;
@@ -741,7 +732,7 @@ fn run_lua_event_loop(
 
     // --- Expose `set_bpm(bpm)` ---
     {
-        let t = Arc::clone(&timer);
+        let t = Arc::clone(timer);
         let f = lua.create_function(move |_, bpm: f64| {
             t.set_bpm(bpm);
             Ok(())
@@ -751,14 +742,14 @@ fn run_lua_event_loop(
 
     // --- Expose `get_bpm()` ---
     {
-        let t = Arc::clone(&timer);
+        let t = Arc::clone(timer);
         let f = lua.create_function(move |_, ()| Ok(t.get_bpm()))?;
         lua.globals().set("get_bpm", f)?;
     }
 
     // --- Expose `set_ppqn(ppqn)` ---
     {
-        let t = Arc::clone(&timer);
+        let t = Arc::clone(timer);
         let f = lua.create_function(move |_, ppqn: u32| {
             t.set_ppqn(ppqn);
             Ok(())
@@ -768,7 +759,7 @@ fn run_lua_event_loop(
 
     // --- Expose `get_ppqn()` ---
     {
-        let t = Arc::clone(&timer);
+        let t = Arc::clone(timer);
         let f = lua.create_function(move |_, ()| Ok(t.get_ppqn()))?;
         lua.globals().set("get_ppqn", f)?;
     }
@@ -805,12 +796,9 @@ fn run_lua_event_loop(
     {
         let subs_cache_for_send = Arc::clone(&subs_cache);
         let f = lua.create_function(move |_, args: LuaMultiValue| -> LuaResult<()> {
-            let sender = match &osc_sender {
-                Some(s) => s,
-                None => {
-                    warn!("send_osc: no OSC socket available");
-                    return Ok(());
-                }
+            let Some(sender) = &osc_sender else {
+                warn!("send_osc: no OSC socket available");
+                return Ok(());
             };
 
             if args.is_empty() {
@@ -836,7 +824,7 @@ fn run_lua_event_loop(
                 };
                 if !address.starts_with('/') {
                     return Err(LuaError::RuntimeError(format!(
-                        "send_osc: OSC address must start with '/', got '{}'", address
+                        "send_osc: OSC address must start with '/', got '{address}'"
                     )));
                 }
                 let osc_args = args.into_iter().skip(2)
@@ -855,7 +843,7 @@ fn run_lua_event_loop(
                     (t, first, 1usize)
                 } else if sender.targets.is_empty() {
                     // No named target: send to all live subscribers instead.
-                    let subs: Vec<String> = subs_cache_for_send.lock().unwrap_or_else(|p| p.into_inner()).clone();
+                    let subs: Vec<String> = subs_cache_for_send.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
                     if !subs.is_empty() {
                         let osc_args = args.into_iter().skip(1)
                             .map(|v| lua_val_to_osc_type(&v))
@@ -877,7 +865,7 @@ fn run_lua_event_loop(
                 // Named-target form.
                 if !sender.targets.contains_key(&first) {
                     return Err(LuaError::RuntimeError(format!(
-                        "send_osc: unknown target '{}'", first
+                        "send_osc: unknown target '{first}'"
                     )));
                 }
                 let address = match args.get(1) {
@@ -888,7 +876,7 @@ fn run_lua_event_loop(
                 };
                 if !address.starts_with('/') {
                     return Err(LuaError::RuntimeError(format!(
-                        "send_osc: OSC address must start with '/', got '{}'", address
+                        "send_osc: OSC address must start with '/', got '{address}'"
                     )));
                 }
                 (first, address, 2usize)
@@ -912,7 +900,7 @@ fn run_lua_event_loop(
     {
         let cfg_table = match route_cfg {
             Some(ref tbl) => toml_table_to_lua(&lua, tbl)
-                .map_err(|e| anyhow::anyhow!("Failed to convert route config to Lua: {}", e))?,
+                .map_err(|e| anyhow::anyhow!("Failed to convert route config to Lua: {e}"))?,
             None => lua.create_table()?,
         };
         lua.globals().set("config", cfg_table)?;
@@ -951,11 +939,11 @@ fn run_lua_event_loop(
 
     // --- Load the stdlib ---
     lua.load(LUA_STDLIB).set_name("stdlib").exec()
-        .map_err(|e| anyhow::anyhow!("Failed to load Lua stdlib: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to load Lua stdlib: {e}"))?;
 
     // --- Load the user script ---
     anyhow::Context::with_context(lua.load(script).set_name(name).exec(), || {
-        format!("Lua load error in '{}'", name)
+        format!("Lua load error in '{name}'")
     })?;
 
     // --- Build OscParamSet from init().osc.params if declared ---
@@ -967,7 +955,7 @@ fn run_lua_event_loop(
             .and_then(|f| f.call::<LuaValue>(()).ok())
             .and_then(|v| if let LuaValue::Table(t) = v { Some(t) } else { None })
             .and_then(|tbl| {
-                let prefix = format!("/{}", name);
+                let prefix = format!("/{name}");
                 match crate::osc_params::from_init_table(&lua, &prefix, &tbl, osc_heartbeat_interval) {
                     Ok(ps) => ps,
                     Err(e) => {
@@ -1020,7 +1008,7 @@ fn run_lua_event_loop(
                     if let Err(e) = ps.tick(&lua) {
                         warn!("[{}] osc_params tick error: {}", name, e);
                     }
-                    *subs_cache.lock().unwrap_or_else(|p| p.into_inner()) = ps.subscriber_addrs();
+                    *subs_cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = ps.subscriber_addrs();
                 }
                 if let Some(ref on_tick) = on_tick_fn
                     && let Err(e) = on_tick.call::<()>((tick, bpm, ppqn)) {
@@ -1035,7 +1023,7 @@ fn run_lua_event_loop(
                             if let Err(e) = ps.dispatch(&lua, &msg) {
                                 warn!("[{}] osc_params dispatch error: {}", name, e);
                             }
-                            *subs_cache.lock().unwrap_or_else(|p| p.into_inner()) = ps.subscriber_addrs();
+                            *subs_cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = ps.subscriber_addrs();
                         }
                         if let Some(ref on_osc) = on_osc_fn {
                             if let Err(e) = on_osc.call::<()>(msg) {
@@ -1299,7 +1287,7 @@ mod tests {
     fn lua_single_input_and_output() {
         let lua = Lua::new();
         let tbl = lua_decl_table(&lua, &["kbd"], &["synth"]);
-        let decl = parse_port_decl_from_lua(&tbl).unwrap();
+        let decl = parse_port_decl_from_lua(&tbl);
         assert_eq!(decl.inputs, vec!["kbd"]);
         assert_eq!(decl.outputs, vec!["synth"]);
     }
@@ -1308,7 +1296,7 @@ mod tests {
     fn lua_multiple_inputs_and_outputs() {
         let lua = Lua::new();
         let tbl = lua_decl_table(&lua, &["kbd", "pad"], &["synth", "drums"]);
-        let decl = parse_port_decl_from_lua(&tbl).unwrap();
+        let decl = parse_port_decl_from_lua(&tbl);
         assert_eq!(decl.inputs, vec!["kbd", "pad"]);
         assert_eq!(decl.outputs, vec!["synth", "drums"]);
     }
@@ -1319,7 +1307,7 @@ mod tests {
         let tbl = lua.create_table().unwrap();
         tbl.set("inputs", "kbd").unwrap();
         tbl.set("outputs", lua_array(&lua, &["synth"])).unwrap();
-        let decl = parse_port_decl_from_lua(&tbl).unwrap();
+        let decl = parse_port_decl_from_lua(&tbl);
         assert_eq!(decl.inputs, vec!["kbd"]);
     }
 
@@ -1329,7 +1317,7 @@ mod tests {
         let tbl = lua.create_table().unwrap();
         tbl.set("inputs", lua_array(&lua, &["kbd"])).unwrap();
         tbl.set("outputs", "synth").unwrap();
-        let decl = parse_port_decl_from_lua(&tbl).unwrap();
+        let decl = parse_port_decl_from_lua(&tbl);
         assert_eq!(decl.outputs, vec!["synth"]);
     }
 
@@ -1339,7 +1327,7 @@ mod tests {
         let tbl = lua.create_table().unwrap();
         tbl.set("inputs", "kbd").unwrap();
         tbl.set("outputs", "synth").unwrap();
-        let decl = parse_port_decl_from_lua(&tbl).unwrap();
+        let decl = parse_port_decl_from_lua(&tbl);
         assert_eq!(decl.inputs, vec!["kbd"]);
         assert_eq!(decl.outputs, vec!["synth"]);
     }
@@ -1349,7 +1337,7 @@ mod tests {
         let lua = Lua::new();
         let tbl = lua.create_table().unwrap();
         tbl.set("outputs", lua_array(&lua, &["synth"])).unwrap();
-        let decl = parse_port_decl_from_lua(&tbl).unwrap();
+        let decl = parse_port_decl_from_lua(&tbl);
         assert!(decl.is_default());
     }
 
@@ -1358,7 +1346,7 @@ mod tests {
         let lua = Lua::new();
         let tbl = lua.create_table().unwrap();
         tbl.set("inputs", lua_array(&lua, &["kbd"])).unwrap();
-        let decl = parse_port_decl_from_lua(&tbl).unwrap();
+        let decl = parse_port_decl_from_lua(&tbl);
         assert!(decl.is_default());
     }
 
@@ -1366,7 +1354,7 @@ mod tests {
     fn lua_empty_table_returns_default() {
         let lua = Lua::new();
         let tbl = lua.create_table().unwrap();
-        let decl = parse_port_decl_from_lua(&tbl).unwrap();
+        let decl = parse_port_decl_from_lua(&tbl);
         assert!(decl.is_default());
     }
 
@@ -1376,7 +1364,7 @@ mod tests {
         let tbl = lua.create_table().unwrap();
         tbl.set("inputs", lua.create_table().unwrap()).unwrap();
         tbl.set("outputs", lua_array(&lua, &["synth"])).unwrap();
-        let decl = parse_port_decl_from_lua(&tbl).unwrap();
+        let decl = parse_port_decl_from_lua(&tbl);
         assert!(decl.is_default());
     }
 
@@ -1386,7 +1374,7 @@ mod tests {
         let tbl = lua.create_table().unwrap();
         tbl.set("inputs", lua_array(&lua, &["kbd"])).unwrap();
         tbl.set("outputs", lua.create_table().unwrap()).unwrap();
-        let decl = parse_port_decl_from_lua(&tbl).unwrap();
+        let decl = parse_port_decl_from_lua(&tbl);
         assert!(decl.is_default());
     }
 
@@ -1394,7 +1382,7 @@ mod tests {
     fn lua_preserves_port_order() {
         let lua = Lua::new();
         let tbl = lua_decl_table(&lua, &["z", "a", "m"], &["out"]);
-        let decl = parse_port_decl_from_lua(&tbl).unwrap();
+        let decl = parse_port_decl_from_lua(&tbl);
         assert_eq!(decl.inputs, vec!["z", "a", "m"]);
     }
 
@@ -1409,7 +1397,7 @@ mod tests {
         let tbl = lua.create_table().unwrap();
         tbl.set("inputs", inp).unwrap();
         tbl.set("outputs", lua_array(&lua, &["synth"])).unwrap();
-        let decl = parse_port_decl_from_lua(&tbl).unwrap();
+        let decl = parse_port_decl_from_lua(&tbl);
         assert_eq!(decl.inputs, vec!["kbd"]);
     }
 
@@ -1423,7 +1411,7 @@ mod tests {
         let tbl = lua.create_table().unwrap();
         tbl.set("inputs", inp).unwrap();
         tbl.set("outputs", lua_array(&lua, &["synth"])).unwrap();
-        let decl = parse_port_decl_from_lua(&tbl).unwrap();
+        let decl = parse_port_decl_from_lua(&tbl);
         assert_eq!(decl.inputs, vec!["kbd"]);
     }
 
@@ -1528,11 +1516,11 @@ mod tests {
     #[test]
     fn extract_init_returning_nil_falls_back_to_toml() {
         let decl = extract_with_cfg(
-            r#"
+            r"
             function init()
                 return nil
             end
-            "#,
+            ",
             "inputs = [\"kbd\"]\noutputs = [\"synth\"]",
         );
         assert_eq!(decl.inputs, vec!["kbd"]);
@@ -1555,11 +1543,11 @@ mod tests {
 
     #[test]
     fn extract_init_returning_non_table_falls_back_to_default_when_no_toml() {
-        let decl = extract(r#"
+        let decl = extract(r"
             function init()
                 return 42
             end
-        "#);
+        ");
         assert!(decl.is_default());
     }
 
@@ -1636,13 +1624,13 @@ mod tests {
 
     #[test]
     fn extract_backward_compat_script_without_init() {
-        let decl = extract(r#"
+        let decl = extract(r"
             function on_midi(msg)
                 send(msg)
             end
             function on_tick(tick, bpm, ppqn)
             end
-        "#);
+        ");
         assert!(decl.is_default());
     }
 
@@ -1706,7 +1694,7 @@ mod tests {
     }
 
     fn pats(strs: &[&str]) -> Vec<String> {
-        strs.iter().map(|s| s.to_string()).collect()
+        strs.iter().map(std::string::ToString::to_string).collect()
     }
 
     #[test]
@@ -1920,12 +1908,12 @@ mod tests {
     // ── apply_connect_defaults ────────────────────────────────────────────────
 
     fn ports(names: &[&str]) -> Vec<String> {
-        names.iter().map(|s| s.to_string()).collect()
+        names.iter().map(std::string::ToString::to_string).collect()
     }
 
     fn decl_with_sentinel(sentinel: &str) -> ConnectDecl {
         let mut d = ConnectDecl::default();
-        d.inputs.insert("".into(), vec![sentinel.to_string()]);
+        d.inputs.insert(String::new(), vec![sentinel.to_string()]);
         d
     }
 
@@ -1955,7 +1943,7 @@ mod tests {
     #[test]
     fn defaults_sentinel_fills_all_ports() {
         let mut raw = ConnectDecl::default();
-        raw.inputs.insert("".into(), vec![".*RouteLevel.*".to_string()]);
+        raw.inputs.insert(String::new(), vec![".*RouteLevel.*".to_string()]);
         let result = apply_connect_defaults(
             raw, &ports(&["kbd", "pad"]), &ports(&["synth"]), None, None,
         );
@@ -1987,7 +1975,7 @@ mod tests {
     fn defaults_per_port_not_overridden_by_sentinel() {
         let mut raw = ConnectDecl::default();
         raw.inputs.insert("kbd".into(), vec![".*PerPort.*".to_string()]);
-        raw.inputs.insert("".into(), vec![".*Sentinel.*".to_string()]);
+        raw.inputs.insert(String::new(), vec![".*Sentinel.*".to_string()]);
         let result = apply_connect_defaults(
             raw, &ports(&["kbd", "pad"]), &ports(&[]), None, None,
         );

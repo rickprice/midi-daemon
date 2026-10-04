@@ -37,12 +37,12 @@ type OscDispatch =
 fn register_route_osc(dispatch: &OscDispatch, name: &str, route: &Route) {
     dispatch
         .lock()
-        .unwrap_or_else(|p| p.into_inner())
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .insert(name.to_string(), Box::new(route.make_osc_injector()));
 }
 
 fn unregister_route_osc(dispatch: &OscDispatch, name: &str) {
-    dispatch.lock().unwrap_or_else(|p| p.into_inner()).remove(name);
+    dispatch.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(name);
 }
 
 /// Bind a UDP port and dispatch incoming packets to routes by address prefix
@@ -58,7 +58,7 @@ fn start_osc_receiver(port: u16, dispatch: OscDispatch) -> Option<osc::OscReceiv
             warn!("OSC: ignoring message with empty route prefix: '{}'", address);
             return;
         }
-        let guard = dispatch.lock().unwrap_or_else(|p| p.into_inner());
+        let guard = dispatch.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(inject) = guard.get(route_name) {
             inject(from, address, args);
         } else {
@@ -158,9 +158,8 @@ fn start_control_socket(
 /// Handle one control connection: read a command, send to the main loop, write the reply.
 async fn handle_control_conn(stream: tokio::net::UnixStream, tx: mpsc::Sender<ControlCmd>) {
     let (read_half, mut write_half) = stream.into_split();
-    let line = match tokio::io::BufReader::new(read_half).lines().next_line().await {
-        Ok(Some(l)) => l,
-        _ => return,
+    let Ok(Some(line)) = tokio::io::BufReader::new(read_half).lines().next_line().await else {
+        return;
     };
     let (reply_tx, reply_rx) = oneshot::channel();
     let cmd = match line.trim() {
@@ -168,7 +167,7 @@ async fn handle_control_conn(stream: tokio::net::UnixStream, tx: mpsc::Sender<Co
         "reload" => ControlCmd::Reload { reply: reply_tx },
         "status" => ControlCmd::Status { reply: reply_tx },
         other => {
-            let _ = write_half.write_all(format!("error: unknown command '{}'\n", other).as_bytes()).await;
+            let _ = write_half.write_all(format!("error: unknown command '{other}'\n").as_bytes()).await;
             return;
         }
     };
@@ -184,10 +183,10 @@ async fn do_control_cmd(cmd: &str) -> Result<()> {
     let stream = tokio::net::UnixStream::connect(&path).await
         .with_context(|| format!("connect to {}: is midi-daemon running?", path.display()))?;
     let (read_half, mut write_half) = stream.into_split();
-    write_half.write_all(format!("{}\n", cmd).as_bytes()).await?;
+    write_half.write_all(format!("{cmd}\n").as_bytes()).await?;
     let mut lines = tokio::io::BufReader::new(read_half).lines();
     while let Ok(Some(line)) = lines.next_line().await {
-        println!("{}", line);
+        println!("{line}");
     }
     Ok(())
 }
@@ -200,7 +199,7 @@ fn graceful_shutdown(routes: &Rc<RefCell<HashMap<String, Route>>>) {
     let to_shutdown: Vec<Route> = routes.borrow_mut().drain().map(|(_, r)| r).collect();
     let handles: Vec<std::thread::JoinHandle<()>> = to_shutdown
         .into_iter()
-        .filter_map(|r| r.shutdown())
+        .filter_map(route::Route::shutdown)
         .collect();
     for h in handles {
         if let Err(e) = h.join() {
@@ -230,16 +229,25 @@ enum Cmd {
 struct Cli {
     /// Log level (e.g. debug, info, warn, error)
     #[arg(long)] log_level: Option<String>,
-    /// Path to config file (overrides $MIDI_DAEMON_CONFIG and default search)
+    /// Path to config file (overrides $`MIDI_DAEMON_CONFIG` and default search)
     #[arg(long)] config: Option<PathBuf>,
-    /// Path to routes directory (overrides routes_dir in config file)
+    /// Path to routes directory (overrides `routes_dir` in config file)
     #[arg(long)] routes: Option<PathBuf>,
     /// Control command to send to a running daemon (omit to start the daemon)
     #[command(subcommand)] command: Option<Cmd>,
 }
 
+// Top-level daemon wiring (config, control socket, routes, watchers, signal
+// handlers, main select loop) — inherently a flat sequence of one-time setup.
+#[allow(clippy::too_many_lines)]
 #[tokio::main]
 async fn main() -> Result<()> {
+    enum WatchEvent {
+        RouteChanged(PathBuf),
+        ConfigChanged,
+    }
+    use tokio::signal::unix::{signal, SignalKind};
+
     let cli = Cli::parse();
 
     match cli.command {
@@ -250,7 +258,7 @@ async fn main() -> Result<()> {
     }
 
     let log_filter = if let Some(level) = cli.log_level {
-        format!("midi_daemon={}", level)
+        format!("midi_daemon={level}")
     } else {
         std::env::var("RUST_LOG").unwrap_or_else(|_| "midi_daemon=info".to_string())
     };
@@ -283,23 +291,12 @@ async fn main() -> Result<()> {
 
     let osc_dispatch: OscDispatch = Arc::new(Mutex::new(HashMap::new()));
 
-    load_all_routes(
-        &routes_dir,
-        Arc::clone(&config),
-        Rc::clone(&routes),
-        Arc::clone(&conn_mgr),
-        Arc::clone(&osc_dispatch),
-    ).await?;
+    load_all_routes(&routes_dir, &config, &routes, &conn_mgr, &osc_dispatch)?;
 
     let mut osc_receivers: HashMap<u16, osc::OscReceiver> = HashMap::new();
     sync_osc_receivers(&config, &routes, &mut osc_receivers, &osc_dispatch);
 
     // inotify watcher for hot-reload
-    enum WatchEvent {
-        RouteChanged(PathBuf),
-        ConfigChanged,
-    }
-
     let (tx, mut rx) = mpsc::channel::<WatchEvent>(32);
 
     let config_path = config.config_path.clone();
@@ -308,7 +305,7 @@ async fn main() -> Result<()> {
             match event.kind {
                 EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_) => {
                     for path in event.paths {
-                        if path.extension().map(|e| e == "lua").unwrap_or(false) {
+                        if path.extension().is_some_and(|e| e == "lua") {
                             let _ = tx.blocking_send(WatchEvent::RouteChanged(path));
                         } else if config_path.as_deref() == Some(path.as_path()) {
                             let _ = tx.blocking_send(WatchEvent::ConfigChanged);
@@ -332,7 +329,6 @@ async fn main() -> Result<()> {
     }
 
     // Signal handlers
-    use tokio::signal::unix::{signal, SignalKind};
     let mut sigterm = signal(SignalKind::terminate())?;
     let mut sigint = signal(SignalKind::interrupt())?;
     let mut sigusr1 = signal(SignalKind::user_defined1())?;
@@ -384,10 +380,8 @@ async fn main() -> Result<()> {
                             "pid: {}\nroutes: {}\nosc_recv: {}\nconfig: {}\ncache: {}\nsocket: {}\n",
                             std::process::id(),
                             if route_names.is_empty() { "(none)".into() } else { route_names.join(", ") },
-                            if ports.is_empty() { "(none)".into() } else { ports.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", ") },
-                            config.config_path.as_deref()
-                                .map(|p| p.display().to_string())
-                                .unwrap_or_else(|| "(defaults)".into()),
+                            if ports.is_empty() { "(none)".into() } else { ports.iter().map(std::string::ToString::to_string).collect::<Vec<_>>().join(", ") },
+                            config.config_path.as_deref().map_or_else(|| "(defaults)".into(), |p| p.display().to_string()),
                             config.cache_dir().display(),
                             config::control_socket_path().display(),
                         );
@@ -438,8 +432,8 @@ fn handle_route_changed(
 
     if path.exists() {
         info!("Detected change in {}.lua — reloading", name);
-        let old_ports = routes.borrow().get(&name).map(|r| r.ports_rc());
-        match Route::start(path, Arc::clone(config), old_ports) {
+        let old_ports = routes.borrow().get(&name).map(route::Route::ports_rc);
+        match Route::start(path, config, old_ports) {
             Ok(route) => {
                 conn_mgr.register_route(&name, route.port_decl(), &route.connect_decl);
                 conn_mgr.apply_all();
@@ -476,8 +470,7 @@ fn handle_config_changed(
                 );
             }
             *config = Arc::new(new_cfg);
-            reload_all_routes(routes_dir, Arc::clone(config), Rc::clone(routes),
-                               Arc::clone(conn_mgr), Arc::clone(osc_dispatch));
+            reload_all_routes(routes_dir, config, routes, conn_mgr, osc_dispatch);
             sync_osc_receivers(config, routes, osc_receivers, osc_dispatch);
             info!("Config reloaded");
         }
@@ -487,19 +480,19 @@ fn handle_config_changed(
 
 fn reload_all_routes(
     dir: &Path,
-    config: Arc<Config>,
-    routes: Rc<RefCell<HashMap<String, Route>>>,
-    conn_mgr: Arc<ConnectionManager>,
-    osc_dispatch: OscDispatch,
+    config: &Arc<Config>,
+    routes: &Rc<RefCell<HashMap<String, Route>>>,
+    conn_mgr: &Arc<ConnectionManager>,
+    osc_dispatch: &OscDispatch,
 ) {
     let names: Vec<String> = routes.borrow().keys().cloned().collect();
     for name in names {
-        let path = dir.join(format!("{}.lua", name));
-        let old_ports = routes.borrow().get(&name).map(|r| r.ports_rc());
-        match Route::start(&path, Arc::clone(&config), old_ports) {
+        let path = dir.join(format!("{name}.lua"));
+        let old_ports = routes.borrow().get(&name).map(route::Route::ports_rc);
+        match Route::start(&path, config, old_ports) {
             Ok(route) => {
                 conn_mgr.register_route(&name, route.port_decl(), &route.connect_decl);
-                register_route_osc(&osc_dispatch, &name, &route);
+                register_route_osc(osc_dispatch, &name, &route);
                 routes.borrow_mut().insert(name.clone(), route);
                 info!("Reloaded route '{}' with new config", name);
             }
@@ -509,12 +502,12 @@ fn reload_all_routes(
     conn_mgr.apply_all();
 }
 
-async fn load_all_routes(
+fn load_all_routes(
     dir: &Path,
-    config: Arc<Config>,
-    routes: Rc<RefCell<HashMap<String, Route>>>,
-    conn_mgr: Arc<ConnectionManager>,
-    osc_dispatch: OscDispatch,
+    config: &Arc<Config>,
+    routes: &Rc<RefCell<HashMap<String, Route>>>,
+    conn_mgr: &Arc<ConnectionManager>,
+    osc_dispatch: &OscDispatch,
 ) -> Result<()> {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
@@ -534,17 +527,17 @@ async fn load_all_routes(
         for entry in entries {
             let entry = entry?;
             let path = entry.path();
-            if path.extension().map(|e| e == "lua").unwrap_or(false) {
+            if path.extension().is_some_and(|e| e == "lua") {
                 let name = path
                     .file_stem()
                     .and_then(|s| s.to_str())
                     .unwrap_or("unknown")
                     .to_string();
 
-                match Route::start(&path, Arc::clone(&config), None) {
+                match Route::start(&path, config, None) {
                     Ok(route) => {
                         conn_mgr.register_route(&name, route.port_decl(), &route.connect_decl);
-                        register_route_osc(&osc_dispatch, &name, &route);
+                        register_route_osc(osc_dispatch, &name, &route);
                         info!("Loaded route: {}", name);
                         map.insert(name, route);
                     }

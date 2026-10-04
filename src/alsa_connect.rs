@@ -36,19 +36,19 @@ impl ConnectionManager {
 
     /// Register (or replace) all auto-connect specs for one route.
     pub fn register_route(&self, route_name: &str, decl: &PortDecl, connect: &ConnectDecl) {
-        let prefix = format!("midi-daemon:{}", route_name);
+        let prefix = format!("midi-daemon:{route_name}");
         let is_default = decl.is_default();
         let base = prefix.clone();
 
-        let mut specs = self.specs.lock().unwrap_or_else(|p| p.into_inner());
+        let mut specs = self.specs.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         specs.retain(|s| !s.our_client_name.starts_with(&prefix));
 
         for port_name in &decl.inputs {
             if let Some(pat_strs) = connect.inputs.get(port_name) {
                 let client_name = if is_default {
-                    format!("{}-in", base)
+                    format!("{base}-in")
                 } else {
-                    format!("{}/{}-in", base, port_name)
+                    format!("{base}/{port_name}-in")
                 };
                 for pat_str in pat_strs {
                     match Regex::new(pat_str) {
@@ -66,9 +66,9 @@ impl ConnectionManager {
         for port_name in &decl.outputs {
             if let Some(pat_strs) = connect.outputs.get(port_name) {
                 let client_name = if is_default {
-                    format!("{}-out", base)
+                    format!("{base}-out")
                 } else {
-                    format!("{}/{}-out", base, port_name)
+                    format!("{base}/{port_name}-out")
                 };
                 for pat_str in pat_strs {
                     match Regex::new(pat_str) {
@@ -86,15 +86,15 @@ impl ConnectionManager {
 
     /// Remove all specs for a route (called when it is deleted).
     pub fn unregister_route(&self, route_name: &str) {
-        let prefix = format!("midi-daemon:{}", route_name);
-        self.specs.lock().unwrap_or_else(|p| p.into_inner()).retain(|s| !s.our_client_name.starts_with(&prefix));
+        let prefix = format!("midi-daemon:{route_name}");
+        self.specs.lock().unwrap_or_else(std::sync::PoisonError::into_inner).retain(|s| !s.our_client_name.starts_with(&prefix));
     }
 
     /// Scan all current ALSA ports and apply matching connections.
     pub fn apply_all(&self) {
         match open_seq() {
             Ok(seq) => {
-                let specs = self.specs.lock().unwrap_or_else(|p| p.into_inner());
+                let specs = self.specs.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 apply_connections(&seq, &specs);
             }
             Err(e) => warn!("auto-connect: failed to open ALSA seq: {}", e),
@@ -155,7 +155,7 @@ fn find_matching_external(seq: &Seq, pattern: &Regex, dir: ConnDir) -> Vec<(Addr
                 ConnDir::Output => PortCap::WRITE | PortCap::SUBS_WRITE,
             };
             if !cap.contains(required) { continue; }
-            let full = format!("{}:{}", cname, pname);
+            let full = format!("{cname}:{pname}");
             if pattern.is_match(&full) {
                 result.push((Addr { client: cid, port: pi.get_port() }, full));
             }
@@ -173,7 +173,7 @@ fn try_subscribe(seq: &Seq, sender: Addr, dest: Addr, label: &str) {
     sub.set_sender(sender);
     sub.set_dest(dest);
     match seq.subscribe_port(&sub) {
-        Ok(_) => info!("auto-connected: {}", label),
+        Ok(()) => info!("auto-connected: {}", label),
         Err(e) => {
             if !e.to_string().contains("busy") {
                 warn!("auto-connect failed ({}): {}", label, e);
@@ -184,12 +184,9 @@ fn try_subscribe(seq: &Seq, sender: Addr, dest: Addr, label: &str) {
 
 fn apply_connections(seq: &Seq, specs: &[PortSpec]) {
     for spec in specs {
-        let our_addr = match find_our_port(seq, &spec.our_client_name) {
-            Some(a) => a,
-            None => {
-                debug!("auto-connect: our port '{}' not yet visible in ALSA", spec.our_client_name);
-                continue;
-            }
+        let Some(our_addr) = find_our_port(seq, &spec.our_client_name) else {
+            debug!("auto-connect: our port '{}' not yet visible in ALSA", spec.our_client_name);
+            continue;
         };
         for (ext_addr, name) in find_matching_external(seq, &spec.pattern, spec.dir) {
             let (sender, dest, label) = match spec.dir {
@@ -203,19 +200,13 @@ fn apply_connections(seq: &Seq, specs: &[PortSpec]) {
 
 /// Connect a newly-appeared ALSA port to any matching specs.
 fn connect_new_port(seq: &Seq, specs: &[PortSpec], new_addr: Addr) {
-    let ci = match seq.get_any_client_info(new_addr.client) {
-        Ok(c) => c,
-        Err(_) => return,
-    };
-    let pi = match seq.get_any_port_info(new_addr) {
-        Ok(p) => p,
-        Err(_) => return,
-    };
+    let Ok(ci) = seq.get_any_client_info(new_addr.client) else { return };
+    let Ok(pi) = seq.get_any_port_info(new_addr) else { return };
 
     let cname = ci.get_name().unwrap_or("").to_string();
     let pname = pi.get_name().unwrap_or("").to_string();
     let cap = pi.get_capability();
-    let full = format!("{}:{}", cname, pname);
+    let full = format!("{cname}:{pname}");
 
     for spec in specs {
         let required = match spec.dir {
@@ -225,10 +216,7 @@ fn connect_new_port(seq: &Seq, specs: &[PortSpec], new_addr: Addr) {
         if !cap.contains(required) { continue; }
         if !spec.pattern.is_match(&full) { continue; }
 
-        let our_addr = match find_our_port(seq, &spec.our_client_name) {
-            Some(a) => a,
-            None => continue,
-        };
+        let Some(our_addr) = find_our_port(seq, &spec.our_client_name) else { continue };
 
         let (sender, dest, label) = match spec.dir {
             ConnDir::Input  => (new_addr, our_addr, format!("{} -> {}", full, spec.our_client_name)),
@@ -271,7 +259,7 @@ fn watch_loop(mgr: &Arc<ConnectionManager>) -> Result<()> {
             debug!("new ALSA port: {}:{}", addr.client, addr.port);
             // Small delay so the port is fully registered before we query it.
             std::thread::sleep(std::time::Duration::from_millis(100));
-            let specs = mgr.specs.lock().unwrap_or_else(|p| p.into_inner());
+            let specs = mgr.specs.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             connect_new_port(&conn_seq, &specs, addr);
         }
     }
@@ -282,11 +270,11 @@ fn watch_loop(mgr: &Arc<ConnectionManager>) -> Result<()> {
 #[cfg(test)]
 impl ConnectionManager {
     fn spec_count(&self) -> usize {
-        self.specs.lock().unwrap_or_else(|p| p.into_inner()).len()
+        self.specs.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len()
     }
 
     fn spec_client_names(&self) -> Vec<String> {
-        let mut names: Vec<String> = self.specs.lock().unwrap_or_else(|p| p.into_inner())
+        let mut names: Vec<String> = self.specs.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter().map(|s| s.our_client_name.clone()).collect();
         names.sort();
         names
@@ -294,13 +282,13 @@ impl ConnectionManager {
 
     /// Returns `Some(true)` if the spec is an Input direction, `Some(false)` for Output.
     fn spec_dir_is_input(&self, client_name: &str) -> Option<bool> {
-        self.specs.lock().unwrap_or_else(|p| p.into_inner()).iter()
+        self.specs.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter()
             .find(|s| s.our_client_name == client_name)
             .map(|s| s.dir == ConnDir::Input)
     }
 
     fn spec_pattern(&self, client_name: &str) -> Option<String> {
-        self.specs.lock().unwrap_or_else(|p| p.into_inner()).iter()
+        self.specs.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter()
             .find(|s| s.our_client_name == client_name)
             .map(|s| s.pattern.as_str().to_string())
     }
@@ -321,8 +309,8 @@ mod tests {
 
     fn make_connect_multi(inputs: &[(&str, &[&str])], outputs: &[(&str, &[&str])]) -> ConnectDecl {
         ConnectDecl {
-            inputs:  inputs.iter().map(|(k, vs)| (k.to_string(), vs.iter().map(|v| v.to_string()).collect())).collect(),
-            outputs: outputs.iter().map(|(k, vs)| (k.to_string(), vs.iter().map(|v| v.to_string()).collect())).collect(),
+            inputs:  inputs.iter().map(|(k, vs)| (k.to_string(), vs.iter().map(std::string::ToString::to_string).collect())).collect(),
+            outputs: outputs.iter().map(|(k, vs)| (k.to_string(), vs.iter().map(std::string::ToString::to_string).collect())).collect(),
         }
     }
 
@@ -524,7 +512,7 @@ mod tests {
         let connect = make_connect(&[], &[("default", ".*Synth.*")]);
         mgr.register_route("t", &decl, &connect);
         assert_eq!(mgr.spec_count(), 1);
-        assert!(mgr.spec_dir_is_input("midi-daemon:t-out") == Some(false));
+        assert_eq!(mgr.spec_dir_is_input("midi-daemon:t-out"), Some(false));
     }
 }
 

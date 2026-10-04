@@ -39,7 +39,7 @@ pub fn load_json_state(lua: &Lua, path: &Path) -> LuaResult<LuaTable> {
 pub fn save_json_state(lua: &Lua, path: &Path, table: &LuaTable) -> anyhow::Result<()> {
     let json: serde_json::Value = lua
         .from_value(LuaValue::Table(table.clone()))
-        .map_err(|e| anyhow::anyhow!("serialize Lua state table: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("serialize Lua state table: {e}"))?;
     let text = serde_json::to_string_pretty(&json).context("serialize JSON state")?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -114,7 +114,7 @@ pub fn midi_bytes_to_lua(lua: &Lua, bytes: &[u8]) -> LuaResult<LuaTable> {
         }
         // Pitch Bend
         [status, lsb, msb] if (0xE0..=0xEF).contains(status) => {
-            let value = (((*msb as i16) << 7) | (*lsb as i16)) - 8192;
+            let value = ((i16::from(*msb) << 7) | i16::from(*lsb)) - 8192;
             msg.set("type", "pitch_bend")?;
             msg.set("channel", (status & 0x0F) + 1)?;
             msg.set("value", value)?;
@@ -180,7 +180,7 @@ pub fn lua_to_midi_bytes(msg: &LuaTable) -> LuaResult<Vec<u8>> {
         "pitch_bend" => {
             let ch: u8 = msg.get::<u8>("channel")?.saturating_sub(1) & 0x0F;
             let value: i16 = msg.get("value")?;
-            let v = (value + 8192).clamp(0, 16383) as u16;
+            let v = (value + 8192).clamp(0, 16383).cast_unsigned();
             let lsb = (v & 0x7F) as u8;
             let msb = ((v >> 7) & 0x7F) as u8;
             Ok(vec![0xE0 | ch, lsb, msb])
@@ -192,15 +192,14 @@ pub fn lua_to_midi_bytes(msg: &LuaTable) -> LuaResult<Vec<u8>> {
         "raw" => {
             let data: LuaTable = msg.get("data")?;
             let len = data.len()?;
-            let mut bytes = Vec::with_capacity(len as usize);
+            let mut bytes = Vec::with_capacity(usize::try_from(len).unwrap_or(0));
             for i in 1..=len {
                 bytes.push(data.get::<u8>(i)?);
             }
             Ok(bytes)
         }
         other => Err(LuaError::RuntimeError(format!(
-            "Unknown MIDI message type: {}",
-            other
+            "Unknown MIDI message type: {other}"
         ))),
     }
 }
@@ -222,9 +221,9 @@ pub fn osc_message_to_lua(lua: &Lua, address: &str, args: &[rosc::OscType]) -> L
 pub(crate) fn osc_type_to_lua_value(lua: &Lua, t: &rosc::OscType) -> LuaResult<LuaValue> {
     use rosc::OscType as O;
     match t {
-        O::Int(n)    => Ok(LuaValue::Integer(*n as i64)),
+        O::Int(n)    => Ok(LuaValue::Integer(i64::from(*n))),
         O::Long(n)   => Ok(LuaValue::Integer(*n)),
-        O::Float(f)  => Ok(LuaValue::Number(*f as f64)),
+        O::Float(f)  => Ok(LuaValue::Number(f64::from(*f))),
         O::Double(d) => Ok(LuaValue::Number(*d)),
         O::String(s) => Ok(LuaValue::String(lua.create_string(s)?)),
         O::Bool(b)   => Ok(LuaValue::Boolean(*b)),
@@ -233,7 +232,7 @@ pub(crate) fn osc_type_to_lua_value(lua: &Lua, t: &rosc::OscType) -> LuaResult<L
         O::Blob(b)   => Ok(LuaValue::String(lua.create_string(b)?)),
         O::Char(c)   => Ok(LuaValue::String(lua.create_string(c.encode_utf8(&mut [0u8; 4]))?)),
         O::Time(t)   => Ok(LuaValue::Number(
-            t.seconds as f64 + t.fractional as f64 / (u32::MAX as f64 + 1.0),
+            f64::from(t.seconds) + f64::from(t.fractional) / (f64::from(u32::MAX) + 1.0),
         )),
         O::Color(c) => {
             let tbl = lua.create_table()?;
@@ -275,12 +274,14 @@ pub fn lua_val_to_osc_type(v: &LuaValue) -> LuaResult<rosc::OscType> {
             ))
         }),
         LuaValue::Number(f) => {
-            if f.abs() > f32::MAX as f64 {
+            if f.abs() > f64::from(f32::MAX) {
                 return Err(LuaError::RuntimeError(format!(
-                    "send_osc: float {} is out of range for OSC Float32; use a smaller value",
-                    f
+                    "send_osc: float {f} is out of range for OSC Float32; use a smaller value"
                 )));
             }
+            // Narrowing to f32 is the point here — OSC Float32 is f32 by protocol,
+            // and the magnitude check above already rules out overflow.
+            #[allow(clippy::cast_possible_truncation)]
             Ok(rosc::OscType::Float(*f as f32))
         }
         LuaValue::String(s) => Ok(rosc::OscType::String(
@@ -296,6 +297,7 @@ pub fn lua_val_to_osc_type(v: &LuaValue) -> LuaResult<rosc::OscType> {
 }
 
 #[cfg(test)]
+#[allow(clippy::float_cmp)] // exact round-trip checks (e.g. JSON serialize/deserialize), not computed results
 mod tests {
     use super::*;
 

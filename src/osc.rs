@@ -31,7 +31,7 @@ impl OscSender {
         let dest = self
             .targets
             .get(target)
-            .ok_or_else(|| anyhow::anyhow!("Unknown OSC target: '{}'", target))?;
+            .ok_or_else(|| anyhow::anyhow!("Unknown OSC target: '{target}'"))?;
         self.send_to_addr(*dest, address, args)
     }
 
@@ -40,7 +40,7 @@ impl OscSender {
     pub fn send_to_addr(&self, dest: SocketAddr, address: String, args: Vec<OscType>) -> Result<()> {
         let packet = rosc::OscPacket::Message(rosc::OscMessage { addr: address, args });
         let encoded = rosc::encoder::encode(&packet)
-            .map_err(|e| anyhow::anyhow!("OSC encode error: {:?}", e))?;
+            .map_err(|e| anyhow::anyhow!("OSC encode error: {e:?}"))?;
         self.socket.send_to(&encoded, dest)?;
         Ok(())
     }
@@ -58,15 +58,15 @@ impl OscReceiver {
     where
         F: Fn(SocketAddr, String, Vec<OscType>) + Send + 'static,
     {
-        let socket = UdpSocket::bind(format!("0.0.0.0:{}", port))
-            .with_context(|| format!("Failed to bind OSC receive port {}", port))?;
+        let socket = UdpSocket::bind(format!("0.0.0.0:{port}"))
+            .with_context(|| format!("Failed to bind OSC receive port {port}"))?;
         socket.set_read_timeout(Some(Duration::from_millis(100)))?;
 
         let running = Arc::new(AtomicBool::new(true));
         let running_clone = Arc::clone(&running);
 
         let thread = std::thread::spawn(move || {
-            let mut buf = [0u8; 65536];
+            let mut buf = vec![0u8; 65536].into_boxed_slice();
             while running_clone.load(Ordering::Relaxed) {
                 match socket.recv_from(&mut buf) {
                     Ok((n, from)) => match rosc::decoder::decode_udp(&buf[..n]) {
@@ -75,10 +75,7 @@ impl OscReceiver {
                     },
                     Err(e)
                         if e.kind() == io::ErrorKind::WouldBlock
-                            || e.kind() == io::ErrorKind::TimedOut =>
-                    {
-                        continue;
-                    }
+                            || e.kind() == io::ErrorKind::TimedOut => {}
                     Err(e) => {
                         warn!("OSC receive error: {}; retrying in 1s", e);
                         std::thread::sleep(Duration::from_secs(1));

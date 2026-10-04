@@ -5,7 +5,7 @@ use tracing::warn;
 // ── MIDI binding types ────────────────────────────────────────────────────────
 
 /// The "address" part of a MIDI message — the routing key for param dispatch.
-/// Mirrors the TouchOSC model: type + channel (+ note/controller where applicable).
+/// Mirrors the `TouchOSC` model: type + channel (+ note/controller where applicable).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum MidiKey {
     Cc            { channel: u8, controller: u8 },
@@ -44,26 +44,26 @@ fn midi_key_from_table(tbl: &LuaTable) -> Option<MidiKey> {
     let msg_type: String = tbl.get::<Option<String>>("type").ok().flatten()?;
     match msg_type.as_str() {
         "cc" => {
-            let ch  = tbl.get::<Option<i64>>("channel").ok().flatten()? as u8;
-            let ctl = tbl.get::<Option<i64>>("controller").ok().flatten()? as u8;
+            let ch  = u8::try_from(tbl.get::<Option<i64>>("channel").ok().flatten()?).ok()?;
+            let ctl = u8::try_from(tbl.get::<Option<i64>>("controller").ok().flatten()?).ok()?;
             Some(MidiKey::Cc { channel: ch, controller: ctl })
         }
         "note_on" => {
-            let ch   = tbl.get::<Option<i64>>("channel").ok().flatten()? as u8;
-            let note = tbl.get::<Option<i64>>("note").ok().flatten()? as u8;
+            let ch   = u8::try_from(tbl.get::<Option<i64>>("channel").ok().flatten()?).ok()?;
+            let note = u8::try_from(tbl.get::<Option<i64>>("note").ok().flatten()?).ok()?;
             Some(MidiKey::NoteOn { channel: ch, note })
         }
         "note_off" => {
-            let ch   = tbl.get::<Option<i64>>("channel").ok().flatten()? as u8;
-            let note = tbl.get::<Option<i64>>("note").ok().flatten()? as u8;
+            let ch   = u8::try_from(tbl.get::<Option<i64>>("channel").ok().flatten()?).ok()?;
+            let note = u8::try_from(tbl.get::<Option<i64>>("note").ok().flatten()?).ok()?;
             Some(MidiKey::NoteOff { channel: ch, note })
         }
         "program_change" => {
-            let ch = tbl.get::<Option<i64>>("channel").ok().flatten()? as u8;
+            let ch = u8::try_from(tbl.get::<Option<i64>>("channel").ok().flatten()?).ok()?;
             Some(MidiKey::ProgramChange { channel: ch })
         }
         "pitch_bend" => {
-            let ch = tbl.get::<Option<i64>>("channel").ok().flatten()? as u8;
+            let ch = u8::try_from(tbl.get::<Option<i64>>("channel").ok().flatten()?).ok()?;
             Some(MidiKey::PitchBend { channel: ch })
         }
         "start"    => Some(MidiKey::Start),
@@ -76,6 +76,9 @@ fn midi_key_from_table(tbl: &LuaTable) -> Option<MidiKey> {
 
 /// Extract the raw numeric payload from a runtime MIDI message table.
 /// Returns `None` for transport messages (no-arg triggers).
+// MIDI payloads are always tiny (0-127, or ±8192 for pitch bend) — nowhere
+// near f64's 2^53 exact-integer threshold.
+#[allow(clippy::cast_precision_loss)]
 fn midi_payload_raw(key: &MidiKey, msg: &LuaTable) -> Option<f64> {
     match key {
         MidiKey::Cc { .. } =>
@@ -152,6 +155,10 @@ fn lua_now(lua: &Lua) -> LuaResult<f64> {
     time_fn.call(())
 }
 
+// Port/timeout values here are always small (ports are range-checked against
+// 65535 right below; timeouts are seconds) — the f64<->i64 casts are
+// intentional truncation of a client-supplied number, not precision bugs.
+#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
 fn parse_feedback(from: &str, args: &LuaTable, default_timeout: f64) -> LuaResult<(String, f64)> {
     let fb = match args.get::<LuaValue>(1)? {
         LuaValue::Integer(port) => {
@@ -160,7 +167,7 @@ fn parse_feedback(from: &str, args: &LuaTable, default_timeout: f64) -> LuaResul
                 from.to_string()
             } else {
                 match from.rsplit_once(':') {
-                    Some((ip, _)) => format!("{}:{}", ip, port),
+                    Some((ip, _)) => format!("{ip}:{port}"),
                     None => from.to_string(),
                 }
             }
@@ -172,7 +179,7 @@ fn parse_feedback(from: &str, args: &LuaTable, default_timeout: f64) -> LuaResul
                 from.to_string()
             } else {
                 match from.rsplit_once(':') {
-                    Some((ip, _)) => format!("{}:{}", ip, port_i),
+                    Some((ip, _)) => format!("{ip}:{port_i}"),
                     None => from.to_string(),
                 }
             }
@@ -190,10 +197,10 @@ fn parse_feedback(from: &str, args: &LuaTable, default_timeout: f64) -> LuaResul
 impl OscParamSet {
     fn new(prefix: &str, default_timeout: f64, heartbeat_interval: f64, now: f64) -> Self {
         OscParamSet {
-            slash_prefix: format!("{}/", prefix),
-            subscribe_addr: format!("{}/subscribe", prefix),
-            unsubscribe_addr: format!("{}/unsubscribe", prefix),
-            heartbeat_addr: format!("{}/heartbeat", prefix),
+            slash_prefix: format!("{prefix}/"),
+            subscribe_addr: format!("{prefix}/subscribe"),
+            unsubscribe_addr: format!("{prefix}/unsubscribe"),
+            heartbeat_addr: format!("{prefix}/heartbeat"),
             default_timeout,
             heartbeat_interval,
             subscribers: HashMap::new(),
@@ -227,10 +234,7 @@ impl OscParamSet {
     /// Dispatch an incoming MIDI message to any params that have a matching `midi` binding.
     /// Calls `set()`, then notifies OSC subscribers via `get()` — same path as OSC dispatch.
     pub fn dispatch_midi(&mut self, lua: &Lua, msg: &LuaTable) -> LuaResult<bool> {
-        let key = match midi_key_from_table(msg) {
-            Some(k) => k,
-            None => return Ok(false),
-        };
+        let Some(key) = midi_key_from_table(msg) else { return Ok(false) };
 
         let bindings: Vec<(String, MidiScale)> = match self.midi_bindings.get(&key) {
             Some(b) if !b.is_empty() =>
@@ -288,6 +292,9 @@ impl OscParamSet {
         Ok(true)
     }
 
+    // One linear OSC-address dispatch (subscribe/unsubscribe/param match); splitting
+    // it up would just scatter one control-flow path across several functions.
+    #[allow(clippy::too_many_lines)]
     pub fn dispatch(&mut self, lua: &Lua, msg: &LuaTable) -> LuaResult<()> {
         let addr: String = msg.get("address")?;
         let from: String = msg.get::<Option<String>>("from")?.unwrap_or_default();
@@ -457,10 +464,7 @@ impl OscParamSet {
                 .and_then(|p| p.set.as_ref())
                 .map(|k| lua.registry_value(k))
                 .transpose()?;
-            let (get_fn, set_fn) = match (get_fn, set_fn) {
-                (Some(g), Some(s)) => (g, s),
-                _ => continue,
-            };
+            let (Some(get_fn), Some(set_fn)) = (get_fn, set_fn) else { continue };
             let current: LuaValue = match get_fn.call(()) {
                 Ok(v) => v,
                 Err(e) => { warn!("resync get '{}': {}", name, e); continue; }
@@ -494,20 +498,16 @@ impl OscParamSet {
 /// Try to build an `OscParamSet` from the `osc.params` key of an `init()` return table.
 ///
 /// Returns `None` if the table has no `osc.params` subtable.
+// subscribe_timeout is a small number of seconds — the i64->f64 cast below is lossless in practice.
+#[allow(clippy::cast_precision_loss)]
 pub fn from_init_table(
     lua: &Lua,
     prefix: &str,
     init_tbl: &LuaTable,
     heartbeat_interval: f64,
 ) -> LuaResult<Option<OscParamSet>> {
-    let osc_tbl = match init_tbl.get::<LuaValue>("osc")? {
-        LuaValue::Table(t) => t,
-        _ => return Ok(None),
-    };
-    let params_tbl = match osc_tbl.get::<LuaValue>("params")? {
-        LuaValue::Table(t) => t,
-        _ => return Ok(None),
-    };
+    let LuaValue::Table(osc_tbl) = init_tbl.get::<LuaValue>("osc")? else { return Ok(None) };
+    let LuaValue::Table(params_tbl) = osc_tbl.get::<LuaValue>("params")? else { return Ok(None) };
     let default_timeout = match osc_tbl.get::<LuaValue>("subscribe_timeout")? {
         LuaValue::Integer(n) => n as f64,
         LuaValue::Number(f) => f,
@@ -536,7 +536,6 @@ pub fn from_init_table(
                             );
                         }
                     }
-                    Ok(LuaValue::Nil) | Err(_) => break,
                     _ => break,
                 }
             }
@@ -552,13 +551,13 @@ mod tests {
     fn make_lua() -> Lua {
         let lua = Lua::new();
         lua.load(
-            r#"
+            r"
             _sent = {}
             function send_osc(...) table.insert(_sent, {...}) end
             function clear() _sent = {} end
             _time = 1000
             os.time = function() return _time end
-            "#,
+            ",
         )
         .exec()
         .unwrap();
@@ -571,8 +570,7 @@ mod tests {
 
     fn make_msg(lua: &Lua, addr: &str, from: &str, args_lua: &str) -> LuaTable {
         lua.load(format!(
-            r#"{{ address = "{}", from = "{}", args = {{{}}} }}"#,
-            addr, from, args_lua
+            r#"{{ address = "{addr}", from = "{from}", args = {{{args_lua}}} }}"#
         ))
         .eval()
         .unwrap()
@@ -1154,7 +1152,7 @@ mod tests {
     // ── dispatch_midi ─────────────────────────────────────────────────────────
 
     fn make_midi_msg(lua: &Lua, fields: &str) -> LuaTable {
-        lua.load(format!("{{ {} }}", fields)).eval().unwrap()
+        lua.load(format!("{{ {fields} }}")).eval().unwrap()
     }
 
     fn ps_with_bpm(lua: &Lua) -> OscParamSet {

@@ -8,8 +8,8 @@ pub enum TimerEvent {
     Tick { tick: u64, bpm: f64, ppqn: u32 },
 }
 
-/// Spawns a high-resolution timer that sends TimerEvent::Tick into `tx`.
-/// BPM and PPQN are atomically adjustable at runtime (from Lua via set_bpm/set_ppqn).
+/// Spawns a high-resolution timer that sends `TimerEvent::Tick` into `tx`.
+/// BPM and PPQN are atomically adjustable at runtime (from Lua via `set_bpm/set_ppqn`).
 pub struct Timer {
     pub bpm: Arc<AtomicU32>,   // stored as bpm * 100 for integer atomics
     pub ppqn: Arc<AtomicU32>,
@@ -20,19 +20,25 @@ impl Timer {
     pub fn new(default_bpm: f64, default_ppqn: u32) -> Self {
         let bpm = default_bpm.max(0.01);
         let ppqn = default_ppqn.max(1);
+        // bpm is always positive here (.max(0.01) above); `as u32` saturates
+        // rather than wrapping, so an absurd config value just clamps.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let bpm_atomic = (bpm * 100.0) as u32;
         Timer {
-            bpm: Arc::new(AtomicU32::new((bpm * 100.0) as u32)),
+            bpm: Arc::new(AtomicU32::new(bpm_atomic)),
             ppqn: Arc::new(AtomicU32::new(ppqn)),
             running: Arc::new(AtomicBool::new(true)),
         }
     }
 
     pub fn get_bpm(&self) -> f64 {
-        self.bpm.load(Ordering::Relaxed) as f64 / 100.0
+        f64::from(self.bpm.load(Ordering::Relaxed)) / 100.0
     }
 
     pub fn set_bpm(&self, bpm: f64) {
         let clamped = bpm.clamp(20.0, 200.0);
+        // clamped is always in [20.0, 200.0], so *100.0 always fits in u32.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         self.bpm.store((clamped * 100.0) as u32, Ordering::Relaxed);
     }
 
@@ -66,7 +72,7 @@ impl Timer {
                     break;
                 }
 
-                let bpm = bpm_atomic.load(Ordering::Relaxed) as f64 / 100.0;
+                let bpm = f64::from(bpm_atomic.load(Ordering::Relaxed)) / 100.0;
                 let ppqn = ppqn_atomic.load(Ordering::Relaxed);
                 // Both are clamped at write time, but guard here to avoid
                 // a Division-by-zero / inf panic if atomics are ever written
@@ -76,7 +82,7 @@ impl Timer {
                     continue;
                 }
 
-                let tick_secs = 60.0 / (bpm * ppqn as f64);
+                let tick_secs = 60.0 / (bpm * f64::from(ppqn));
                 let duration = Duration::from_secs_f64(tick_secs);
 
                 let event = TimerEvent::Tick { tick, bpm, ppqn };

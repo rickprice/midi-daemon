@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 /// Public config — fully resolved (no Option fields).
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_field_names)] // `config_path` is clearer here than the alternatives
 pub struct Config {
     pub routes_dir: PathBuf,
     pub default_bpm: f64,
@@ -153,7 +154,7 @@ pub fn control_socket_path() -> PathBuf {
     }
     // Only use the cache dir if the home directory actually exists and is usable.
     if let Some(cache) = dirs::cache_dir()
-        && cache.parent().is_some_and(|p| p.exists()) {
+        && cache.parent().is_some_and(std::path::Path::exists) {
         return cache.join("midi-daemon/control.sock");
     }
     PathBuf::from("/tmp/midi-daemon.sock")
@@ -168,6 +169,7 @@ impl Config {
     ///   1. `$CACHE_DIRECTORY` — set by systemd when `CacheDirectory=midi-daemon` is configured
     ///   2. `/var/cache/midi-daemon` — root, or system user with no usable home
     ///   3. `$XDG_CACHE_HOME/midi-daemon` / `~/.cache/midi-daemon` — interactive user session
+    #[allow(clippy::unused_self)] // kept as an instance method for API consistency with lua_state_dir()
     pub fn cache_dir(&self) -> PathBuf {
         if let Ok(dir) = std::env::var("CACHE_DIRECTORY") {
             return PathBuf::from(dir);
@@ -184,11 +186,9 @@ impl Config {
         if !home_usable {
             return system_cache_dir();
         }
-        dirs::cache_dir()
-            .map(|d| d.join("midi-daemon"))
-            .unwrap_or_else(|| {
+        dirs::cache_dir().map_or_else(|| {
                 home.unwrap().join(".cache/midi-daemon")
-            })
+            }, |d| d.join("midi-daemon"))
     }
 
     /// Returns the root directory for Lua `on_startup`/`on_shutdown` JSON state.
@@ -273,9 +273,7 @@ impl Config {
         }
 
         // 4. No config found — fall back to built-in defaults
-        let (routes_dir, scope) = user_config_dir()
-            .map(|d| (d.join("routes.d"), "user"))
-            .unwrap_or_else(|| (system_config_dir().join("routes.d"), "system"));
+        let (routes_dir, scope) = user_config_dir().map_or_else(|| (system_config_dir().join("routes.d"), "system"), |d| (d.join("routes.d"), "user"));
         tracing::info!("No config file found, using {} defaults", scope);
         Ok(default_config(routes_dir))
     }
@@ -310,7 +308,7 @@ impl Config {
             None => return Ok(self.clone()),
         };
         if let Some(ref override_dir) = self.routes_dir_override {
-            new_cfg.routes_dir = override_dir.clone();
+            new_cfg.routes_dir.clone_from(override_dir);
             new_cfg.routes_dir_override = Some(override_dir.clone());
         }
         Ok(new_cfg)
@@ -324,6 +322,7 @@ impl Config {
 }
 
 #[cfg(test)]
+#[allow(clippy::float_cmp)] // exact round-trip checks of literal values, not computed results
 mod tests {
     use super::*;
     use std::io::Write;
@@ -331,7 +330,7 @@ mod tests {
     fn write_tmp(name: &str, content: &str) -> PathBuf {
         let path = std::env::temp_dir().join(name);
         let mut f = std::fs::File::create(&path).unwrap();
-        write!(f, "{}", content).unwrap();
+        write!(f, "{content}").unwrap();
         path
     }
 
