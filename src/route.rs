@@ -914,28 +914,7 @@ fn run_lua_event_loop(
     // on_startup/on_shutdown, but they work anywhere, e.g. a periodic
     // checkpoint from on_tick). Reads/writes
     // <state_dir>/<route-name>/state.json.
-    {
-        let path = lua_state_file.clone();
-        let name_for_fn = name.to_string();
-        let f = lua.create_function(move |lua, table: LuaTable| -> LuaResult<()> {
-            if let Err(e) = crate::lua_api::save_json_state(lua, &path, &table) {
-                warn!("[{}] save_state error: {}", name_for_fn, e);
-            }
-            Ok(())
-        })?;
-        lua.globals().set("save_state", f)?;
-    }
-    {
-        let path = lua_state_file.clone();
-        let name_for_fn = name.to_string();
-        let f = lua.create_function(move |lua, ()| -> LuaResult<LuaTable> {
-            Ok(crate::lua_api::load_json_state(lua, &path).unwrap_or_else(|e| {
-                warn!("[{}] load_state error: {}", name_for_fn, e);
-                lua.create_table().expect("create empty Lua state table")
-            }))
-        })?;
-        lua.globals().set("load_state", f)?;
-    }
+    register_state_functions(&lua, &lua_state_file, name)?;
 
     // --- Load the stdlib ---
     lua.load(LUA_STDLIB).set_name("stdlib").exec()
@@ -969,17 +948,12 @@ fn run_lua_event_loop(
     let on_midi_fn: Option<LuaFunction> = lua.globals().get("on_midi").ok();
     let on_tick_fn: Option<LuaFunction> = lua.globals().get("on_tick").ok();
     let on_osc_fn: Option<LuaFunction> = lua.globals().get("on_osc").ok();
-    let on_startup_fn: Option<LuaFunction> = lua.globals().get("on_startup").ok();
-    let on_shutdown_fn: Option<LuaFunction> = lua.globals().get("on_shutdown").ok();
 
     // --- Call on_startup() ---
     //
     // A plain lifecycle hook with no implicit argument — a route that wants
     // to restore state calls load_state() itself inside it.
-    if let Some(ref on_startup) = on_startup_fn
-        && let Err(e) = on_startup.call::<()>(()) {
-        warn!("[{}] on_startup error: {}", name, e);
-    }
+    call_optional_hook(&lua, "on_startup", name);
 
     // --- Event loop ---
     while let Some(event) = rx.blocking_recv() {
@@ -1050,12 +1024,49 @@ fn run_lua_event_loop(
     //
     // A plain lifecycle hook with no implicit argument — a route that wants
     // to persist state calls save_state() itself inside it.
-    if let Some(ref on_shutdown) = on_shutdown_fn
-        && let Err(e) = on_shutdown.call::<()>(()) {
-        warn!("[{}] on_shutdown error: {}", name, e);
-    }
+    call_optional_hook(&lua, "on_shutdown", name);
 
     Ok(())
+}
+
+/// Register the `save_state(table)` / `load_state()` Lua globals, which read
+/// and write `path` as JSON. The only state-persistence primitives exposed to
+/// routes — `on_startup`/`on_shutdown` are plain lifecycle hooks with no
+/// implicit state argument (see [`call_optional_hook`]).
+fn register_state_functions(lua: &Lua, path: &Path, route_name: &str) -> LuaResult<()> {
+    {
+        let path = path.to_path_buf();
+        let route_name = route_name.to_string();
+        let f = lua.create_function(move |lua, table: LuaTable| -> LuaResult<()> {
+            if let Err(e) = crate::lua_api::save_json_state(lua, &path, &table) {
+                warn!("[{}] save_state error: {}", route_name, e);
+            }
+            Ok(())
+        })?;
+        lua.globals().set("save_state", f)?;
+    }
+    {
+        let path = path.to_path_buf();
+        let route_name = route_name.to_string();
+        let f = lua.create_function(move |lua, ()| -> LuaResult<LuaTable> {
+            Ok(crate::lua_api::load_json_state(lua, &path).unwrap_or_else(|e| {
+                warn!("[{}] load_state error: {}", route_name, e);
+                lua.create_table().expect("create empty Lua state table")
+            }))
+        })?;
+        lua.globals().set("load_state", f)?;
+    }
+    Ok(())
+}
+
+/// Call an optional zero-argument lifecycle hook (`on_startup`/`on_shutdown`)
+/// if the route script defines it. A missing hook is a no-op; an error from
+/// the hook is logged and swallowed — a broken hook shouldn't crash the route.
+fn call_optional_hook(lua: &Lua, hook_name: &str, route_name: &str) {
+    if let Ok(Some(f)) = lua.globals().get::<Option<LuaFunction>>(hook_name)
+        && let Err(e) = f.call::<()>(()) {
+        warn!("[{}] {} error: {}", route_name, hook_name, e);
+    }
 }
 
 #[cfg(test)]
@@ -2013,5 +2024,109 @@ mod tests {
         let raw = decl_with_sentinel(".*Pat.*");
         let result = apply_connect_defaults(raw, &ports(&["kbd"]), &ports(&[]), None, None);
         assert!(!result.inputs.contains_key(""));
+    }
+
+    // ── register_state_functions / call_optional_hook ───────────────────────────
+
+    fn state_path(dir: &std::path::Path) -> std::path::PathBuf {
+        dir.join("state.json")
+    }
+
+    #[test]
+    fn save_state_then_load_state_roundtrips() {
+        let lua = Lua::new();
+        let dir = std::env::temp_dir().join("midi_daemon_test_route_state_roundtrip");
+        let _ = std::fs::remove_dir_all(&dir);
+        register_state_functions(&lua, &state_path(&dir), "test").unwrap();
+
+        lua.load(r#"save_state({ count = 3, label = "hi" })"#).exec().unwrap();
+        let loaded: LuaTable = lua.load("return load_state()").eval().unwrap();
+
+        assert_eq!(loaded.get::<i64>("count").unwrap(), 3);
+        assert_eq!(loaded.get::<String>("label").unwrap(), "hi");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_state_before_any_save_returns_empty_table() {
+        let lua = Lua::new();
+        let dir = std::env::temp_dir().join("midi_daemon_test_route_state_empty");
+        let _ = std::fs::remove_dir_all(&dir);
+        register_state_functions(&lua, &state_path(&dir), "test").unwrap();
+
+        let loaded: LuaTable = lua.load("return load_state()").eval().unwrap();
+        assert_eq!(loaded.pairs::<LuaValue, LuaValue>().count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_state_overwrites_previous_value() {
+        let lua = Lua::new();
+        let dir = std::env::temp_dir().join("midi_daemon_test_route_state_overwrite");
+        let _ = std::fs::remove_dir_all(&dir);
+        register_state_functions(&lua, &state_path(&dir), "test").unwrap();
+
+        lua.load("save_state({ n = 1 })").exec().unwrap();
+        lua.load("save_state({ n = 2 })").exec().unwrap();
+        let loaded: LuaTable = lua.load("return load_state()").eval().unwrap();
+
+        assert_eq!(loaded.get::<i64>("n").unwrap(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn call_optional_hook_runs_defined_hook() {
+        let lua = Lua::new();
+        lua.load("ran = false; function on_startup() ran = true end").exec().unwrap();
+        call_optional_hook(&lua, "on_startup", "test");
+        assert!(lua.globals().get::<bool>("ran").unwrap());
+    }
+
+    #[test]
+    fn call_optional_hook_is_noop_when_undefined() {
+        let lua = Lua::new();
+        // Must not panic or error when the route script defines no hook at all.
+        call_optional_hook(&lua, "on_startup", "test");
+    }
+
+    #[test]
+    fn call_optional_hook_swallows_errors_from_the_hook() {
+        let lua = Lua::new();
+        lua.load("function on_shutdown() error('boom') end").exec().unwrap();
+        // Must not panic — errors are logged and swallowed, not propagated.
+        call_optional_hook(&lua, "on_shutdown", "test");
+    }
+
+    #[test]
+    fn call_optional_hook_ignores_a_non_function_global_of_the_same_name() {
+        let lua = Lua::new();
+        lua.load("on_startup = 42").exec().unwrap();
+        // A stray non-function global must not be mistaken for the hook.
+        call_optional_hook(&lua, "on_startup", "test");
+    }
+
+    #[test]
+    fn save_state_and_load_state_are_independent_of_hooks() {
+        // Exercises the documented pattern: on_startup() calling load_state()
+        // itself, since the daemon no longer passes state as an argument.
+        let lua = Lua::new();
+        let dir = std::env::temp_dir().join("midi_daemon_test_route_state_via_hook");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(state_path(&dir), r#"{"restored": 99}"#).unwrap();
+
+        register_state_functions(&lua, &state_path(&dir), "test").unwrap();
+        lua.load(r"
+            restored_value = nil
+            function on_startup()
+                local state = load_state()
+                restored_value = state.restored
+            end
+        ").exec().unwrap();
+
+        call_optional_hook(&lua, "on_startup", "test");
+
+        assert_eq!(lua.globals().get::<i64>("restored_value").unwrap(), 99);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
