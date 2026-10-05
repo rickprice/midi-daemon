@@ -2,6 +2,7 @@ mod alsa_connect;
 mod config;
 mod lua_api;
 mod lua_stdlib_tests;
+mod obs;
 mod osc;
 mod osc_params;
 mod route;
@@ -20,6 +21,7 @@ use tracing::{debug, error, info, warn};
 
 use alsa_connect::ConnectionManager;
 use config::Config;
+use obs::ObsManager;
 use route::Route;
 
 // ── OSC dispatch ──────────────────────────────────────────────────────────────
@@ -76,10 +78,16 @@ struct Daemon {
     conn_mgr: Arc<ConnectionManager>,
     osc_dispatch: OscDispatch,
     osc_receivers: HashMap<u16, osc::OscReceiver>,
+    obs_manager: Arc<ObsManager>,
 }
 
 impl Daemon {
-    fn new(routes_dir: PathBuf, config: Arc<Config>, conn_mgr: Arc<ConnectionManager>) -> Self {
+    fn new(
+        routes_dir: PathBuf,
+        config: Arc<Config>,
+        conn_mgr: Arc<ConnectionManager>,
+        obs_manager: Arc<ObsManager>,
+    ) -> Self {
         Daemon {
             routes_dir,
             config,
@@ -87,6 +95,7 @@ impl Daemon {
             conn_mgr,
             osc_dispatch: Arc::new(Mutex::new(HashMap::new())),
             osc_receivers: HashMap::new(),
+            obs_manager,
         }
     }
 
@@ -102,6 +111,15 @@ impl Daemon {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(name);
+    }
+
+    fn register_route_obs(&self, name: &str, route: &Route) {
+        let injector: obs::EventInjector = Arc::new(route.make_obs_injector());
+        self.obs_manager.register_route(name, &route.obs_connections, &injector);
+    }
+
+    fn unregister_route_obs(&self, name: &str) {
+        self.obs_manager.unregister_route(name);
     }
 
     /// Collect the set of UDP ports that need a running receiver: the global
@@ -156,10 +174,11 @@ impl Daemon {
                     .unwrap_or("unknown")
                     .to_string();
 
-                match Route::start(&path, &self.config, None) {
+                match Route::start(&path, &self.config, None, &self.obs_manager) {
                     Ok(route) => {
                         self.conn_mgr.register_route(&name, route.port_decl(), &route.connect_decl);
                         self.register_route_osc(&name, &route);
+                        self.register_route_obs(&name, &route);
                         info!("Loaded route: {}", name);
                         self.routes.insert(name, route);
                     }
@@ -176,10 +195,11 @@ impl Daemon {
         for name in names {
             let path = self.routes_dir.join(format!("{name}.lua"));
             let old_ports = self.routes.get(&name).map(route::Route::ports_rc);
-            match Route::start(&path, &self.config, old_ports) {
+            match Route::start(&path, &self.config, old_ports, &self.obs_manager) {
                 Ok(route) => {
                     self.conn_mgr.register_route(&name, route.port_decl(), &route.connect_decl);
                     self.register_route_osc(&name, &route);
+                    self.register_route_obs(&name, &route);
                     self.routes.insert(name.clone(), route);
                     info!("Reloaded route '{}' with new config", name);
                 }
@@ -198,11 +218,12 @@ impl Daemon {
         if path.exists() {
             info!("Detected change in {}.lua — reloading", name);
             let old_ports = self.routes.get(&name).map(route::Route::ports_rc);
-            match Route::start(path, &self.config, old_ports) {
+            match Route::start(path, &self.config, old_ports, &self.obs_manager) {
                 Ok(route) => {
                     self.conn_mgr.register_route(&name, route.port_decl(), &route.connect_decl);
                     self.conn_mgr.apply_all();
                     self.register_route_osc(&name, &route);
+                    self.register_route_obs(&name, &route);
                     self.routes.insert(name.clone(), route);
                     self.sync_osc_receivers();
                     info!("Reloaded route: {}", name);
@@ -213,6 +234,7 @@ impl Daemon {
             self.routes.remove(&name);
             self.conn_mgr.unregister_route(&name);
             self.unregister_route_osc(&name);
+            self.unregister_route_obs(&name);
             self.sync_osc_receivers();
             info!("Removed route: {}", name);
         }
@@ -227,6 +249,7 @@ impl Daemon {
                         "routes_dir changed in config.toml — restart the daemon for this to take effect"
                     );
                 }
+                self.obs_manager.sync(&new_cfg.obs);
                 self.config = Arc::new(new_cfg);
                 self.reload_all_routes();
                 self.sync_osc_receivers();
@@ -393,6 +416,7 @@ struct Cli {
 
 // Top-level daemon wiring (config, control socket, routes, watchers, signal
 // handlers, main select loop) — inherently a flat sequence of one-time setup.
+#[allow(clippy::too_many_lines)]
 #[tokio::main]
 async fn main() -> Result<()> {
     enum WatchEvent {
@@ -438,7 +462,9 @@ async fn main() -> Result<()> {
     let conn_mgr = Arc::new(ConnectionManager::new());
     Arc::clone(&conn_mgr).spawn_watcher();
 
-    let mut daemon = Daemon::new(routes_dir.clone(), config, conn_mgr);
+    let obs_manager = ObsManager::new(&config.obs);
+
+    let mut daemon = Daemon::new(routes_dir.clone(), config, conn_mgr, obs_manager);
     daemon.load_all_routes()?;
     daemon.sync_osc_receivers();
 

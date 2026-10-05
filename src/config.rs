@@ -3,6 +3,14 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+/// One named OBS websocket connection, declared as `[obs.<name>]` in config.toml.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct ObsConnCfg {
+    pub host: String,
+    pub port: u16,
+    pub password: Option<String>,
+}
+
 /// Public config — fully resolved (no Option fields).
 #[derive(Debug, Clone)]
 #[allow(clippy::struct_field_names)] // `config_path` is clearer here than the alternatives
@@ -32,6 +40,10 @@ pub struct Config {
     /// Each route gets its own subdirectory named after the route. Defaults to
     /// `<cache_dir>/lua-state` when unset.
     pub state_dir: Option<PathBuf>,
+    /// Named OBS websocket connections, declared as `[obs.<name>]` sections.
+    /// Routes address them by name from `obs_call`/`obs_call_sync` and declare
+    /// interest in a connection's events via `init()`'s `obs.connections`.
+    pub obs: HashMap<String, ObsConnCfg>,
 }
 
 /// Internal deserialization target. `routes_dir` is optional so the caller
@@ -50,6 +62,8 @@ struct RawConfig {
     #[serde(default = "default_osc_heartbeat_interval")]
     osc_heartbeat_interval: f64,
     state_dir: Option<PathBuf>,
+    #[serde(default)]
+    obs: HashMap<String, ObsConnCfg>,
     #[serde(flatten)]
     route_configs: HashMap<String, toml::Value>,
 }
@@ -69,6 +83,7 @@ impl RawConfig {
             osc_heartbeat_interval: self.osc_heartbeat_interval,
             routes_dir_override: None,
             state_dir: self.state_dir,
+            obs: self.obs,
         }
     }
 }
@@ -101,6 +116,7 @@ fn default_config(routes_dir: PathBuf) -> Config {
         osc_heartbeat_interval: default_osc_heartbeat_interval(),
         routes_dir_override: None,
         state_dir: None,
+        obs: HashMap::new(),
     }
 }
 
@@ -555,6 +571,54 @@ mod tests {
         );
         let cfg = Config::load(&path).unwrap();
         assert_eq!(cfg.lua_state_dir(), PathBuf::from("/custom/lua-state"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ── obs connections ────────────────────────────────────────────────────────
+
+    #[test]
+    fn obs_section_absent_returns_empty_map() {
+        let path = write_tmp("midi_daemon_test_no_obs.toml", "default_bpm = 120.0\n");
+        let cfg = Config::load(&path).unwrap();
+        assert!(cfg.obs.is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn single_obs_connection_parses() {
+        let path = write_tmp(
+            "midi_daemon_test_obs_single.toml",
+            "[obs.main]\nhost = \"127.0.0.1\"\nport = 4455\npassword = \"secret\"\n",
+        );
+        let cfg = Config::load(&path).unwrap();
+        let main = cfg.obs.get("main").unwrap();
+        assert_eq!(main.host, "127.0.0.1");
+        assert_eq!(main.port, 4455);
+        assert_eq!(main.password.as_deref(), Some("secret"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn obs_connection_without_password_parses() {
+        let path = write_tmp(
+            "midi_daemon_test_obs_no_pw.toml",
+            "[obs.main]\nhost = \"127.0.0.1\"\nport = 4455\n",
+        );
+        let cfg = Config::load(&path).unwrap();
+        assert!(cfg.obs.get("main").unwrap().password.is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn multiple_obs_connections_parse_independently() {
+        let path = write_tmp(
+            "midi_daemon_test_obs_multi.toml",
+            "[obs.main]\nhost = \"127.0.0.1\"\nport = 4455\n\n[obs.backup]\nhost = \"192.168.1.50\"\nport = 4456\npassword = \"other\"\n",
+        );
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.obs.len(), 2);
+        assert_eq!(cfg.obs.get("main").unwrap().port, 4455);
+        assert_eq!(cfg.obs.get("backup").unwrap().password.as_deref(), Some("other"));
         let _ = std::fs::remove_file(&path);
     }
 }

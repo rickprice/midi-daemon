@@ -30,3 +30,5 @@ regex = "1.12.3"
 rosc = "0.10"
 libc = "0.2"
 clap = { version = "4", features = ["derive"] }
+obws = { version = "0.15", features = ["events"] }
+futures-util = "0.3"

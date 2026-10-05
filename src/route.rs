@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use midir::os::unix::{VirtualInput, VirtualOutput};
 use midir::{MidiInput, MidiInputConnection, MidiOutput, MidiOutputConnection};
 use mlua::prelude::*;
+use mlua::LuaSerdeExt;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -17,6 +18,13 @@ pub struct ConnectDecl {
     pub outputs: HashMap<String, Vec<String>>,
 }
 
+/// Named OBS connections (declared in config.toml as `[obs.<name>]`) that a
+/// route wants events from, declared via `init()`'s `obs = { connections = {...} }`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ObsDecl {
+    pub connections: Vec<String>,
+}
+
 use crate::config::Config;
 use crate::lua_api::{
     lua_to_midi_bytes, lua_val_to_osc_type, midi_bytes_to_lua, osc_message_to_lua,
@@ -29,6 +37,8 @@ enum RouteEvent {
     Midi { port: String, bytes: Vec<u8> },
     Timer(TimerEvent),
     Osc { from: SocketAddr, address: String, args: Vec<rosc::OscType> },
+    /// An event from a named OBS connection this route declared interest in.
+    ObsEvent { connection: String, event: serde_json::Value },
     /// Re-apply all current param values through their `set()` functions.
     ResyncState,
     /// Call `on_shutdown()` and exit the event loop cleanly.
@@ -167,6 +177,9 @@ pub struct Route {
     /// OSC receive port declared by this route's `init()`. The daemon starts exactly
     /// one shared receiver per unique port and dispatches by /route-name/ prefix.
     pub osc_receive_port: Option<u16>,
+    /// Named OBS connections (from config.toml's `[obs.<name>]`) this route's
+    /// `init()` declared interest in receiving events from.
+    pub obs_connections: Vec<String>,
 }
 
 impl Route {
@@ -196,6 +209,22 @@ impl Route {
             }
         }
     }
+
+    /// Returns a `Send + Sync + 'static` closure that injects OBS events into
+    /// this route's event loop. Used by `ObsManager` — one injector per route,
+    /// shared across every OBS connection the route declared interest in; the
+    /// connection name is passed at call time rather than baked in.
+    pub fn make_obs_injector(&self) -> impl Fn(&str, serde_json::Value) + Send + Sync + 'static {
+        let tx = self.osc_tx.clone();
+        move |connection: &str, event: serde_json::Value| {
+            if tx
+                .try_send(RouteEvent::ObsEvent { connection: connection.to_string(), event })
+                .is_err()
+            {
+                warn!("OBS event dropped: route event channel full or closed");
+            }
+        }
+    }
 }
 
 impl Route {
@@ -218,6 +247,7 @@ impl Route {
         lua_path: &Path,
         config: &Arc<Config>,
         existing_ports: Option<Rc<RoutePorts>>,
+        obs_manager: &Arc<crate::obs::ObsManager>,
     ) -> Result<Self> {
         let name = lua_path
             .file_stem()
@@ -234,7 +264,7 @@ impl Route {
         let lua_state_file = config.lua_state_dir().join(&name).join("state.json");
 
         // Run the script once to extract port layout, connect patterns, and OSC declarations.
-        let (decl, raw_connect, osc_decl) =
+        let (decl, raw_connect, osc_decl, obs_decl) =
             extract_all_decls(&script, &name, route_cfg.as_ref())?;
 
         // Fill missing connect patterns with global defaults from config.
@@ -308,6 +338,11 @@ impl Route {
         // OSC receivers are managed centrally by main.rs — routes never bind their own sockets.
         let osc_tx = tx.clone();
 
+        // Every configured OBS connection's request queue, keyed by name — a route
+        // may call any of them via obs_call/obs_call_sync, not just the ones it
+        // declared event interest in via obs_connections.
+        let obs_senders = obs_manager.sender_map();
+
         let timer = Arc::new(Timer::new(config.default_bpm, config.default_ppqn));
         let _timer_thread = timer.spawn(tx.clone(), RouteEvent::Timer);
 
@@ -330,7 +365,7 @@ impl Route {
                 out_conns_for_thread,
                 default_out,
                 &timer_for_thread,
-                RouteThreadArgs { route_cfg, osc_sender, osc_heartbeat_interval, lua_state_file },
+                RouteThreadArgs { route_cfg, osc_sender, osc_heartbeat_interval, lua_state_file, obs_senders },
             ) {
                 error!("Route '{}' event loop error: {}", name_for_thread, e);
             }
@@ -350,6 +385,7 @@ impl Route {
             osc_tx,
             connect_decl,
             osc_receive_port,
+            obs_connections: obs_decl.connections,
         })
     }
 }
@@ -370,6 +406,13 @@ fn setup_extract_lua(lua: &Lua, name: &str, route_cfg: Option<&toml::Table>) -> 
     lua.globals().set("log", lua.create_function(|_, _: String| Ok(()))?)?;
     lua.globals().set("save_state", lua.create_function(|_, _: LuaTable| Ok(()))?)?;
     lua.globals().set("load_state", lua.create_function(|lua, ()| lua.create_table())?)?;
+    lua.globals().set("obs_call", lua.create_function(|_, _: LuaMultiValue| Ok(()))?)?;
+    lua.globals().set(
+        "obs_call_sync",
+        lua.create_function(|_, _: LuaMultiValue| -> LuaResult<(bool, LuaValue, LuaValue)> {
+            Ok((false, LuaValue::Nil, LuaValue::Nil))
+        })?,
+    )?;
     lua.globals().set("ROUTE_NAME", name)?;
     lua.globals().set("OSC_SEND_ENABLED", false)?;
     let cfg_table = match route_cfg {
@@ -478,7 +521,7 @@ fn extract_all_decls(
     script: &str,
     name: &str,
     route_cfg: Option<&toml::Table>,
-) -> Result<(PortDecl, ConnectDecl, OscDecl)> {
+) -> Result<(PortDecl, ConnectDecl, OscDecl, ObsDecl)> {
     let lua = Lua::new();
     setup_extract_lua(&lua, name, route_cfg)?;
 
@@ -491,6 +534,7 @@ fn extract_all_decls(
             PortDecl::default(),
             connect_from_toml(ConnectDecl::default(), route_cfg),
             OscDecl::default(),
+            ObsDecl::default(),
         ));
     }
 
@@ -500,7 +544,8 @@ fn extract_all_decls(
                 let port_decl = parse_port_decl_from_lua(tbl);
                 let connect_decl = connect_from_toml(connect_from_lua_table(tbl), route_cfg);
                 let osc_decl = osc_from_lua_table(tbl);
-                return Ok((port_decl, connect_decl, osc_decl));
+                let obs_decl = obs_from_lua_table(tbl);
+                return Ok((port_decl, connect_decl, osc_decl, obs_decl));
             }
             Ok(_) => warn!("[{}] init() did not return a table; using default ports", name),
             Err(e) => warn!("[{}] init() error: {}; using default ports", name, e),
@@ -512,7 +557,25 @@ fn extract_all_decls(
         .and_then(parse_port_decl_from_toml)
         .unwrap_or_default();
     let connect_decl = connect_from_toml(ConnectDecl::default(), route_cfg);
-    Ok((port_decl, connect_decl, OscDecl::default()))
+    Ok((port_decl, connect_decl, OscDecl::default(), ObsDecl::default()))
+}
+
+/// Parse OBS connection interest from the table returned by `init()`:
+///
+/// ```lua
+/// obs = { connections = {"main", "backup"} }  -- or a single name as a string
+/// ```
+///
+/// Declaring a connection here only controls event delivery (`on_obs_event`) —
+/// `obs_call`/`obs_call_sync` can address any connection configured in
+/// config.toml regardless of what a route declares here.
+fn obs_from_lua_table(tbl: &LuaTable) -> ObsDecl {
+    let Ok(LuaValue::Table(obs_tbl)) = tbl.get::<LuaValue>("obs") else { return ObsDecl::default() };
+    let connections = match obs_tbl.get::<LuaValue>("connections") {
+        Ok(v) => lua_val_to_patterns(v),
+        _ => vec![],
+    };
+    ObsDecl { connections }
 }
 
 /// Parse OSC receive/send declarations from the table returned by `init()`.
@@ -659,11 +722,13 @@ struct RouteThreadArgs {
     osc_sender: Option<OscSender>,
     osc_heartbeat_interval: f64,
     lua_state_file: std::path::PathBuf,
+    obs_senders: HashMap<String, mpsc::Sender<crate::obs::ObsRequest>>,
 }
 
 // Owns the route's Lua VM for its whole lifetime: registers the Lua-facing
 // globals via the register_* helpers above, loads the script, then runs the
 // event loop until shutdown.
+#[allow(clippy::too_many_lines)]
 fn run_lua_event_loop(
     name: &str,
     script: &str,
@@ -673,12 +738,13 @@ fn run_lua_event_loop(
     timer: &Arc<Timer>,
     args: RouteThreadArgs,
 ) -> Result<()> {
-    let RouteThreadArgs { route_cfg, osc_sender, osc_heartbeat_interval, lua_state_file } = args;
+    let RouteThreadArgs { route_cfg, osc_sender, osc_heartbeat_interval, lua_state_file, obs_senders } = args;
     let lua = Lua::new();
 
     register_send(&lua, out_conns, default_out)?;
     register_timer_fns(&lua, timer)?;
     register_log(&lua, name)?;
+    register_obs_fns(&lua, obs_senders)?;
 
     // Must be set before register_send_osc, since OSC_SEND_ENABLED reflects
     // whether a send socket was available at route-start time.
@@ -741,6 +807,7 @@ fn run_lua_event_loop(
     let on_midi_fn: Option<LuaFunction> = lua.globals().get("on_midi").ok();
     let on_tick_fn: Option<LuaFunction> = lua.globals().get("on_tick").ok();
     let on_osc_fn: Option<LuaFunction> = lua.globals().get("on_osc").ok();
+    let on_obs_event_fn: Option<LuaFunction> = lua.globals().get("on_obs_event").ok();
 
     // --- Call on_startup() ---
     //
@@ -801,6 +868,18 @@ fn run_lua_event_loop(
                         }
                     }
                     Err(e) => warn!("[{}] OSC message parse error: {}", name, e),
+                }
+            }
+            RouteEvent::ObsEvent { connection, event } => {
+                if let Some(ref on_obs_event) = on_obs_event_fn {
+                    match lua.to_value(&event) {
+                        Ok(ev_lua) => {
+                            if let Err(e) = on_obs_event.call::<()>((connection.as_str(), ev_lua)) {
+                                warn!("[{}] on_obs_event error: {}", name, e);
+                            }
+                        }
+                        Err(e) => warn!("[{}] OBS event convert error: {}", name, e),
+                    }
                 }
             }
             RouteEvent::ResyncState => {
@@ -1033,6 +1112,73 @@ fn register_send_osc(
     })?;
     lua.globals().set("send_osc", f)?;
     Ok(subs_cache)
+}
+
+/// Register `obs_call(conn, request, args)` / `obs_call_sync(conn, request, args, timeout_ms)`.
+///
+/// Both queue a request onto the named connection's async request channel
+/// (owned by `ObsManager` in `main.rs`) and return immediately to the caller
+/// — `obs_call` is pure fire-and-forget (no reply channel), while
+/// `obs_call_sync` blocks *this route's own thread only* on a plain
+/// `std::sync::mpsc` reply channel with a timeout, never touching the tokio
+/// runtime. `conn` may be any connection configured in config.toml, not just
+/// ones this route declared event interest in via `init()`'s `obs.connections`.
+fn register_obs_fns(
+    lua: &Lua,
+    obs_senders: HashMap<String, mpsc::Sender<crate::obs::ObsRequest>>,
+) -> LuaResult<()> {
+    let senders = Arc::new(obs_senders);
+
+    {
+        let senders = Arc::clone(&senders);
+        let f = lua.create_function(
+            move |lua, (conn, request, args): (String, String, LuaValue)| -> LuaResult<()> {
+                let Some(tx) = senders.get(&conn) else {
+                    warn!("obs_call: unknown OBS connection '{}'", conn);
+                    return Ok(());
+                };
+                let args_json: serde_json::Value = lua.from_value(args)?;
+                let req = crate::obs::ObsRequest { request, args: args_json, reply: None };
+                if tx.try_send(req).is_err() {
+                    warn!("obs_call: request dropped — connection '{}' queue full or closed", conn);
+                }
+                Ok(())
+            },
+        )?;
+        lua.globals().set("obs_call", f)?;
+    }
+
+    {
+        let f = lua.create_function(
+            move |lua, (conn, request, args, timeout_ms): (String, String, LuaValue, u64)| -> LuaResult<(bool, LuaValue, LuaValue)> {
+                let Some(tx) = senders.get(&conn) else {
+                    let err = lua.create_string(format!("unknown OBS connection '{conn}'"))?;
+                    return Ok((false, LuaValue::Nil, LuaValue::String(err)));
+                };
+                let args_json: serde_json::Value = lua.from_value(args)?;
+                let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+                let req = crate::obs::ObsRequest { request, args: args_json, reply: Some(reply_tx) };
+                if tx.try_send(req).is_err() {
+                    let err = lua.create_string("request queue full or closed")?;
+                    return Ok((false, LuaValue::Nil, LuaValue::String(err)));
+                }
+                if let Ok(reply) = reply_rx.recv_timeout(std::time::Duration::from_millis(timeout_ms)) {
+                    let result_lua = lua.to_value(&reply.result)?;
+                    let err_lua = match reply.error {
+                        Some(e) => LuaValue::String(lua.create_string(&e)?),
+                        None => LuaValue::Nil,
+                    };
+                    Ok((reply.ok, result_lua, err_lua))
+                } else {
+                    let err = lua.create_string("obs_call_sync: timed out")?;
+                    Ok((false, LuaValue::Nil, LuaValue::String(err)))
+                }
+            },
+        )?;
+        lua.globals().set("obs_call_sync", f)?;
+    }
+
+    Ok(())
 }
 
 /// Register the `save_state(table)` / `load_state()` Lua globals, which read
@@ -2134,5 +2280,47 @@ mod tests {
 
         assert_eq!(lua.globals().get::<i64>("restored_value").unwrap(), 99);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── obs_from_lua_table ───────────────────────────────────────────────────
+
+    #[test]
+    fn obs_table_absent_returns_default() {
+        let lua = Lua::new();
+        let tbl = lua.create_table().unwrap();
+        let decl = obs_from_lua_table(&tbl);
+        assert_eq!(decl, ObsDecl::default());
+    }
+
+    #[test]
+    fn obs_connections_string_shorthand() {
+        let lua = Lua::new();
+        let tbl = lua.create_table().unwrap();
+        let obs_tbl = lua.create_table().unwrap();
+        obs_tbl.set("connections", "main").unwrap();
+        tbl.set("obs", obs_tbl).unwrap();
+        let decl = obs_from_lua_table(&tbl);
+        assert_eq!(decl.connections, vec!["main"]);
+    }
+
+    #[test]
+    fn obs_connections_array() {
+        let lua = Lua::new();
+        let tbl = lua.create_table().unwrap();
+        let obs_tbl = lua.create_table().unwrap();
+        obs_tbl.set("connections", lua_array(&lua, &["main", "backup"])).unwrap();
+        tbl.set("obs", obs_tbl).unwrap();
+        let decl = obs_from_lua_table(&tbl);
+        assert_eq!(decl.connections, vec!["main", "backup"]);
+    }
+
+    #[test]
+    fn obs_table_present_without_connections_returns_empty() {
+        let lua = Lua::new();
+        let tbl = lua.create_table().unwrap();
+        let obs_tbl = lua.create_table().unwrap();
+        tbl.set("obs", obs_tbl).unwrap();
+        let decl = obs_from_lua_table(&tbl);
+        assert!(decl.connections.is_empty());
     }
 }

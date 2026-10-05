@@ -426,6 +426,8 @@ get_bpm()              -- Get current BPM (float)
 set_ppqn(ppqn)         -- Set pulses per quarter note (integer)
 get_ppqn()             -- Get current PPQN (integer)
 log(message)           -- Log a string to the systemd journal / stdout
+obs_call(conn, request, args)                     -- Fire-and-forget OBS call
+obs_call_sync(conn, request, args, timeout_ms)    -- OBS call, blocks this route for a result
 ```
 
 ### Global variables
@@ -663,6 +665,84 @@ function init()
 end
 ```
 
+## OBS support
+
+midi-daemon can drive OBS Studio (via the obs-websocket plugin, OBS 28+) and
+react to its events, with support for multiple independent OBS connections.
+Connections are declared globally in `config.toml` and addressed by name from
+any route — they are not owned by a single route.
+
+```toml
+[obs.main]
+host     = "127.0.0.1"
+port     = 4455
+password = "changeme"   # omit if authentication is disabled in OBS
+
+[obs.streaming-pc]
+host = "192.168.1.50"
+port = 4455
+```
+
+The daemon owns one reconnecting background task per connection; a route
+never blocks waiting for OBS to come back online.
+
+### Calling OBS
+
+```lua
+obs_call(conn, request, args)                  -- fire-and-forget, returns immediately
+obs_call_sync(conn, request, args, timeout_ms) -- blocks this route only, up to timeout_ms
+```
+
+`obs_call` is the default — it queues the request and returns without
+waiting, so a slow or unreachable OBS connection never stalls MIDI/OSC/timer
+handling. `obs_call_sync` blocks the **calling route's own thread only** (via
+a plain OS-level wait with a timeout, not an async await) for the rare case a
+script needs a result immediately; other routes and other OBS connections
+keep running normally while it waits. It returns `ok, result, err`:
+
+```lua
+local ok, result, err = obs_call_sync("main", "scenes.current", {}, 1000)
+if ok then
+    log("current scene: " .. result.currentProgramSceneName)
+else
+    log("obs_call_sync failed: " .. tostring(err))
+end
+```
+
+Supported `request` names today (more are added to `src/obs.rs` as routes
+need them):
+
+| Request                | Args                      | Result                     |
+|-------------------------|----------------------------|-----------------------------|
+| `scenes.set_current`   | `{ name = "Scene 2" }`    | —                           |
+| `scenes.current`       | `{}`                       | current program scene      |
+| `scenes.list`          | `{}`                       | all scenes                 |
+| `inputs.set_mute`      | `{ name, muted = true }`  | —                           |
+| `inputs.toggle_mute`   | `{ name }`                 | `{ muted = true/false }`   |
+
+### Receiving OBS events
+
+A route opts in to a connection's events (scene changed, mute toggled, stream
+state changed, …) by declaring it in `init()`:
+
+```lua
+function init()
+    return { obs = { connections = {"main"} } }  -- or a single name as a string
+end
+
+function on_obs_event(conn, event)
+    -- `event` is the obws Event enum serialized to a Lua table; its shape
+    -- depends on the event type. Inspect it once to find the fields you need:
+    for k, v in pairs(event) do
+        log(conn .. " event key: " .. tostring(k))
+    end
+end
+```
+
+Declaring `obs.connections` only controls event delivery — `obs_call`/`obs_call_sync`
+can address any connection configured in `config.toml`, whether or not the
+route declared it here.
+
 ## config.toml
 
 Config is split into two parts: **global defaults** (top-level keys) and
@@ -704,6 +784,12 @@ default_ppqn = 24
 
 # How often (in seconds) the daemon sends /route/heartbeat to OSC subscribers.
 # osc_heartbeat_interval = 5.0
+
+# Named OBS websocket connections — add as many [obs.<name>] sections as needed.
+# [obs.main]
+# host     = "127.0.0.1"
+# port     = 4455
+# password = "changeme"
 ```
 
 Changes to `config.toml` are picked up automatically and all routes are

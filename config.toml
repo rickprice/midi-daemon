@@ -36,6 +36,44 @@ default_bpm = 120.0
 # How often (in seconds) the daemon sends /route/heartbeat to OSC subscribers.
 # osc_heartbeat_interval = 5.0
 
+# ── OBS connections ───────────────────────────────────────────────────────────
+# Named OBS websocket connections (obs-websocket plugin, OBS 28+). Any route
+# can call any connection by name via obs_call()/obs_call_sync(), regardless
+# of what it declares interest in below. Multiple connections are supported —
+# just add more [obs.<name>] sections.
+#
+# [obs.main]
+# host     = "127.0.0.1"
+# port     = 4455
+# password = "changeme"   # omit if authentication is disabled in OBS
+#
+# [obs.streaming-pc]
+# host = "192.168.1.50"
+# port = 4455
+#
+# A route opts in to receiving that connection's events (scene changed, mute
+# toggled, etc.) via on_obs_event(conn, event) by declaring it in init():
+#
+#   function init()
+#       return { obs = { connections = {"main"} } }
+#   end
+#
+#   function on_obs_event(conn, event)
+#       log(conn .. ": " .. event.eventType)
+#   end
+#
+# Calling OBS (fire-and-forget, does not block the route):
+#   obs_call("main", "scenes.set_current", { name = "Scene 2" })
+#   obs_call("main", "inputs.set_mute", { name = "Mic/Aux", muted = true })
+#
+# Calling OBS and waiting for a result (blocks this route's thread only, up to
+# timeout_ms — other routes and OBS connections keep running):
+#   local ok, result, err = obs_call_sync("main", "scenes.current", {}, 1000)
+#
+# Supported request names: scenes.set_current, scenes.current, scenes.list,
+# inputs.set_mute, inputs.toggle_mute. More are added to src/obs.rs as routes
+# need them.
+
 # Pulses per quarter note — controls tick resolution.
 # 24 = standard MIDI clock, 96 = high resolution.
 # Can be overridden at runtime from Lua with set_ppqn().
