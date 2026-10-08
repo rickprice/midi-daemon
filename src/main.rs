@@ -51,7 +51,11 @@ fn start_osc_receiver(port: u16, dispatch: OscDispatch) -> Option<osc::OscReceiv
         if let Some(inject) = guard.get(route_name) {
             inject(from, address, args);
         } else {
-            warn!("OSC: no route for address '{}' (prefix '{}')", address, route_name);
+            // debug, not warn: any external OSC peer we talk to (e.g. a
+            // Non-Mixer-XT controller's own scan-on-hello /signal/list) can
+            // legitimately send unsolicited traffic that doesn't belong to
+            // any loaded route. That's expected, not a misconfiguration.
+            debug!("OSC: no route for address '{}' (prefix '{}')", address, route_name);
         }
     }) {
         Ok(rx) => {
