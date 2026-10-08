@@ -1,0 +1,400 @@
+lexml_version: '5'
+root:
+  id: d267155c-42e7-4e71-848d-c19986a821f8
+  type: GROUP
+  properties:
+  - type: b
+    key: background
+    value: true
+  - type: c
+    key: color
+    value:
+      r: 0.12
+      g: 0.12
+      b: 0.12
+      a: 1.0
+  - type: f
+    key: cornerRadius
+    value: 0.0
+  - type: r
+    key: frame
+    value:
+      x: 0.0
+      y: 0.0
+      w: 1024.0
+      h: 600.0
+  - type: b
+    key: grabFocus
+    value: false
+  - type: b
+    key: interactive
+    value: false
+  - type: b
+    key: locked
+    value: false
+  - type: s
+    key: name
+    value: Metronome
+  - type: i
+    key: orientation
+    value: 0
+  - type: b
+    key: outline
+    value: false
+  - type: i
+    key: outlineStyle
+    value: 0
+  - type: i
+    key: pointerPriority
+    value: 0
+  - type: i
+    key: shape
+    value: 1
+  - type: b
+    key: visible
+    value: true
+  values:
+  - key: touch
+    body:
+      locked: false
+      lockedDefaultCurrent: false
+      default: 'false'
+      defaultPull: '0'
+  children:
+  - id: 2f828b62-5dd8-11f1-ad9e-8cae4cb83d63
+    type: GROUP
+    properties:
+    - type: b
+      key: background
+      value: true
+    - type: c
+      key: color
+      value:
+        r: 0.0
+        g: 0.0
+        b: 0.0
+        a: 0.0
+    - type: f
+      key: cornerRadius
+      value: 1.0
+    - type: r
+      key: frame
+      value:
+        x: 100.0
+        y: 100.0
+        w: 260.0
+        h: 260.0
+    - type: b
+      key: grabFocus
+      value: false
+    - type: b
+      key: interactive
+      value: false
+    - type: b
+      key: locked
+      value: false
+    - type: s
+      key: name
+      value: VolumePanMuteControl
+    - type: i
+      key: orientation
+      value: 0
+    - type: b
+      key: outline
+      value: true
+    - type: i
+      key: outlineStyle
+      value: 0
+    - type: i
+      key: pointerPriority
+      value: 0
+    - type: s
+      key: script
+      value:
+        file: lib/subscribe.lua
+    - type: i
+      key: shape
+      value: 1
+    - type: s
+      key: tag
+      value: '8000'
+    - type: b
+      key: visible
+      value: true
+    values:
+    - key: touch
+      body:
+        locked: false
+        lockedDefaultCurrent: false
+        default: 'false'
+        defaultPull: '0'
+    children:
+    - id: bcbd5c60-5dc8-11f1-b556-8cae4cb83d63
+      type: RADIAL
+      properties:
+      - type: b
+        key: background
+        value: false
+      - type: b
+        key: centered
+        value: false
+      - type: c
+        key: color
+        value:
+          r: 1.0
+          g: 0.0
+          b: 0.0
+          a: 1.0
+      - type: f
+        key: cornerRadius
+        value: 0.0
+      - type: r
+        key: frame
+        value:
+          x: 5.0
+          y: 5.0
+          w: 250.0
+          h: 250.0
+      - type: b
+        key: grabFocus
+        value: true
+      - type: b
+        key: grid
+        value: true
+      - type: c
+        key: gridColor
+        value:
+          r: 0.0
+          g: 0.0
+          b: 0.0
+          a: 0.25
+      - type: i
+        key: gridSteps
+        value: 20
+      - type: b
+        key: interactive
+        value: true
+      - type: b
+        key: inverted
+        value: false
+      - type: b
+        key: locked
+        value: false
+      - type: s
+        key: name
+        value: Volume
+      - type: i
+        key: orientation
+        value: 0
+      - type: b
+        key: outline
+        value: true
+      - type: i
+        key: outlineStyle
+        value: 0
+      - type: i
+        key: pointerPriority
+        value: 0
+      - type: i
+        key: response
+        value: 0
+      - type: i
+        key: responseFactor
+        value: 100
+      - type: i
+        key: shape
+        value: 2
+      - type: b
+        key: visible
+        value: true
+      values:
+      - key: x
+        body:
+          locked: false
+          lockedDefaultCurrent: false
+          default: '0'
+          defaultPull: '0'
+      - key: touch
+        body:
+          locked: false
+          lockedDefaultCurrent: false
+          default: 'false'
+          defaultPull: '0'
+      messages:
+      - kind: osc
+        raw_xml: <enabled>1</enabled><send>1</send><receive>1</receive><feedback>0</feedback><noDuplicates>0</noDuplicates><connections>1111111111</connections><triggers><trigger><var><![CDATA[x]]></var><condition>ANY</condition></trigger></triggers><path><partial><type>CONSTANT</type><conversion>STRING</conversion><value><![CDATA[/]]></value><scaleMin>0</scaleMin><scaleMax>1</scaleMax></partial><partial><type>PROPERTY</type><conversion>STRING</conversion><value><![CDATA[parent.name]]></value><scaleMin>0</scaleMin><scaleMax>1</scaleMax></partial><partial><type>CONSTANT</type><conversion>STRING</conversion><value><![CDATA[/]]></value><scaleMin>0</scaleMin><scaleMax>1</scaleMax></partial><partial><type>PROPERTY</type><conversion>STRING</conversion><value><![CDATA[name]]></value><scaleMin>0</scaleMin><scaleMax>1</scaleMax></partial></path><arguments><partial><type>VALUE</type><conversion>FLOAT</conversion><value><![CDATA[x]]></value><scaleMin>0</scaleMin><scaleMax>1</scaleMax></partial></arguments>
+    - id: eac3c9aa-5dc8-11f1-8420-8cae4cb83d63
+      type: RADIAL
+      properties:
+      - type: b
+        key: background
+        value: true
+      - type: b
+        key: centered
+        value: true
+      - type: c
+        key: color
+        value:
+          r: 1.0
+          g: 0.0
+          b: 0.0
+          a: 1.0
+      - type: f
+        key: cornerRadius
+        value: 1.0
+      - type: r
+        key: frame
+        value:
+          x: 67.0
+          y: 67.0
+          w: 125.0
+          h: 125.0
+      - type: b
+        key: grabFocus
+        value: true
+      - type: b
+        key: grid
+        value: true
+      - type: c
+        key: gridColor
+        value:
+          r: 0.0
+          g: 0.0
+          b: 0.0
+          a: 0.25
+      - type: i
+        key: gridSteps
+        value: 20
+      - type: b
+        key: interactive
+        value: true
+      - type: b
+        key: inverted
+        value: false
+      - type: b
+        key: locked
+        value: false
+      - type: s
+        key: name
+        value: Pan
+      - type: i
+        key: orientation
+        value: 0
+      - type: b
+        key: outline
+        value: true
+      - type: i
+        key: outlineStyle
+        value: 0
+      - type: i
+        key: pointerPriority
+        value: 0
+      - type: i
+        key: response
+        value: 0
+      - type: i
+        key: responseFactor
+        value: 100
+      - type: i
+        key: shape
+        value: 2
+      - type: b
+        key: visible
+        value: true
+      values:
+      - key: x
+        body:
+          locked: false
+          lockedDefaultCurrent: false
+          default: '0'
+          defaultPull: '0'
+      - key: touch
+        body:
+          locked: false
+          lockedDefaultCurrent: false
+          default: 'false'
+          defaultPull: '0'
+      messages:
+      - kind: osc
+        raw_xml: <enabled>1</enabled><send>1</send><receive>1</receive><feedback>0</feedback><noDuplicates>0</noDuplicates><connections>1111111111</connections><triggers><trigger><var><![CDATA[x]]></var><condition>ANY</condition></trigger></triggers><path><partial><type>CONSTANT</type><conversion>STRING</conversion><value><![CDATA[/]]></value><scaleMin>0</scaleMin><scaleMax>1</scaleMax></partial><partial><type>PROPERTY</type><conversion>STRING</conversion><value><![CDATA[parent.name]]></value><scaleMin>0</scaleMin><scaleMax>1</scaleMax></partial><partial><type>CONSTANT</type><conversion>STRING</conversion><value><![CDATA[/]]></value><scaleMin>0</scaleMin><scaleMax>1</scaleMax></partial><partial><type>PROPERTY</type><conversion>STRING</conversion><value><![CDATA[name]]></value><scaleMin>0</scaleMin><scaleMax>1</scaleMax></partial></path><arguments><partial><type>VALUE</type><conversion>FLOAT</conversion><value><![CDATA[x]]></value><scaleMin>-1</scaleMin><scaleMax>1</scaleMax></partial></arguments>
+    - id: fe884dda-5dc8-11f1-90d3-8cae4cb83d63
+      type: BUTTON
+      properties:
+      - type: b
+        key: background
+        value: true
+      - type: i
+        key: buttonType
+        value: 1
+      - type: c
+        key: color
+        value:
+          r: 1.0
+          g: 0.0
+          b: 0.0
+          a: 1.0
+      - type: f
+        key: cornerRadius
+        value: 1.0
+      - type: r
+        key: frame
+        value:
+          x: 102.0
+          y: 102.0
+          w: 55.0
+          h: 55.0
+      - type: b
+        key: grabFocus
+        value: true
+      - type: b
+        key: interactive
+        value: true
+      - type: b
+        key: locked
+        value: false
+      - type: s
+        key: name
+        value: Mute
+      - type: i
+        key: orientation
+        value: 0
+      - type: b
+        key: outline
+        value: true
+      - type: i
+        key: outlineStyle
+        value: 1
+      - type: i
+        key: pointerPriority
+        value: 0
+      - type: b
+        key: press
+        value: true
+      - type: b
+        key: release
+        value: true
+      - type: i
+        key: shape
+        value: 2
+      - type: b
+        key: valuePosition
+        value: false
+      - type: b
+        key: visible
+        value: true
+      values:
+      - key: x
+        body:
+          locked: false
+          lockedDefaultCurrent: false
+          default: '0'
+          defaultPull: '0'
+      - key: touch
+        body:
+          locked: false
+          lockedDefaultCurrent: false
+          default: 'false'
+          defaultPull: '0'
+      messages:
+      - kind: osc
+        raw_xml: <enabled>1</enabled><send>1</send><receive>1</receive><feedback>0</feedback><noDuplicates>0</noDuplicates><connections>1111111111</connections><triggers><trigger><var><![CDATA[x]]></var><condition>ANY</condition></trigger></triggers><path><partial><type>CONSTANT</type><conversion>STRING</conversion><value><![CDATA[/]]></value><scaleMin>0</scaleMin><scaleMax>1</scaleMax></partial><partial><type>PROPERTY</type><conversion>STRING</conversion><value><![CDATA[parent.name]]></value><scaleMin>0</scaleMin><scaleMax>1</scaleMax></partial><partial><type>CONSTANT</type><conversion>STRING</conversion><value><![CDATA[/]]></value><scaleMin>0</scaleMin><scaleMax>1</scaleMax></partial><partial><type>PROPERTY</type><conversion>STRING</conversion><value><![CDATA[name]]></value><scaleMin>0</scaleMin><scaleMax>1</scaleMax></partial></path><arguments><partial><type>VALUE</type><conversion>BOOLEAN</conversion><value><![CDATA[x]]></value><scaleMin>0</scaleMin><scaleMax>1</scaleMax></partial></arguments>
