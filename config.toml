@@ -198,6 +198,14 @@ mute_controller = 118
 # osc_receive_port = 9000
 # osc_send_addr    = "127.0.0.1:9001"
 
+# Optional Non-Mixer-XT bridge (see routes.d/lib/nmxt.lua and
+# https://github.com/Stazed/non-mixer-xt/blob/main/OSC.md). Disabled unless
+# nmxt_strip is set — this route then also drives that Non-Mixer-XT strip's
+# Gain (volume/mute), with changes flowing both ways.
+# nmxt_strip    = "Guitar"            # Non-Mixer-XT strip name
+# nmxt_pan      = false               # only set true if this strip has a Pan plugin inserted
+# nmxt_osc_addr = "127.0.0.1:9500"    # Non-Mixer-XT's OSC server
+
 [timing-trainer]
 # MIDI channel for the pan CC output
 pan_channel   = 1

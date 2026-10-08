@@ -444,6 +444,28 @@ send_osc("/" .. ROUTE_NAME .. "/beat", beat, bpm)
 on_osc = osc_params("/" .. ROUTE_NAME, { ... })
 ```
 
+### Sharing code between routes
+
+Lua's `debug` library isn't loaded into a route's Lua state, so a route can't
+locate its own file to derive a path relative to itself; and nothing pins the
+daemon's working directory to `routes_dir`, so a plain relative `dofile`
+won't reliably resolve either. Put shared helpers in a `lib/` subdirectory
+under `routes_dir` (it's scanned non-recursively for `*.lua` routes, so
+anything under `lib/` is never itself loaded as a route) and `dofile` it with
+the full path for your install:
+
+```lua
+-- System-wide install (routes_dir = /etc/midi-daemon/routes.d):
+local shared = dofile("/etc/midi-daemon/routes.d/lib/mylib.lua")
+
+-- Per-user install (routes_dir = ~/.config/midi-daemon/routes.d):
+local shared = dofile((os.getenv("HOME") or "") .. "/.config/midi-daemon/routes.d/lib/mylib.lua")
+```
+
+See `routes.d/lib/nmxt.lua` and the Non-Mixer-XT bridge in the
+[VolumePanMuteControl example](#non-mixer-xt-bridge) below for a real
+multi-route library.
+
 ### Stdlib helpers
 
 The following helpers are available in every route without any `require` or `dofile`.
@@ -1093,6 +1115,9 @@ Configurable via `[VolumePanMuteControl]` in `config.toml`:
 | `mute_controller`  | 118     | CC number for mute (no universal standard; configure for your DAW) |
 | `osc_receive_port` | *(none)*| UDP port for incoming OSC (falls back to global `osc_receive_port`) |
 | `osc_send_addr`    | *(none)*| UDP `"host:port"` for OSC output (falls back to global `osc_send_addr`) |
+| `nmxt_strip`       | *(none)*| Non-Mixer-XT strip name this route also drives, e.g. `"Guitar"` — bridge disabled when unset |
+| `nmxt_pan`         | `false` | Also bridge pan — only if this strip has a Pan plugin inserted in Non-Mixer-XT |
+| `nmxt_osc_addr`    | `"127.0.0.1:9500"` | Non-Mixer-XT's OSC server address |
 
 ### OSC interface
 
@@ -1113,6 +1138,35 @@ Configurable via `[VolumePanMuteControl]` in `config.toml`:
 
 For mute, incoming CC ≥ 64 triggers muted (1) and < 64 triggers unmuted (0).
 Outgoing MIDI sends 127 for muted and 0 for unmuted.
+
+### Non-Mixer-XT bridge
+
+Set `nmxt_strip` to also drive a [Non-Mixer-XT](https://github.com/Stazed/non-mixer-xt)
+strip's Gain (volume/mute) over OSC, using the signal-subscription protocol
+described in [its OSC.md](https://github.com/Stazed/non-mixer-xt/blob/main/OSC.md).
+Volume/Pan/Mute changes from MIDI or OSC are pushed out to Non-Mixer-XT;
+changes made directly in its own GUI flow back out to MIDI and any
+subscribed OSC controller, the same as a hardware CC would.
+
+Deploy one copy of this route per strip (e.g. `VolumePanMuteControlGuitar.lua`,
+`VolumePanMuteControlVocals.lua`), each with its own `[section]` in
+`config.toml` setting `nmxt_strip` to that strip's name — the copies can
+otherwise be byte-identical, since all strip-specific behavior comes from
+`config`.
+
+Pan only works if the target strip actually has a Pan plugin inserted in
+Non-Mixer-XT (most strips don't, by default) — set `nmxt_pan = true` only
+then; otherwise leave it unset and pan stays MIDI/OSC-only.
+
+The shared logic lives in `routes.d/lib/nmxt.lua` (see
+[Sharing code between routes](#sharing-code-between-routes) above for why
+it's loaded via a hardcoded `dofile` path). It registers one controller per
+daemon — so multiple strips collapse into a single Non-Mixer-XT peer instead
+of each stealing the others' registration, since Non-Mixer-XT identifies a
+peer by name and a repeated `/signal/hello` with the same name overwrites
+the previous peer's address — subscribes to feedback for this strip's
+Gain/Pan signals, and converts between Non-Mixer-XT's normalized 0.0–1.0
+range and this route's native units.
 
 ## Example: Transpose
 
