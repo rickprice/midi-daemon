@@ -27,8 +27,11 @@ pub enum MidiScale {
     Raw,
     /// Linear map from the type's full payload range to [min, max].
     Linear { min: f64, max: f64 },
-    /// Gate: raw ≥ threshold → 1.0, raw < threshold → 0.0.
-    Threshold(f64),
+    /// Gate: raw ≥ threshold → 1.0, raw < threshold → 0.0 (flipped if `invert`).
+    /// `invert` exists for controllers that report "pressed" as a low value
+    /// instead of high — flip the gate rather than relabel on/off in Lua,
+    /// since that would also invert the param's direct OSC semantics.
+    Threshold { threshold: f64, invert: bool },
 }
 
 struct MidiBinding {
@@ -103,7 +106,10 @@ fn midi_payload_range(key: &MidiKey) -> (f64, f64) {
 fn apply_midi_scale(raw: f64, scale: &MidiScale, key: &MidiKey) -> f64 {
     match scale {
         MidiScale::Raw => raw,
-        MidiScale::Threshold(t) => if raw >= *t { 1.0 } else { 0.0 },
+        MidiScale::Threshold { threshold, invert } => {
+            let gate = raw >= *threshold;
+            if gate != *invert { 1.0 } else { 0.0 }
+        }
         MidiScale::Linear { min, max } => {
             let (lo, hi) = midi_payload_range(key);
             min + (raw - lo) / (hi - lo) * (max - min)
@@ -114,7 +120,8 @@ fn apply_midi_scale(raw: f64, scale: &MidiScale, key: &MidiKey) -> f64 {
 /// Parse a `MidiScale` from a binding spec table (`scale`, `threshold`, or nothing).
 fn parse_midi_scale(spec: &LuaTable) -> MidiScale {
     if let Ok(t) = spec.get::<f64>("threshold") {
-        return MidiScale::Threshold(t);
+        let invert = spec.get::<bool>("invert").unwrap_or(false);
+        return MidiScale::Threshold { threshold: t, invert };
     }
     if let Ok(LuaValue::Table(arr)) = spec.get::<LuaValue>("scale") {
         let min = arr.get::<f64>(1).unwrap_or(0.0);
@@ -1217,7 +1224,7 @@ mod tests {
         ps.add_midi_binding(
             MidiKey::Cc { channel: 1, controller: 22 },
             "running".to_string(),
-            MidiScale::Threshold(64.0),
+            MidiScale::Threshold { threshold: 64.0, invert: false },
         );
 
         let high = make_midi_msg(&lua, r#"type="cc", channel=1, controller=22, value=100"#);
@@ -1227,6 +1234,35 @@ mod tests {
         let low = make_midi_msg(&lua, r#"type="cc", channel=1, controller=22, value=0"#);
         ps.dispatch_midi(&lua, &low).unwrap();
         assert_lua(&lua, r#"assert(running == false, "value<64 should set running false")"#);
+    }
+
+    #[test]
+    fn dispatch_midi_cc_threshold_inverted() {
+        let lua = make_lua();
+        lua.globals().set("running", false).unwrap();
+        let mut ps = make_ps(&lua, "/p");
+        let set_fn: LuaFunction = lua
+            .load("function(v) running = (v ~= 0) end")
+            .eval()
+            .unwrap();
+        let get_fn: LuaFunction =
+            lua.load("function() return running and 1 or 0 end").eval().unwrap();
+        ps.add_param(&lua, "running".to_string(), Some(get_fn), Some(set_fn))
+            .unwrap();
+        ps.add_midi_binding(
+            MidiKey::Cc { channel: 1, controller: 22 },
+            "running".to_string(),
+            MidiScale::Threshold { threshold: 64.0, invert: true },
+        );
+
+        // Reversed hardware: low raw value means "pressed"/on.
+        let low = make_midi_msg(&lua, r#"type="cc", channel=1, controller=22, value=0"#);
+        ps.dispatch_midi(&lua, &low).unwrap();
+        assert_lua(&lua, r#"assert(running == true, "inverted: value<64 should set running true")"#);
+
+        let high = make_midi_msg(&lua, r#"type="cc", channel=1, controller=22, value=100"#);
+        ps.dispatch_midi(&lua, &high).unwrap();
+        assert_lua(&lua, r#"assert(running == false, "inverted: value>=64 should set running false")"#);
     }
 
     #[test]
