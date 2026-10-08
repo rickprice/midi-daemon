@@ -435,6 +435,7 @@ obs_call_sync(conn, request, args, timeout_ms)    -- OBS call, blocks this route
 ```lua
 ROUTE_NAME        -- string: the route's filename stem, e.g. "metronome" for metronome.lua
 OSC_SEND_ENABLED  -- bool: true when a send target is configured (global or per-route)
+ROUTES_DIR        -- string: absolute path to this install's routes directory
 ```
 
 Useful for building OSC address prefixes that automatically match the route name:
@@ -449,18 +450,20 @@ on_osc = osc_params("/" .. ROUTE_NAME, { ... })
 Lua's `debug` library isn't loaded into a route's Lua state, so a route can't
 locate its own file to derive a path relative to itself; and nothing pins the
 daemon's working directory to `routes_dir`, so a plain relative `dofile`
-won't reliably resolve either. Put shared helpers in a `lib/` subdirectory
-under `routes_dir` (it's scanned non-recursively for `*.lua` routes, so
-anything under `lib/` is never itself loaded as a route) and `dofile` it with
-the full path for your install:
+won't reliably resolve either. Use the `ROUTES_DIR` global instead — the
+daemon sets it to this install's actual routes directory, so the same line
+works whether deployed per-user or system-wide. Put shared helpers in a
+`lib/` subdirectory under `routes_dir` (it's scanned non-recursively for
+`*.lua` routes, so anything under `lib/` is never itself loaded as a route)
+and `dofile` it from there:
 
 ```lua
--- System-wide install (routes_dir = /etc/midi-daemon/routes.d):
-local shared = dofile("/etc/midi-daemon/routes.d/lib/mylib.lua")
-
--- Per-user install (routes_dir = ~/.config/midi-daemon/routes.d):
-local shared = dofile((os.getenv("HOME") or "") .. "/.config/midi-daemon/routes.d/lib/mylib.lua")
+local shared = dofile(ROUTES_DIR .. "/lib/mylib.lua")
 ```
+
+A `dofile`d module runs in the same Lua state as the route that loaded it,
+so it can read that route's globals directly — e.g. `ROUTE_NAME` — without
+the caller having to pass them in explicitly.
 
 See `routes.d/lib/nmxt.lua` and the Non-Mixer-XT bridge in the
 [VolumePanMuteControl example](#non-mixer-xt-bridge) below for a real
@@ -1158,9 +1161,10 @@ Pan only works if the target strip actually has a Pan plugin inserted in
 Non-Mixer-XT (most strips don't, by default) — set `nmxt_pan = true` only
 then; otherwise leave it unset and pan stays MIDI/OSC-only.
 
-The shared logic lives in `routes.d/lib/nmxt.lua` (see
-[Sharing code between routes](#sharing-code-between-routes) above for why
-it's loaded via a hardcoded `dofile` path). It registers one controller per
+The shared logic lives in `routes.d/lib/nmxt.lua`, loaded via
+`dofile(ROUTES_DIR .. "/lib/nmxt.lua")` (see
+[Sharing code between routes](#sharing-code-between-routes) above). It
+registers one controller per
 daemon — so multiple strips collapse into a single Non-Mixer-XT peer instead
 of each stealing the others' registration, since Non-Mixer-XT identifies a
 peer by name and a repeated `/signal/hello` with the same name overwrites

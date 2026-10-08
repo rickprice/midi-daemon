@@ -44,12 +44,13 @@ function M.path(strip, module_name, param)
 end
 
 -- Create a controller bound to one strip's Volume (Gain), Mute (Gain), and
--- optionally Pan (Mono Pan) signals. `opts`:
+-- optionally Pan (Mono Pan) signals. Feedback destination paths are built
+-- from the global ROUTE_NAME (set by the daemon before the route script
+-- runs, and visible here too since dofile() shares the caller's Lua state)
+-- so midi-daemon's OSC dispatcher -- which routes by "/<route-name>/..."
+-- prefix -- delivers them back to this route. `opts`:
 --   addr       Non-Mixer-XT OSC target, "host:port" (default "127.0.0.1:9500")
 --   strip      Non-Mixer-XT strip name, e.g. "Guitar" (required)
---   route_name this route's ROUTE_NAME -- used to build feedback destination
---              paths so midi-daemon's OSC dispatcher (which routes by
---              "/<route-name>/..." prefix) delivers them back to this route
 --   hello_port UDP port Non-Mixer-XT should push feedback to -- this must be
 --              a port midi-daemon is actually listening on, i.e. the shared
 --              osc_receive_port from config.toml (default 9000)
@@ -58,7 +59,7 @@ end
 function M.new(opts)
     local addr  = opts.addr or "127.0.0.1:9500"
     local strip = assert(opts.strip, "nmxt.new: opts.strip is required")
-    local route = assert(opts.route_name, "nmxt.new: opts.route_name is required")
+    local route = assert(ROUTE_NAME, "nmxt.new: global ROUTE_NAME is not set")
     local hello_port = opts.hello_port or 9000
 
     local c = {

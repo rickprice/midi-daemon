@@ -265,7 +265,7 @@ impl Route {
 
         // Run the script once to extract port layout, connect patterns, and OSC declarations.
         let (decl, raw_connect, osc_decl, obs_decl) =
-            extract_all_decls(&script, &name, route_cfg.as_ref())?;
+            extract_all_decls(&script, &name, route_cfg.as_ref(), &config.routes_dir)?;
 
         // Fill missing connect patterns with global defaults from config.
         let connect_decl = apply_connect_defaults(
@@ -357,6 +357,7 @@ impl Route {
         let name_for_thread = name.clone();
 
         let osc_heartbeat_interval = config.osc_heartbeat_interval;
+        let routes_dir = config.routes_dir.clone();
         let thread = std::thread::spawn(move || {
             if let Err(e) = run_lua_event_loop(
                 &name_for_thread,
@@ -365,7 +366,7 @@ impl Route {
                 out_conns_for_thread,
                 default_out,
                 &timer_for_thread,
-                RouteThreadArgs { route_cfg, osc_sender, osc_heartbeat_interval, lua_state_file, obs_senders },
+                RouteThreadArgs { route_cfg, osc_sender, osc_heartbeat_interval, lua_state_file, obs_senders, routes_dir },
             ) {
                 error!("Route '{}' event loop error: {}", name_for_thread, e);
             }
@@ -396,7 +397,12 @@ const LUA_STDLIB: &str = include_str!("lua/stdlib.lua");
 
 /// Install no-op stubs, the config table, and the stdlib so `init()` can safely
 /// call any global the live event loop exposes.
-fn setup_extract_lua(lua: &Lua, name: &str, route_cfg: Option<&toml::Table>) -> Result<()> {
+fn setup_extract_lua(
+    lua: &Lua,
+    name: &str,
+    route_cfg: Option<&toml::Table>,
+    routes_dir: &Path,
+) -> Result<()> {
     lua.globals().set("send", lua.create_function(|_, _: LuaMultiValue| Ok(()))?)?;
     lua.globals().set("send_osc", lua.create_function(|_, _: LuaMultiValue| Ok(()))?)?;
     lua.globals().set("set_bpm", lua.create_function(|_, _: f64| Ok(()))?)?;
@@ -415,6 +421,7 @@ fn setup_extract_lua(lua: &Lua, name: &str, route_cfg: Option<&toml::Table>) -> 
     )?;
     lua.globals().set("ROUTE_NAME", name)?;
     lua.globals().set("OSC_SEND_ENABLED", false)?;
+    lua.globals().set("ROUTES_DIR", routes_dir.to_string_lossy().into_owned())?;
     let cfg_table = match route_cfg {
         Some(tbl) => toml_table_to_lua(lua, tbl)
             .map_err(|e| anyhow::anyhow!("Failed to convert config to Lua: {e}"))?,
@@ -521,9 +528,10 @@ fn extract_all_decls(
     script: &str,
     name: &str,
     route_cfg: Option<&toml::Table>,
+    routes_dir: &Path,
 ) -> Result<(PortDecl, ConnectDecl, OscDecl, ObsDecl)> {
     let lua = Lua::new();
-    setup_extract_lua(&lua, name, route_cfg)?;
+    setup_extract_lua(&lua, name, route_cfg, routes_dir)?;
 
     if let Err(e) = lua.load(script).set_name(name).exec() {
         tracing::debug!(
@@ -723,6 +731,7 @@ struct RouteThreadArgs {
     osc_heartbeat_interval: f64,
     lua_state_file: std::path::PathBuf,
     obs_senders: HashMap<String, mpsc::Sender<crate::obs::ObsRequest>>,
+    routes_dir: std::path::PathBuf,
 }
 
 // Owns the route's Lua VM for its whole lifetime: registers the Lua-facing
@@ -738,7 +747,7 @@ fn run_lua_event_loop(
     timer: &Arc<Timer>,
     args: RouteThreadArgs,
 ) -> Result<()> {
-    let RouteThreadArgs { route_cfg, osc_sender, osc_heartbeat_interval, lua_state_file, obs_senders } = args;
+    let RouteThreadArgs { route_cfg, osc_sender, osc_heartbeat_interval, lua_state_file, obs_senders, routes_dir } = args;
     let lua = Lua::new();
 
     register_send(&lua, out_conns, default_out)?;
@@ -750,6 +759,10 @@ fn run_lua_event_loop(
     // whether a send socket was available at route-start time.
     lua.globals().set("ROUTE_NAME", name)?;
     lua.globals().set("OSC_SEND_ENABLED", osc_sender.is_some())?;
+    // Absolute path to routes_dir, so a route can dofile() a shared helper
+    // under lib/ without hardcoding an install-specific path — see "Sharing
+    // code between routes" in the README.
+    lua.globals().set("ROUTES_DIR", routes_dir.to_string_lossy().into_owned())?;
 
     // Subscriber address cache: updated after every osc_param_set dispatch/tick so
     // register_send_osc's closure can fan out to subscribers when no named target is configured.
@@ -1581,12 +1594,12 @@ mod tests {
     // ── extract_port_decl ─────────────────────────────────────────────────────
 
     fn extract(script: &str) -> PortDecl {
-        extract_all_decls(script, "test", None).unwrap().0
+        extract_all_decls(script, "test", None, Path::new("/test/routes")).unwrap().0
     }
 
     fn extract_with_cfg(script: &str, cfg_toml: &str) -> PortDecl {
         let tbl: toml::Table = toml::from_str(cfg_toml).unwrap();
-        extract_all_decls(script, "test", Some(&tbl)).unwrap().0
+        extract_all_decls(script, "test", Some(&tbl), Path::new("/test/routes")).unwrap().0
     }
 
     #[test]
@@ -1841,12 +1854,12 @@ mod tests {
     // ── extract_connect_decl ──────────────────────────────────────────────────
 
     fn connect(script: &str) -> ConnectDecl {
-        extract_all_decls(script, "test", None).unwrap().1
+        extract_all_decls(script, "test", None, Path::new("/test/routes")).unwrap().1
     }
 
     fn connect_with_cfg(script: &str, cfg_toml: &str) -> ConnectDecl {
         let tbl: toml::Table = toml::from_str(cfg_toml).unwrap();
-        extract_all_decls(script, "test", Some(&tbl)).unwrap().1
+        extract_all_decls(script, "test", Some(&tbl), Path::new("/test/routes")).unwrap().1
     }
 
     #[test]

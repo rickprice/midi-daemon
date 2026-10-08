@@ -29,10 +29,10 @@
 -- false unless this strip actually has a Pan plugin inserted in Non-Mixer-XT
 -- (most strips don't by default -- see the OSC.md link above).
 
--- Per-user install path (see README.md "Per-user install"). A system-wide
--- install's routes live under /etc/midi-daemon/routes.d instead -- hardcode
--- that path here if you deploy this file system-wide.
-local nmxt_lib = dofile((os.getenv("HOME") or "") .. "/.config/midi-daemon/routes.d/lib/nmxt.lua")
+-- ROUTES_DIR is set by the daemon to this install's actual routes
+-- directory, so this works unmodified whether deployed per-user or
+-- system-wide (see "Sharing code between routes" in README.md).
+local nmxt_lib = dofile(ROUTES_DIR .. "/lib/nmxt.lua")
 
 local CHANNEL = config.channel or 1
 
@@ -52,7 +52,6 @@ local muted  = false
 local nmxt = config.nmxt_strip and nmxt_lib.new({
     addr       = config.nmxt_osc_addr,
     strip      = config.nmxt_strip,
-    route_name = ROUTE_NAME,
     has_pan    = config.nmxt_pan or false,
     -- Must match the daemon's actual OSC receive port (config.toml's
     -- top-level osc_receive_port, default 9000) so Non-Mixer-XT's feedback
