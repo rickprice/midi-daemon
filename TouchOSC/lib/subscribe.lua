@@ -12,7 +12,7 @@ function init()
   port = self.tag
   subPath = "/" .. self.name .. "/subscribe"
   heartbeatPath = "/" .. self.name .. "/heartbeat"
-  discPath = "/" .. self.name .. "/disconnect"
+  discPath = "/" .. self.name .. "/unsubscribe"
 
   -- Send initial subscription
   sendOSC({ subPath, { { tag = 'i', value = self.tag }, { tag = 'i', value = 30 } } })
@@ -27,7 +27,7 @@ function update()
   local now = getMillis()
   if (now - lastHeartbeat >= heartbeatDelay) then
     lastHeartbeat = now
-    sendOSC({ heartbeatPath, { { "f", 1.0 } } })
+    sendOSC({ heartbeatPath, { { tag = 'i', value = self.tag } } })
   end
 end
 
@@ -37,6 +37,6 @@ function onReceiveNotify(message, argument)
     heartbeatActive = false
 
     -- Send disconnect
-    sendOSC({ discPath, { { "f", 1.0 } } })
+    sendOSC({ discPath, { { tag = 'i', value = self.tag } } })
   end
 end
