@@ -299,6 +299,32 @@ impl OscParamSet {
         Ok(true)
     }
 
+    // Push every readable param's current value to `fb` — the route (via each
+    // param's `get()`) is the source of truth, so this is what makes a client
+    // caught up, whether it just subscribed or is a heartbeat we didn't
+    // recognize (e.g. the daemon restarted and forgot it).
+    fn dump_state_to(&self, lua: &Lua, fb: &str) -> LuaResult<()> {
+        let param_names: Vec<String> = self.params.iter()
+            .filter(|(_, p)| p.get.is_some())
+            .map(|(n, _)| n.clone())
+            .collect();
+        let send_osc: LuaFunction = lua.globals().get("send_osc")?;
+        for pname in param_names {
+            let get_fn: Option<LuaFunction> = self.params.get(&pname)
+                .and_then(|p| p.get.as_ref())
+                .map(|k| lua.registry_value(k))
+                .transpose()?;
+            if let Some(f) = get_fn {
+                let value: LuaValue = f.call(())?;
+                let param_addr = format!("{}{}", self.slash_prefix, pname);
+                if let Err(e) = send_osc.call::<()>((fb, param_addr.as_str(), value)) {
+                    warn!("OscParamSet state dump to '{}': {}", fb, e);
+                }
+            }
+        }
+        Ok(())
+    }
+
     // One linear OSC-address dispatch (subscribe/unsubscribe/param match); splitting
     // it up would just scatter one control-flow path across several functions.
     #[allow(clippy::too_many_lines)]
@@ -312,25 +338,7 @@ impl OscParamSet {
             let (fb, timeout) = parse_feedback(&from, &args, self.default_timeout)?;
             let now = lua_now(lua)?;
             self.subscribers.insert(fb.clone(), Subscriber { expiry: now + timeout });
-
-            let param_names: Vec<String> = self.params.iter()
-                .filter(|(_, p)| p.get.is_some())
-                .map(|(n, _)| n.clone())
-                .collect();
-            let send_osc: LuaFunction = lua.globals().get("send_osc")?;
-            for pname in param_names {
-                let get_fn: Option<LuaFunction> = self.params.get(&pname)
-                    .and_then(|p| p.get.as_ref())
-                    .map(|k| lua.registry_value(k))
-                    .transpose()?;
-                if let Some(f) = get_fn {
-                    let value: LuaValue = f.call(())?;
-                    let param_addr = format!("{}{}", self.slash_prefix, pname);
-                    if let Err(e) = send_osc.call::<()>((fb.as_str(), param_addr.as_str(), value)) {
-                        warn!("OscParamSet subscribe state dump: {}", e);
-                    }
-                }
-            }
+            self.dump_state_to(lua, &fb)?;
             return Ok(());
         }
 
@@ -341,12 +349,23 @@ impl OscParamSet {
             return Ok(());
         }
 
-        // /prefix/heartbeat [port [timeout]] — renews the subscriber's expiry
+        // /prefix/heartbeat [port [timeout]] — renews the subscriber's expiry.
+        // A heartbeat from an address we don't have on file means this client
+        // thinks it's subscribed but we don't agree — most likely we restarted
+        // and lost our subscriber list while it kept beating. TouchOSC's
+        // subscribe.lua only sends /subscribe once, at layout load, so without
+        // this it would never resubscribe and would silently stop receiving
+        // updates until the layout is reloaded. Treat it exactly like a fresh
+        // subscribe: re-register and catch it up.
         if addr == self.heartbeat_addr {
             let (fb, timeout) = parse_feedback(&from, &args, self.default_timeout)?;
             let now = lua_now(lua)?;
-            if let Some(sub) = self.subscribers.get_mut(&fb) {
-                sub.expiry = now + timeout;
+            match self.subscribers.get_mut(&fb) {
+                Some(sub) => sub.expiry = now + timeout,
+                None => {
+                    self.subscribers.insert(fb.clone(), Subscriber { expiry: now + timeout });
+                    self.dump_state_to(lua, &fb)?;
+                }
             }
             return Ok(());
         }
@@ -1047,6 +1066,47 @@ mod tests {
         );
     }
 
+
+    #[test]
+    fn heartbeat_from_unknown_client_resubscribes_and_dumps_state() {
+        let lua = make_lua();
+        let mut ps = make_ps(&lua, "/p");
+        lua.globals().set("v", 42i64).unwrap();
+        let set_fn: LuaFunction = lua.load("function(a) v = a end").eval().unwrap();
+        let get_fn: LuaFunction = lua.load("function() return v end").eval().unwrap();
+        ps.add_param(&lua, "x".to_string(), Some(get_fn), Some(set_fn)).unwrap();
+
+        // No prior /subscribe — simulates a daemon restart that forgot a
+        // client who never stopped sending heartbeats.
+        let hb = make_msg(&lua, "/p/heartbeat", "1.2.3.4:9001", "");
+        ps.dispatch(&lua, &hb).unwrap();
+
+        assert_lua(
+            &lua,
+            r#"
+            local dumped = false
+            for _, s in ipairs(_sent) do
+                if s[1] == "1.2.3.4:9001" and s[2] == "/p/x" then dumped = true end
+            end
+            assert(dumped, "unrecognized heartbeat should trigger a state dump, same as subscribe")
+            "#,
+        );
+
+        // And it's now a real subscriber — future changes reach it.
+        assert_lua(&lua, "clear()");
+        let msg = make_msg(&lua, "/p/x", "1.2.3.4:9000", "9");
+        ps.dispatch(&lua, &msg).unwrap();
+        assert_lua(
+            &lua,
+            r#"
+            local notified = false
+            for _, s in ipairs(_sent) do
+                if s[1] == "1.2.3.4:9001" and s[2] == "/p/x" then notified = true end
+            end
+            assert(notified, "re-subscribed-via-heartbeat client should receive future notifications")
+            "#,
+        );
+    }
 
     #[test]
     fn heartbeat_sent_after_interval() {

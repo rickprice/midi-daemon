@@ -594,7 +594,7 @@ the listener.
 |---|---|---|
 | `prefix/subscribe` | `[port [timeout_secs]]` | Register (or renew) sender; sends current state of all `get`-able params immediately |
 | `prefix/unsubscribe` | `[port]` | Remove subscriber immediately |
-| `prefix/heartbeat` | — | Sent by the daemon to subscribers at the configured `osc_heartbeat_interval` (default 5 s) |
+| `prefix/heartbeat` | `[port [timeout_secs]]` | Sent by subscribers to renew their subscription; the daemon also sends this address to subscribers at the configured `osc_heartbeat_interval` (default 5 s), so a UI can show "connected". A heartbeat from a sender the daemon doesn't currently have on file (e.g. it restarted while the client kept beating) is treated as an implicit `subscribe` — re-registered and immediately sent the current state |
 
 **OSC dispatch rules for `prefix/<param>`:**
 
