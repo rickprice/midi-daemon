@@ -1172,6 +1172,13 @@ the previous peer's address — subscribes to feedback for this strip's
 Gain/Pan signals, and converts between Non-Mixer-XT's normalized 0.0–1.0
 range and this route's native units.
 
+The hello/subscribe registration is resent every 5 seconds from `on_tick`
+(not just once at startup), since it's a one-way UDP registration with no
+delivery confirmation — if Non-Mixer-XT isn't listening yet when the daemon
+first starts (e.g. both processes launched together and Non-Mixer-XT is
+still loading its project), the initial registration is silently dropped and
+retrying is the only way to recover without restarting the daemon.
+
 ## Example: Transpose
 
 See `routes.d/transpose.lua`. Shifts all notes up by a configurable interval,
