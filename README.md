@@ -1172,12 +1172,16 @@ the previous peer's address — subscribes to feedback for this strip's
 Gain/Pan signals, and converts between Non-Mixer-XT's normalized 0.0–1.0
 range and this route's native units.
 
-The hello/subscribe registration is resent every 5 seconds from `on_tick`
-(not just once at startup), since it's a one-way UDP registration with no
-delivery confirmation — if Non-Mixer-XT isn't listening yet when the daemon
-first starts (e.g. both processes launched together and Non-Mixer-XT is
-still loading its project), the initial registration is silently dropped and
-retrying is the only way to recover without restarting the daemon.
+The hello/subscribe registration, and this route's current volume/pan/mute,
+are resent together every 5 seconds from `on_tick` (not just once at
+startup), since it's one-way UDP with no delivery confirmation — if
+Non-Mixer-XT isn't listening yet when the daemon first starts (e.g. both
+processes launched together and Non-Mixer-XT is still loading its project),
+the initial registration and state push are silently dropped. midi-daemon
+is the source of truth for these values, so the periodic resend both heals
+a dropped startup race and re-syncs Non-Mixer-XT's GUI (which always comes
+up showing its own plugin defaults, not midi-daemon's state) if it restarts
+on its own without the daemon restarting too.
 
 ## Example: Transpose
 
